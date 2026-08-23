@@ -1,0 +1,20 @@
+# 构建产物目录（CMake 默认与脚本约定的构建目录）
+build/
+.build/
+
+# IDE 与编辑器本地配置
+.idea/
+.vscode/
+*.suo
+*.user
+
+# 编译与测试中间产物
+*.o
+*.a
+*.so
+*.exe
+*.dll
+Testing/
+
+# 实验/临时文件
+*.log

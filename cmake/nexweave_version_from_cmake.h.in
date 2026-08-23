@@ -1,0 +1,8 @@
+// 构建时生成的版本头文件模板：内容由 CMake configure_file 填充，
+// 唯一事实来源是 CMakeLists.txt 中的 project(nexweave VERSION ...)。
+// 生成物只包含版本字符串，供测试校验头文件常量与 CMake 配置一致。
+
+#pragma once
+
+// 由 CMake 生成的完整版本字符串，形如 "0.1.0"。
+#define NEXWEAVE_VERSION_STRING_FROM_CMAKE "@PROJECT_VERSION@"
