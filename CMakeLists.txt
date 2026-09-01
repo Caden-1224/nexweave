@@ -34,6 +34,7 @@ configure_file(
 # ---- 核心模块：core/domain（版本号领域值）----
 add_library(nexweave_core_domain STATIC
   core/domain/version.cpp
+  core/domain/identifiers.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -61,6 +62,12 @@ endif()
 # 版本一致性是发布边界的不变量：CMake VERSION 与头文件常量必须一致。
 add_test(NAME version_unit COMMAND nexweave_version_test)
 set_tests_properties(version_unit PROPERTIES LABELS "unit")
+
+add_executable(nexweave_identifiers_test tests/unit/identifiers_test.cpp)
+target_link_libraries(nexweave_identifiers_test PRIVATE nexweave_core_domain)
+target_compile_options(nexweave_identifiers_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME identifiers_unit COMMAND nexweave_identifiers_test)
+set_tests_properties(identifiers_unit PROPERTIES LABELS "unit")
 
 # 门禁脚本失败路径：工具缺失时必须以可读错误和非零码退出；
 # 成功路径由仓库自身的构建 + 全量 CTest 链路覆盖。
