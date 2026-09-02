@@ -35,6 +35,7 @@ configure_file(
 add_library(nexweave_core_domain STATIC
   core/domain/version.cpp
   core/domain/identifiers.cpp
+  core/domain/audio_frame.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -68,6 +69,15 @@ target_link_libraries(nexweave_identifiers_test PRIVATE nexweave_core_domain)
 target_compile_options(nexweave_identifiers_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME identifiers_unit COMMAND nexweave_identifiers_test)
 set_tests_properties(identifiers_unit PROPERTIES LABELS "unit")
+
+add_executable(nexweave_audio_frame_test tests/unit/audio_frame_test.cpp)
+target_link_libraries(nexweave_audio_frame_test PRIVATE nexweave_core_domain)
+target_compile_options(nexweave_audio_frame_test PRIVATE -Wall -Wextra -Wpedantic)
+if(NEXWEAVE_WARNINGS_AS_ERRORS)
+  target_compile_options(nexweave_audio_frame_test PRIVATE -Werror)
+endif()
+add_test(NAME audio_frame_unit COMMAND nexweave_audio_frame_test)
+set_tests_properties(audio_frame_unit PROPERTIES LABELS "unit")
 
 # 门禁脚本失败路径：工具缺失时必须以可读错误和非零码退出；
 # 成功路径由仓库自身的构建 + 全量 CTest 链路覆盖。
