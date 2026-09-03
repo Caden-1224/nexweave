@@ -88,6 +88,20 @@ endif()
 add_test(NAME error_unit COMMAND nexweave_error_test)
 set_tests_properties(error_unit PROPERTIES LABELS "unit")
 
+# 后端能力契约夹具只依赖公共值对象，验证六类接口可被同一运行时注入，
+# 并覆盖 top_k=0、空文本、未打开输出和设备读失败等失败语义。
+add_executable(nexweave_backend_contract_test
+  tests/contract/backend_contract_test.cpp)
+target_link_libraries(nexweave_backend_contract_test PRIVATE nexweave_core_domain)
+target_include_directories(nexweave_backend_contract_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/capability)
+target_compile_options(nexweave_backend_contract_test PRIVATE -Wall -Wextra -Wpedantic)
+if(NEXWEAVE_WARNINGS_AS_ERRORS)
+  target_compile_options(nexweave_backend_contract_test PRIVATE -Werror)
+endif()
+add_test(NAME backend_contract COMMAND nexweave_backend_contract_test)
+set_tests_properties(backend_contract PROPERTIES LABELS "contract")
+
 # 门禁脚本失败路径：工具缺失时必须以可读错误和非零码退出；
 # 成功路径由仓库自身的构建 + 全量 CTest 链路覆盖。
 add_test(NAME gate_scripts_failure COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/gate/gate_test.sh)
