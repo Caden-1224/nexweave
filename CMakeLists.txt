@@ -37,9 +37,11 @@ add_library(nexweave_core_domain STATIC
   core/domain/identifiers.cpp
   core/domain/audio_frame.cpp
   core/domain/error.cpp
+  core/runtime/session_state_machine.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/runtime
   ${NEXWEAVE_GENERATED_DIR}
 )
 target_compile_options(nexweave_core_domain PRIVATE
@@ -101,6 +103,18 @@ if(NEXWEAVE_WARNINGS_AS_ERRORS)
 endif()
 add_test(NAME backend_contract COMMAND nexweave_backend_contract_test)
 set_tests_properties(backend_contract PROPERTIES LABELS "contract")
+
+add_executable(nexweave_session_state_machine_test
+  tests/unit/session_state_machine_test.cpp)
+target_link_libraries(nexweave_session_state_machine_test PRIVATE nexweave_core_domain)
+target_include_directories(nexweave_session_state_machine_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/runtime)
+target_compile_options(nexweave_session_state_machine_test PRIVATE -Wall -Wextra -Wpedantic)
+if(NEXWEAVE_WARNINGS_AS_ERRORS)
+  target_compile_options(nexweave_session_state_machine_test PRIVATE -Werror)
+endif()
+add_test(NAME session_state_machine_unit COMMAND nexweave_session_state_machine_test)
+set_tests_properties(session_state_machine_unit PROPERTIES LABELS "unit")
 
 # 门禁脚本失败路径：工具缺失时必须以可读错误和非零码退出；
 # 成功路径由仓库自身的构建 + 全量 CTest 链路覆盖。
