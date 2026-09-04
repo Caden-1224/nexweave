@@ -1,4 +1,5 @@
 #include "session_state_machine.hpp"
+#include <limits>
 namespace nexweave::runtime { namespace {
 const char* state_to_text(SessionStateMachine::State s) {
   switch (s) {
@@ -27,7 +28,15 @@ const char* event_name(SessionStateMachine::Event e) {
 }}
 namespace nexweave::runtime {
 domain::OperationResult SessionStateMachine::dispatch(Event e) {
+  return dispatch(e, generation());
+}
+
+domain::OperationResult SessionStateMachine::dispatch(Event e, std::uint64_t supplied_generation) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (supplied_generation != generation_) {
+    return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,
+      "拒绝过时代际事件");
+  }
   State next = state_;
   bool valid = false;
   switch (state_) {
@@ -65,11 +74,23 @@ domain::OperationResult SessionStateMachine::dispatch(Event e) {
     return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,
       std::string("非法 Session 状态迁移: ") + state_to_text(state_) + " + " + event_name(e));
   }
-  trace_.push_back(std::string(state_to_text(state_)) + "--" + event_name(e) + "-->" + state_to_text(next));
+  if ((e == Event::kAudioStart || e == Event::kCancel) &&
+      generation_ == std::numeric_limits<std::uint64_t>::max()) {
+    return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,
+      "generation 已耗尽，拒绝开启新代际");
+  }
+  // 轨迹先写入，随后才提交无抛出的状态/代际赋值；若分配失败，三者保持原值。
+  // 这样取消窗口不会出现“代际已变但状态未变”的半提交状态。
+  const auto transition = std::string(state_to_text(state_)) + "--" + event_name(e) + "-->" + state_to_text(next);
+  trace_.push_back(transition);
+  if (e == Event::kAudioStart || e == Event::kCancel) {
+    ++generation_;
+  }
   state_ = next;
   return domain::OperationResult::success();
 }
 SessionStateMachine::State SessionStateMachine::state()const{std::lock_guard<std::mutex>l(mutex_);return state_;}
+std::uint64_t SessionStateMachine::generation() const { std::lock_guard<std::mutex> lock(mutex_); return generation_; }
 const char* SessionStateMachine::state_name()const{std::lock_guard<std::mutex>l(mutex_);return state_to_text(state_);}
 std::vector<std::string> SessionStateMachine::trace()const{std::lock_guard<std::mutex>l(mutex_);return trace_;}
 void SessionStateMachine::reset(){std::lock_guard<std::mutex>l(mutex_);state_=State::kIdle;trace_.clear();}
