@@ -39,6 +39,7 @@ add_library(nexweave_core_domain STATIC
   core/domain/error.cpp
   core/runtime/session_state_machine.cpp
   core/protocol/control_rpc.cpp
+  core/protocol/data_event.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -124,6 +125,14 @@ if(NEXWEAVE_WARNINGS_AS_ERRORS)
 endif()
 add_test(NAME control_rpc_unit COMMAND nexweave_control_rpc_test)
 set_tests_properties(control_rpc_unit PROPERTIES LABELS "unit")
+add_executable(nexweave_data_event_test tests/unit/data_event_test.cpp)
+target_link_libraries(nexweave_data_event_test PRIVATE nexweave_core_domain)
+target_compile_options(nexweave_data_event_test PRIVATE -Wall -Wextra -Wpedantic)
+if(NEXWEAVE_WARNINGS_AS_ERRORS)
+  target_compile_options(nexweave_data_event_test PRIVATE -Werror)
+endif()
+add_test(NAME data_event_unit COMMAND nexweave_data_event_test)
+set_tests_properties(data_event_unit PROPERTIES LABELS "unit")
 
 # 门禁脚本失败路径：工具缺失时必须以可读错误和非零码退出；
 # 成功路径由仓库自身的构建 + 全量 CTest 链路覆盖。

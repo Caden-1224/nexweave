@@ -1,0 +1,3 @@
+#include "../../core/protocol/data_event.hpp"
+// 保护不变量：元数据可往返，PCM 必须恰好一帧，非法长度和未结束 done 必须拒绝。
+int main(){using namespace nexweave::protocol;DataEvent e;e.request_id="req-1";e.session_id="s-1";e.type=DataEventType::kPartial;e.text="hi";auto m=encode_event_metadata(e);if(!m.ok()||!decode_event_metadata(*m.value).ok())return 1;e.type=DataEventType::kPcm;e.pcm.assign(640,7);auto p=encode_pcm_payload(e);if(!p.ok())return 2;m=encode_event_metadata(e);auto meta=decode_event_metadata(*m.value);if(!meta.ok()||!meta.value->pcm.empty()||!attach_pcm_payload(*meta.value,*p.value).ok())return 3;e.pcm.resize(639);if(validate_event(e).ok())return 4;e.type=DataEventType::kDone;e.pcm.clear();if(validate_event(e).ok())return 5;return 0;}
