@@ -31,6 +31,7 @@ std::vector<std::int16_t> MakePcm(std::size_t frames) {
 }
 
 void TestSourceFramesAndEnd() {
+  // 成功场景：两帧输入必须按原顺序各返回一次；EOF 与 close 的错误码证明不会越界读取。
   const auto pcm = MakePcm(2);
   nexweave::backend::FakeAudioSource source(pcm);
   CHECK(source.frame_count() == 2);
@@ -55,6 +56,7 @@ void TestSourceFramesAndEnd() {
 }
 
 void TestSourceRejectsEmptyAndPartialPcm() {
+  // 失败边界：空输入和 319 样本尾帧都拒绝，证明 Fake 不会静默补零或截断。
   nexweave::backend::FakeAudioSource empty({});
   CHECK(empty.open().error.code == nexweave::domain::ErrorCode::kInvalidInput);
 
@@ -64,6 +66,7 @@ void TestSourceRejectsEmptyAndPartialPcm() {
 }
 
 void TestCancellationAndDeterministicReplay() {
+  // 取消场景：取消后的 read 不得产出帧；close/open 后独立重放必须与原始夹具完全一致。
   const auto pcm = MakePcm(1);
   nexweave::backend::FakeAudioSource source(pcm);
   CHECK(source.open().ok());
@@ -74,9 +77,17 @@ void TestCancellationAndDeterministicReplay() {
   const auto replay = source.read();
   CHECK(replay.ok());
   CHECK(replay.value->samples == pcm);
+
+  // 独立实例对比补充确定性证据：相同固定输入不依赖对象历史即可得到相同首帧。
+  nexweave::backend::FakeAudioSource independent(pcm);
+  CHECK(independent.open().ok());
+  const auto independent_frame = independent.read();
+  CHECK(independent_frame.ok());
+  CHECK(independent_frame.value->samples == replay.value->samples);
 }
 
 void TestSinkValidationCancellationAndNoResidue() {
+  // 输出场景：合法帧可回读，非法帧不污染缓存；取消清理旧代，重开后缓存从空开始。
   nexweave::backend::FakeAudioSink sink;
   const auto valid = nexweave::domain::AudioFrame::from_samples(
       std::vector<std::int16_t>(nexweave::domain::kAudioFrameSamples, 7));

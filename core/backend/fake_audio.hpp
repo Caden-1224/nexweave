@@ -31,8 +31,15 @@ class FakeAudioSource final : public capability::IAudioSource {
  public:
   explicit FakeAudioSource(std::vector<std::int16_t> pcm_samples);
 
+  // C++17/CMake 3.16 兼容；成功仅表示状态从 closed 迁移到 opened。
+  // 空输入、非整帧输入返回 kInvalidInput，重复打开返回 kAlreadyCompleted。
   domain::OperationResult open() override;
+
+  // 成功返回一个 320 样本帧并推进游标；EOF 返回 kAlreadyCompleted，关闭返回
+  // kDeviceFailure，取消返回 kCancelled；失败不会推进游标，也不返回可消费值。
   domain::Result<domain::AudioFrame> read() override;
+
+  // C++17 下幂等关闭：清除 opened/cancelled 与游标，不访问外部资源；任何状态均返回成功。
   domain::OperationResult close() noexcept override;
 
   // 取消当前输入代际；幂等且不清除源数据，供下一次 open() 重放同一夹具。
@@ -66,8 +73,14 @@ class FakeAudioSink final : public capability::IAudioSink {
  public:
   FakeAudioSink() = default;
 
+  // C++17/CMake 3.16 兼容；从 closed 打开时清空上一轮缓存，重复打开返回 kAlreadyCompleted。
   domain::OperationResult open() override;
+
+  // 仅接受 16 kHz/单声道/S16_LE/320 样本帧；未打开返回 kDeviceFailure，取消返回
+  // kCancelled，非法帧返回 kInvalidInput，失败不改变已缓存输出。
   domain::OperationResult write(const domain::AudioFrame& frame) override;
+
+  // C++17 下幂等关闭：停止接受写入但保留最近结果快照，之后可再次 open()。
   domain::OperationResult close() noexcept override;
 
   // 取消当前输出代际并清理已缓存帧；可重复调用且不影响下一次 open()。
