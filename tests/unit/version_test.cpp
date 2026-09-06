@@ -15,29 +15,29 @@
 #include "version.hpp"
 // 构建时生成的版本头：内容来自 CMakeLists 的 project(VERSION ...)，
 // 用于校验头文件常量与 CMake 配置一致。
-#include "nexweave_version_from_cmake.h"
-
 #include <cstdint>
 #include <cstdio>
 #include <string>
+
+#include "nexweave_version_from_cmake.h"
 
 namespace {
 
 int g_failures = 0;
 
 // 记录一次失败断言。宏保留调用位置的行号，便于失败时定位。
-#define CHECK(cond)                                                          \
-  do {                                                                       \
-    if (!(cond)) {                                                           \
-      std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);            \
-      ++g_failures;                                                          \
-    }                                                                        \
+#define CHECK(cond)                                               \
+  do {                                                            \
+    if (!(cond)) {                                                \
+      std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+      ++g_failures;                                               \
+    }                                                             \
   } while (0)
 
+using nexweave::domain::parse_version;
 using nexweave::domain::ParseVersionResult;
 using nexweave::domain::Version;
 using nexweave::domain::VersionError;
-using nexweave::domain::parse_version;
 
 // 成功路径：常规版本号。
 void TestValidVersion() {

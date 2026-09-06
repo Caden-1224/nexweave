@@ -12,17 +12,16 @@
 namespace {
 int failures = 0;
 
-#define CHECK(value) \
-  do { \
-    if (!(value)) { \
+#define CHECK(value)                                               \
+  do {                                                             \
+    if (!(value)) {                                                \
       std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #value); \
-      ++failures; \
-    } \
+      ++failures;                                                  \
+    }                                                              \
   } while (0)
 
 void TestValidFrame() {
-  CHECK(nexweave::domain::kAudioSampleRateHz * nexweave::domain::kAudioFrameDurationMs /
-            1000 ==
+  CHECK(nexweave::domain::kAudioSampleRateHz * nexweave::domain::kAudioFrameDurationMs / 1000 ==
         nexweave::domain::kAudioFrameSamples);
   CHECK(nexweave::domain::kAudioFrameBytes == 640);
 
@@ -41,8 +40,7 @@ void TestValidFrame() {
   const auto validated = nexweave::domain::validate_audio_frame(frame.value);
   CHECK(validated.value.samples == frame.value.samples);
 
-  const std::vector<std::int16_t> vector_samples(
-      nexweave::domain::kAudioFrameSamples, 7);
+  const std::vector<std::int16_t> vector_samples(nexweave::domain::kAudioFrameSamples, 7);
   const auto copied = nexweave::domain::AudioFrame::from_samples(vector_samples);
   CHECK(copied.ok());
   CHECK(copied.value.samples.front() == 7);

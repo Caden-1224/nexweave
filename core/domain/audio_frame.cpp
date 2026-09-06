@@ -4,8 +4,7 @@
 
 namespace nexweave::domain {
 
-AudioFrameValidationResult AudioFrame::from_samples(
-    const std::vector<std::int16_t>& input) {
+AudioFrameValidationResult AudioFrame::from_samples(const std::vector<std::int16_t>& input) {
   AudioFrameValidationResult result;
   if (input.size() != kAudioFrameSamples) {
     result.error = AudioFrameError::kInvalidSampleCount;

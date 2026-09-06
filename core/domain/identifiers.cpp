@@ -1,6 +1,5 @@
 #include "identifiers.hpp"
 
-#include <cctype>
 #include <limits>
 
 namespace nexweave::domain {
@@ -10,7 +9,8 @@ bool safe_id(std::string_view value) noexcept {
     return false;
   }
   for (const unsigned char c : value) {
-    if (!(std::isalnum(c) || c == '-' || c == '_' || c == '.')) {
+    if (!(((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) ||
+          c == '-' || c == '_' || c == '.')) {
       return false;
     }
   }
@@ -18,12 +18,12 @@ bool safe_id(std::string_view value) noexcept {
 }
 
 bool numeric_suffix(std::string_view value, std::string_view prefix) noexcept {
-  if (value.size() <= prefix.size() ||
+  if (value.size() <= prefix.size() || value.size() > 128 ||
       value.substr(0, prefix.size()) != prefix) {
     return false;
   }
   for (const unsigned char c : value.substr(prefix.size())) {
-    if (!std::isdigit(c)) {
+    if (c < '0' || c > '9') {
       return false;
     }
   }

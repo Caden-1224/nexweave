@@ -34,10 +34,10 @@ enum class AudioSampleFormat : std::uint8_t {
 };
 
 enum class AudioFrameError : std::uint8_t {
-  kNone,                 // 元数据与样本数均符合 v1 合同。
-  kInvalidSampleRate,   // 采样率不是 16000 Hz；调用方应拒绝该帧，不做隐式重采样。
-  kInvalidChannels,     // 声道数不是单声道；交错多声道数据不能直接提交。
-  kInvalidFormat,       // 样本编码不是 S16_LE；字节序/位宽不匹配时使用此错误。
+  kNone,               // 元数据与样本数均符合 v1 合同。
+  kInvalidSampleRate,  // 采样率不是 16000 Hz；调用方应拒绝该帧，不做隐式重采样。
+  kInvalidChannels,  // 声道数不是单声道；交错多声道数据不能直接提交。
+  kInvalidFormat,    // 样本编码不是 S16_LE；字节序/位宽不匹配时使用此错误。
   kInvalidSampleCount,  // 样本数不是 320；短帧、长帧和缺失载荷均属于此错误。
 };
 
@@ -69,7 +69,9 @@ struct AudioFrameValidationResult {
   AudioFrameError error = AudioFrameError::kInvalidSampleCount;
 
   // 返回 true 仅表示 value 已通过全部固定合同检查；false 时不得向下游传递 value。
-  bool ok() const noexcept { return error == AudioFrameError::kNone; }
+  bool ok() const noexcept {
+    return error == AudioFrameError::kNone;
+  }
 };
 
 // 校验顺序固定为元数据后样本长度：错误码互斥且优先报告帧头错误，避免同一坏帧
@@ -78,8 +80,7 @@ struct AudioFrameValidationResult {
 AudioFrameValidationResult validate_audio_frame(const AudioFrame& frame);
 
 template <std::size_t N>
-AudioFrameValidationResult AudioFrame::from_samples(
-    const std::array<std::int16_t, N>& input) {
+AudioFrameValidationResult AudioFrame::from_samples(const std::array<std::int16_t, N>& input) {
   AudioFrameValidationResult result;
   if constexpr (N != kAudioFrameSamples) {
     result.error = AudioFrameError::kInvalidSampleCount;

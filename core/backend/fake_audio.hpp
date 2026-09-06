@@ -22,7 +22,7 @@ namespace nexweave::backend {
  * 不会被补零、截断或重采样。构造函数只复制/移动样本，不创建外部资源。
  * 输出后置：每次成功 read() 返回下一帧的独立 AudioFrame；读完后返回
  * kAlreadyCompleted，且不再产生伪造帧。close() 后 read() 返回 kDeviceFailure。
- * cancel() 是取消线性化点：从该点起 read() 返回 kCancelled；再次 open() 会把
+ * cancel() 是取消线性化点：从该点起 read() 返回 kCancelled；close() 后再次 open() 会把
  * 游标归零并清除取消状态，从而同一输入可以重复、确定性地运行。
  * 并发安全：open/close/read/cancel 由同一互斥量线性化；read 不阻塞外部资源，
  * 取消与读竞争时以先取得锁的操作为准。对象不拥有后台线程，析构无需额外 join。
@@ -43,7 +43,7 @@ class FakeAudioSource final : public capability::IAudioSource {
   domain::OperationResult close() noexcept override;
 
   // 取消当前输入代际；幂等且不清除源数据，供下一次 open() 重放同一夹具。
-  domain::OperationResult cancel() noexcept;
+  domain::OperationResult cancel() noexcept override;
 
   // 返回总帧数和已消费帧数的快照，便于测试验证没有越界或重复消费。
   std::size_t frame_count() const noexcept;
@@ -84,7 +84,7 @@ class FakeAudioSink final : public capability::IAudioSink {
   domain::OperationResult close() noexcept override;
 
   // 取消当前输出代际并清理已缓存帧；可重复调用且不影响下一次 open()。
-  domain::OperationResult cancel() noexcept;
+  domain::OperationResult cancel() noexcept override;
 
   // 返回最近一次运行的帧/PCM 独立快照；调用不改变 open/close/cancel 状态。
   std::vector<domain::AudioFrame> frames() const;

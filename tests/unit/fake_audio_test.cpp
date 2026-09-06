@@ -5,26 +5,25 @@
 // FakeAudioSource/FakeAudioSink 公共接口观察行为，不依赖内部游标或容器布局。
 #include "fake_audio.hpp"
 
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 namespace {
 int failures = 0;
 
-#define CHECK(value) \
-  do { \
-    if (!(value)) { \
+#define CHECK(value)                                               \
+  do {                                                             \
+    if (!(value)) {                                                \
       std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #value); \
-      ++failures; \
-    } \
+      ++failures;                                                  \
+    }                                                              \
   } while (false)
 
 std::vector<std::int16_t> MakePcm(std::size_t frames) {
   std::vector<std::int16_t> pcm;
   pcm.reserve(frames * nexweave::domain::kAudioFrameSamples);
-  for (std::size_t index = 0; index < frames * nexweave::domain::kAudioFrameSamples;
-       ++index) {
+  for (std::size_t index = 0; index < frames * nexweave::domain::kAudioFrameSamples; ++index) {
     pcm.push_back(static_cast<std::int16_t>(index % 997));
   }
   return pcm;
@@ -70,7 +69,9 @@ void TestCancellationAndDeterministicReplay() {
   const auto pcm = MakePcm(1);
   nexweave::backend::FakeAudioSource source(pcm);
   CHECK(source.open().ok());
-  CHECK(source.cancel().ok());
+  nexweave::capability::IAudioSource& input = source;
+  CHECK(input.cancel().ok());
+  CHECK(input.cancel().ok());
   CHECK(source.read().error.code == nexweave::domain::ErrorCode::kCancelled);
   CHECK(source.close().ok());
   CHECK(source.open().ok());
@@ -101,7 +102,9 @@ void TestSinkValidationCancellationAndNoResidue() {
   malformed.samples.pop_back();
   CHECK(sink.write(malformed).error.code == nexweave::domain::ErrorCode::kInvalidInput);
 
-  CHECK(sink.cancel().ok());
+  nexweave::capability::IAudioSink& output = sink;
+  CHECK(output.cancel().ok());
+  CHECK(output.cancel().ok());
   CHECK(sink.frames().empty());
   CHECK(sink.write(valid.value).error.code == nexweave::domain::ErrorCode::kCancelled);
   CHECK(sink.close().ok());

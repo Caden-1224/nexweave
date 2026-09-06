@@ -36,10 +36,10 @@ inline bool operator==(const Version& lhs, const Version& rhs) {
 // 版本解析错误码。按失败原因分别报告，便于上层把解析失败
 // 映射为控制面结构化错误。
 enum class VersionError {
-  kNone,         // 解析成功，无错误
-  kEmpty,        // 输入为空串（输入缺失）
-  kMalformed,    // 段数不足（如 "1.2"）或某段含非数字字符 / 数值溢出
-  kTooManyParts, // 分段超过三个（如 "1.2.3.4"）
+  kNone,          // 解析成功，无错误
+  kEmpty,         // 输入为空串（输入缺失）
+  kMalformed,     // 段数不足（如 "1.2"）或某段含非数字字符 / 数值溢出
+  kTooManyParts,  // 分段超过三个（如 "1.2.3.4"）
 };
 
 // 解析结果：成功时 version 有效；失败时 error 说明原因且 version 为默认值。
@@ -49,7 +49,9 @@ struct ParseVersionResult {
   VersionError error = VersionError::kNone;
 
   // 便捷判定：ok() == (error == kNone)。
-  bool ok() const { return error == VersionError::kNone; }
+  bool ok() const {
+    return error == VersionError::kNone;
+  }
 };
 
 // 解析语义版本号。输入前提见文件头注释；严格接受恰好三段、每段纯 ASCII

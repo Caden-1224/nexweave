@@ -1,15 +1,144 @@
 #include "data_event.hpp"
-#include <nlohmann/json.hpp>
+
 #include "../domain/identifiers.hpp"
-namespace nexweave::protocol { namespace { using Json=nlohmann::json;
-template<class T> domain::Result<T> bad(domain::ErrorCode c,std::string m){return domain::Result<T>::failure(c,std::move(m));}
-const char* name(DataEventType t) noexcept { static const char* n[]={"partial","final","token","pcm","done","error"}; auto i=static_cast<unsigned>(t); return i<6?n[i]:""; }
-bool parse_type(const std::string&s,DataEventType&t) noexcept { for(unsigned i=0;i<6;++i) if(s==name(static_cast<DataEventType>(i))){t=static_cast<DataEventType>(i);return true;} return false; }
-}}
+#include "json_fields.hpp"
+
 namespace nexweave::protocol {
-domain::OperationResult validate_event(const DataEvent&e) noexcept { if(e.version!=1)return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"不支持的数据面版本"); if(!domain::is_valid_request_id(e.request_id))return domain::OperationResult::failure(domain::ErrorCode::kMissingField,"request_id"); if(!domain::is_valid_session_id(e.session_id))return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"session_id"); if(e.type==DataEventType::kPcm){if(e.pcm.size()!=domain::kAudioFrameBytes)return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"PCM 必须是 640 字节帧");}else if(!e.pcm.empty())return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"非 PCM 事件不得携带载荷"); if(e.type==DataEventType::kError?e.error_code==domain::ErrorCode::kNone:e.error_code!=domain::ErrorCode::kNone)return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"错误码与事件类型不一致"); if(e.type==DataEventType::kDone&&!e.end)return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"done 必须标记 end"); return domain::OperationResult::success(); }
-domain::Result<std::string> encode_event_metadata(const DataEvent&e){auto v=validate_event(e);if(!v.ok())return bad<std::string>(v.error.code,v.error.message);Json j={{"version",e.version},{"request_id",e.request_id},{"session_id",e.session_id},{"generation",e.generation},{"sequence",e.sequence},{"type",name(e.type)},{"text",e.text},{"frame_index",e.frame_index},{"end",e.end},{"error_code",static_cast<int>(e.error_code)},{"message",e.message},{"pcm_bytes",e.pcm.size()}};return domain::Result<std::string>::success(j.dump());}
-domain::Result<DataEvent> decode_event_metadata(std::string_view s){try{auto j=Json::parse(s.begin(),s.end());DataEvent e;e.version=j.at("version").get<std::uint32_t>();e.request_id=j.at("request_id").get<std::string>();e.session_id=j.at("session_id").get<std::string>();e.generation=j.at("generation").get<std::uint64_t>();e.sequence=j.at("sequence").get<std::uint64_t>();if(!parse_type(j.at("type").get<std::string>(),e.type))return bad<DataEvent>(domain::ErrorCode::kInvalidInput,"未知事件类型");e.text=j.at("text").get<std::string>();e.frame_index=j.at("frame_index").get<std::uint32_t>();e.end=j.at("end").get<bool>();int c=j.at("error_code").get<int>();if(c<0||c>static_cast<int>(domain::ErrorCode::kDeviceFailure))return bad<DataEvent>(domain::ErrorCode::kInvalidInput,"错误码越界");e.error_code=static_cast<domain::ErrorCode>(c);e.message=j.at("message").get<std::string>();e.expected_pcm_bytes=j.at("pcm_bytes").get<std::size_t>();if(e.expected_pcm_bytes>domain::kAudioFrameBytes)return bad<DataEvent>(domain::ErrorCode::kInvalidInput,"PCM 元数据长度越界");if(e.type==DataEventType::kPcm&&e.expected_pcm_bytes!=domain::kAudioFrameBytes)return bad<DataEvent>(domain::ErrorCode::kInvalidInput,"PCM 元数据长度错误");if(e.type!=DataEventType::kPcm&&e.expected_pcm_bytes!=0)return bad<DataEvent>(domain::ErrorCode::kInvalidInput,"非 PCM 事件长度必须为零");if(e.type!=DataEventType::kPcm){auto v=validate_event(e);if(!v.ok())return bad<DataEvent>(v.error.code,v.error.message);}return domain::Result<DataEvent>::success(std::move(e));}catch(const std::exception&x){return bad<DataEvent>(domain::ErrorCode::kInvalidInput,std::string("事件 JSON 无效: ")+x.what());}}
-domain::Result<std::vector<std::uint8_t>> encode_pcm_payload(const DataEvent&e){if(e.type!=DataEventType::kPcm)return bad<std::vector<std::uint8_t>>(domain::ErrorCode::kInvalidInput,"只有 PCM 事件可编码载荷");auto v=validate_event(e);if(!v.ok())return bad<std::vector<std::uint8_t>>(v.error.code,v.error.message);return domain::Result<std::vector<std::uint8_t>>::success(e.pcm);}
-domain::Result<DataEvent> attach_pcm_payload(DataEvent e,const std::vector<std::uint8_t>&p){if(e.type!=DataEventType::kPcm)return bad<DataEvent>(domain::ErrorCode::kInvalidInput,"只有 PCM 事件可附加载荷");if(e.expected_pcm_bytes!=0&&e.expected_pcm_bytes!=p.size())return bad<DataEvent>(domain::ErrorCode::kInvalidInput,"PCM 元数据与载荷长度不一致");e.pcm=p;auto v=validate_event(e);if(!v.ok())return bad<DataEvent>(v.error.code,v.error.message);return domain::Result<DataEvent>::success(std::move(e));}
+namespace {
+using detail::Json;
+using domain::ErrorCode;
+using domain::OperationResult;
+constexpr const char* names[] = {"partial", "final", "token", "pcm", "done", "error"};
+
+const char* name(DataEventType type) noexcept {
+  const auto index = static_cast<unsigned>(type);
+  return index < 6 ? names[index] : "";
 }
+
+DataEventType parse_type(const std::string& text) {
+  for (unsigned index = 0; index < 6; ++index) {
+    if (text == names[index]) {
+      return static_cast<DataEventType>(index);
+    }
+  }
+  throw std::invalid_argument("未知事件类型");
+}
+
+// 元数据与完整帧共用头校验；不能因为二进制尚未到达而跳过版本/归属验证。
+// 此函数没有流历史，不能证明 sequence 单调或 generation 当前有效。
+OperationResult validate_header(const DataEvent& event) {
+  if (event.version != 1 || name(event.type)[0] == '\0' ||
+      !domain::is_valid_error_code(event.error_code)) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "数据面版本、类型或错误码无效");
+  }
+  if (!domain::is_valid_request_id(event.request_id)) {
+    return OperationResult::failure(ErrorCode::kMissingField, "request_id");
+  }
+  if (!domain::is_valid_session_id(event.session_id)) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "session_id");
+  }
+  if ((event.type == DataEventType::kError) != (event.error_code != ErrorCode::kNone)) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "错误码与事件类型不一致");
+  }
+  if (event.type == DataEventType::kDone && !event.end) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "done 必须标记 end");
+  }
+  return OperationResult::success();
+}
+
+template <class T>
+domain::Result<T> rejected(const OperationResult& validation) {
+  return domain::Result<T>::failure(validation.error.code, validation.error.message);
+}
+}  // namespace
+
+OperationResult validate_event(const DataEvent& event) {
+  const auto header = validate_header(event);
+  if (!header.ok()) {
+    return header;
+  }
+  const auto required_bytes = event.type == DataEventType::kPcm ? domain::kAudioFrameBytes : 0;
+  if (event.pcm.size() != required_bytes ||
+      (event.expected_pcm_bytes != 0 && event.expected_pcm_bytes != required_bytes)) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "事件 PCM 长度不符合声明和帧合同");
+  }
+  return OperationResult::success();
+}
+
+domain::Result<std::string> encode_event_metadata(const DataEvent& event) {
+  const auto validation = validate_event(event);
+  if (!validation.ok()) {
+    return rejected<std::string>(validation);
+  }
+  return detail::dump(Json{{"version", event.version},
+                           {"request_id", event.request_id},
+                           {"session_id", event.session_id},
+                           {"generation", event.generation},
+                           {"sequence", event.sequence},
+                           {"type", name(event.type)},
+                           {"text", event.text},
+                           {"frame_index", event.frame_index},
+                           {"end", event.end},
+                           {"error_code", static_cast<int>(event.error_code)},
+                           {"message", event.message},
+                           {"pcm_bytes", event.pcm.size()}});
+}
+
+domain::Result<DataEvent> decode_event_metadata(std::string_view input) {
+  return detail::decode<DataEvent>(
+      input,
+      {"version", "request_id", "session_id", "generation", "sequence", "type", "text",
+       "frame_index", "end", "error_code", "message", "pcm_bytes"},
+      [](const Json& json) {
+        DataEvent event;
+        event.version = detail::integer<std::uint32_t>(json, "version");
+        event.request_id = json.at("request_id").get<std::string>();
+        event.session_id = json.at("session_id").get<std::string>();
+        event.generation = detail::integer<std::uint64_t>(json, "generation");
+        event.sequence = detail::integer<std::uint64_t>(json, "sequence");
+        event.type = parse_type(json.at("type").get<std::string>());
+        event.text = json.at("text").get<std::string>();
+        event.frame_index = detail::integer<std::uint32_t>(json, "frame_index");
+        event.end = json.at("end").get<bool>();
+        event.error_code = static_cast<ErrorCode>(detail::integer<int>(json, "error_code"));
+        event.message = json.at("message").get<std::string>();
+        event.expected_pcm_bytes = detail::integer<std::size_t>(json, "pcm_bytes");
+        const auto header = validate_header(event);
+        if (!header.ok()) {
+          return rejected<DataEvent>(header);
+        }
+        const auto required = event.type == DataEventType::kPcm ? domain::kAudioFrameBytes : 0;
+        if (event.expected_pcm_bytes != required) {
+          return domain::Result<DataEvent>::failure(ErrorCode::kInvalidInput, "PCM 元数据长度错误");
+        }
+        return domain::Result<DataEvent>::success(std::move(event));
+      });
+}
+
+domain::Result<std::vector<std::uint8_t>> encode_pcm_payload(const DataEvent& event) {
+  if (event.type != DataEventType::kPcm) {
+    return domain::Result<std::vector<std::uint8_t>>::failure(ErrorCode::kInvalidInput,
+                                                              "只有 PCM 事件可编码载荷");
+  }
+  const auto validation = validate_event(event);
+  if (!validation.ok()) {
+    return rejected<std::vector<std::uint8_t>>(validation);
+  }
+  return domain::Result<std::vector<std::uint8_t>>::success(event.pcm);
+}
+
+domain::Result<DataEvent> attach_pcm_payload(DataEvent event,
+                                             const std::vector<std::uint8_t>& payload) {
+  const auto header = validate_header(event);
+  if (!header.ok()) {
+    return rejected<DataEvent>(header);
+  }
+  if (event.type != DataEventType::kPcm || payload.size() != domain::kAudioFrameBytes ||
+      (event.expected_pcm_bytes != 0 && event.expected_pcm_bytes != payload.size())) {
+    return domain::Result<DataEvent>::failure(ErrorCode::kInvalidInput, "PCM 头或载荷长度无效");
+  }
+  // 先验证长度再复制，避免不合法的大载荷造成不必要分配；源头和源载荷始终不变。
+  event.pcm = payload;
+  return domain::Result<DataEvent>::success(std::move(event));
+}
+}  // namespace nexweave::protocol

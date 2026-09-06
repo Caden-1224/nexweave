@@ -20,14 +20,8 @@ if ! command -v ctest >/dev/null 2>&1; then
   exit 1
 fi
 
-# 构建目录缺失或已过期（CMakeLists.txt 比测试定义新）时，先走一次
-# 构建门禁，保证测试对象与当前源码一致；只检查文件存在会让部分失败
-# 或陈旧的构建目录静默跑旧产物。
-if [ ! -f "$BUILD_DIR/CTestTestfile.cmake" ] || \
-   [ "$REPO_ROOT/CMakeLists.txt" -nt "$BUILD_DIR/CTestTestfile.cmake" ]; then
-  echo "==> 构建目录缺失或已过期，先执行构建门禁。"
-  "${REPO_ROOT}/scripts/build.sh"
-fi
-
+# 每次先执行增量构建，让构建系统按完整依赖判断 .cpp/.hpp 是否变化。
+# 不能只比较 CMakeLists 的时间；构建失败立即退出，禁止运行上一次成功的旧测试程序。
+"${REPO_ROOT}/scripts/build.sh"
 echo "==> 运行测试: ${BUILD_DIR}"
 ctest --test-dir "$BUILD_DIR" --output-on-failure
