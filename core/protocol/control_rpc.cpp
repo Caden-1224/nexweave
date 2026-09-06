@@ -2,9 +2,27 @@
 #include <nlohmann/json.hpp>
 #include "../domain/identifiers.hpp"
 namespace nexweave::protocol {
-namespace { using Json=nlohmann::json;
-template<class T> domain::Result<T> bad(domain::ErrorCode c,std::string m){return domain::Result<T>::failure(c,std::move(m));}
-domain::ErrorCode code(const Json& v,bool& ok) noexcept {if(!v.is_number_integer()){ok=false;return domain::ErrorCode::kInvalidInput;} const auto n=v.get<int>(); if(n<0||n>static_cast<int>(domain::ErrorCode::kDeviceFailure)){ok=false;return domain::ErrorCode::kInvalidInput;} ok=true;return static_cast<domain::ErrorCode>(n);}
+namespace {
+using Json = nlohmann::json;
+
+template <class T>
+domain::Result<T> bad(domain::ErrorCode code, std::string message) {
+  return domain::Result<T>::failure(code, std::move(message));
+}
+
+domain::ErrorCode code(const Json& value, bool& valid) noexcept {
+  if (!value.is_number_integer()) {
+    valid = false;
+    return domain::ErrorCode::kInvalidInput;
+  }
+  const auto number = value.get<int>();
+  if (number < 0 || number > static_cast<int>(domain::ErrorCode::kDeviceFailure)) {
+    valid = false;
+    return domain::ErrorCode::kInvalidInput;
+  }
+  valid = true;
+  return static_cast<domain::ErrorCode>(number);
+}
 }
 domain::OperationResult validate_request(const ControlRequest&r)noexcept{if(r.version!=1)return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"不支持的 RPC 版本");if(!domain::is_valid_request_id(r.request_id))return domain::OperationResult::failure(domain::ErrorCode::kMissingField,"request_id");if(r.operation!="start"&&r.operation!="query"&&r.operation!="cancel"&&r.operation!="exit")return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"未知 operation");if(!r.work_id.empty()&&!domain::is_valid_work_id(r.work_id))return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"work_id");if(!domain::is_valid_session_id(r.session_id))return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"session_id");if(r.deadline.count()<=0)return domain::OperationResult::failure(domain::ErrorCode::kTimeout,"deadline 必须为正");return domain::OperationResult::success();}
 domain::OperationResult validate_response(const ControlResponse&r)noexcept{if(r.version!=1)return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,"不支持的 RPC 版本");if(!domain::is_valid_request_id(r.request_id))return domain::OperationResult::failure(domain::ErrorCode::kMissingField,"request_id");return domain::OperationResult::success();}

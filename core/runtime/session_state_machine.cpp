@@ -89,9 +89,29 @@ domain::OperationResult SessionStateMachine::dispatch(Event e, std::uint64_t sup
   state_ = next;
   return domain::OperationResult::success();
 }
-SessionStateMachine::State SessionStateMachine::state()const{std::lock_guard<std::mutex>l(mutex_);return state_;}
-std::uint64_t SessionStateMachine::generation() const { std::lock_guard<std::mutex> lock(mutex_); return generation_; }
-const char* SessionStateMachine::state_name()const{std::lock_guard<std::mutex>l(mutex_);return state_to_text(state_);}
-std::vector<std::string> SessionStateMachine::trace()const{std::lock_guard<std::mutex>l(mutex_);return trace_;}
-void SessionStateMachine::reset(){std::lock_guard<std::mutex>l(mutex_);state_=State::kIdle;trace_.clear();}
+SessionStateMachine::State SessionStateMachine::state() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return state_;
+}
+
+std::uint64_t SessionStateMachine::generation() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return generation_;
+}
+
+const char* SessionStateMachine::state_name() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return state_to_text(state_);
+}
+
+std::vector<std::string> SessionStateMachine::trace() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return trace_;
+}
+
+void SessionStateMachine::reset() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  state_ = State::kIdle;
+  trace_.clear();
+}
 }
