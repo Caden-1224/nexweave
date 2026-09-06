@@ -40,6 +40,7 @@ add_library(nexweave_core_domain STATIC
   core/runtime/session_state_machine.cpp
   core/protocol/control_rpc.cpp
   core/protocol/data_event.cpp
+  core/observability/observability.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -138,3 +139,12 @@ set_tests_properties(data_event_unit PROPERTIES LABELS "unit")
 # 成功路径由仓库自身的构建 + 全量 CTest 链路覆盖。
 add_test(NAME gate_scripts_failure COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/gate/gate_test.sh)
 set_tests_properties(gate_scripts_failure PROPERTIES LABELS "gate")
+
+add_executable(nexweave_observability_test tests/unit/observability_test.cpp)
+target_link_libraries(nexweave_observability_test PRIVATE nexweave_core_domain)
+target_include_directories(nexweave_observability_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/observability)
+target_compile_options(nexweave_observability_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME observability_unit COMMAND nexweave_observability_test)
+set_tests_properties(observability_unit PROPERTIES LABELS "unit")
+
+
