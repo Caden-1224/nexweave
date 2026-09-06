@@ -41,6 +41,7 @@ add_library(nexweave_core_domain STATIC
   core/protocol/control_rpc.cpp
   core/protocol/data_event.cpp
   core/observability/observability.cpp
+  core/backend/fake_audio.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -146,5 +147,17 @@ target_include_directories(nexweave_observability_test PRIVATE ${CMAKE_CURRENT_S
 target_compile_options(nexweave_observability_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME observability_unit COMMAND nexweave_observability_test)
 set_tests_properties(observability_unit PROPERTIES LABELS "unit")
+
+add_executable(nexweave_fake_audio_test
+  tests/unit/fake_audio_test.cpp)
+target_link_libraries(nexweave_fake_audio_test PRIVATE nexweave_core_domain)
+target_include_directories(nexweave_fake_audio_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/backend)
+target_compile_options(nexweave_fake_audio_test PRIVATE -Wall -Wextra -Wpedantic)
+if(NEXWEAVE_WARNINGS_AS_ERRORS)
+  target_compile_options(nexweave_fake_audio_test PRIVATE -Werror)
+endif()
+add_test(NAME fake_audio_unit COMMAND nexweave_fake_audio_test)
+set_tests_properties(fake_audio_unit PROPERTIES LABELS "unit")
 
 
