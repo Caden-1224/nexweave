@@ -40,6 +40,7 @@ add_library(nexweave_core_domain STATIC
   core/observability/observability.cpp
   core/backend/fake_audio.cpp
   core/backend/fake_asr.cpp
+  core/backend/fake_rag.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -76,6 +77,7 @@ nexweave_test(data_event tests/unit/data_event_test.cpp unit)
 nexweave_test(observability tests/unit/observability_test.cpp unit)
 nexweave_test(fake_audio tests/unit/fake_audio_test.cpp unit)
 nexweave_test(fake_asr tests/unit/fake_asr_test.cpp unit)
+nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
 # 同一公共能力测试同时进入 contract 门禁，避免只测最小 Fixture 而漏掉实际 Fake。
 set_tests_properties(fake_asr_unit PROPERTIES LABELS "unit;contract")
 nexweave_test(protocol_boundaries tests/unit/protocol_boundaries_test.cpp unit)
