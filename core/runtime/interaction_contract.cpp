@@ -109,6 +109,10 @@ domain::Result<std::uint64_t> InteractionContractFixture::begin_generation() {
   if (generation_ == std::numeric_limits<std::uint64_t>::max()) {
     return domain::Result<std::uint64_t>::failure(domain::ErrorCode::kInvalidInput);
   }
+  if (generation_started_ && !terminal_) {
+    trace_.push_back(ActivityMarker::kOldOutputBlocked);
+    last_marker_ = ActivityMarker::kOldOutputBlocked;
+  }
   ++generation_;
   generation_started_ = true;
   generation_done_ = false;
