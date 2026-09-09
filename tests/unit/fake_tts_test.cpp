@@ -191,108 +191,141 @@ void TestCallbackFailureLocksRound() {
   CHECK(frames.size() == 2 + ExpectedFrameCount(text));
 }
 
-// 并发取消（块间线性化）：合成线程交付第 2 帧后停在屏障上，主线程此时
-// 调用 cancel()。回调返回后 synthesize 在“第 3 帧交付前”的检查点收敛为
-// kCancelled：恰好 2 帧被保留、其后没有任何新帧，取消前交付的帧不撤回。
-// 屏障保证主线程的 cancel() 与合成进度有确定先后关系，不依赖时间片。
-void TestConcurrentCancelStopsBeforeNextFrame() {
+// 重复运行与输出残留：成功返回后不存在任何迟到的后台交付；连续两次相同
+// 文本的帧数与逐采样内容完全一致，取消/失败的新调用不会追加旧轮次的帧。
+void TestRepeatAndNoResidue() {
   backend::FakeTts tts;
   capability::ITts& itts = tts;
-  const std::string text(400, 'a');  // 25 帧，足够留出取消窗口。
+  const std::string text(32, 'a');  // 恰好 2 帧。
   std::vector<domain::AudioFrame> frames;
-  std::atomic<int> delivered{0};
-  std::thread::id callback_thread{};
+  const auto record = [&](const domain::AudioFrame& frame) { frames.push_back(frame); };
+  CHECK(itts.set_callback(record).ok());
 
+  CHECK(itts.synthesize(text).ok());
+  const std::size_t first_round = frames.size();
+  CHECK(first_round == ExpectedFrameCount(text));
+  // 返回后先做若干无关操作（取消失败轮次），帧数必须保持，证明无迟到回调。
+  CHECK(itts.cancel().ok());
+  CHECK(itts.synthesize(text).error.code == domain::ErrorCode::kCancelled);
+  CHECK(frames.size() == first_round);
+  // 重新注册后重复运行：新旧两轮逐采样一致，无输出残留。
+  CHECK(itts.set_callback(record).ok());
+  CHECK(itts.synthesize(text).ok());
+  CHECK(frames.size() == 2 * first_round);
+  for (std::size_t index = 0; index < first_round; ++index) {
+    CHECK(frames[first_round + index].samples == frames[index].samples);
+  }
+}
+
+// ---- 并发取消的共享确定性夹具 ----
+
+// 一次“合成中途取消”的可复现运行结果；所有字段在 join 之后由调用方断言。
+struct ConcurrentCancelResult {
+  domain::OperationResult outcome = domain::OperationResult::success();
+  int delivered = 0;                     // 取消前实际交付的帧数。
+  std::vector<domain::AudioFrame> frames;  // 交付帧副本（worker 写、join 后读）。
+  std::thread::id worker_id{};           // 合成线程 id（join 前固化）。
+  std::thread::id callback_thread{};     // 回调所在线程 id（worker 写、join 后读）。
+};
+
+// 把合成停到可复现位置后由主线程 cancel() 再放行：
+//  - block_after_frames == 0：合成线程在进入 synthesize 之前等待，主线程
+//    先 cancel() 再放行，覆盖“首块前取消”以并发方式到达的边界；
+//  - block_after_frames == N（N >= 1）：回调交付第 N 帧后停在屏障上，主线程
+//    cancel() 再放行，覆盖“块间/回调进行中/结束边界”的取消。
+// 不使用 sleep：屏障与条件变量保证 cancel() 与合成进度的先后关系确定。
+// helper 内部除条件变量外不创建任何资源；回调只写本 helper 的结果字段。
+ConcurrentCancelResult RunConcurrentCancel(backend::FakeTts& tts,
+                                           const std::string& text,
+                                           int block_after_frames) {
+  ConcurrentCancelResult result;
+  std::atomic<int> delivered{0};
   std::mutex barrier_mutex;
   std::condition_variable reached_cv;
   std::condition_variable release_cv;
-  bool target_hit = false;
+  bool ready = false;
   bool released = false;
 
-  CHECK(itts.set_callback([&](const domain::AudioFrame& frame) {
-             frames.push_back(frame);
-             callback_thread = std::this_thread::get_id();
+  const auto wait_until_ready = [&] {
+    std::unique_lock<std::mutex> lock(barrier_mutex);
+    reached_cv.wait(lock, [&] { return ready; });
+  };
+  const auto mark_ready_and_wait = [&] {
+    std::unique_lock<std::mutex> lock(barrier_mutex);
+    ready = true;
+    reached_cv.notify_one();
+    release_cv.wait(lock, [&] { return released; });
+  };
+
+  CHECK(tts.set_callback([&](const domain::AudioFrame& frame) {
+             result.frames.push_back(frame);
+             result.callback_thread = std::this_thread::get_id();
              const int count = delivered.fetch_add(1) + 1;
-             if (count == 2) {
-               std::unique_lock<std::mutex> lock(barrier_mutex);
-               target_hit = true;
-               reached_cv.notify_one();
-               release_cv.wait(lock, [&] { return released; });
+             if (block_after_frames > 0 && count == block_after_frames) {
+               mark_ready_and_wait();
              }
            }).ok());
 
-  domain::OperationResult outcome = domain::OperationResult::success();
   std::thread worker([&] {
-    outcome = itts.synthesize(text);
+    if (block_after_frames == 0) {
+      mark_ready_and_wait();  // 首块前：先停住，等主线程 cancel() 完再开跑。
+    }
+    result.outcome = tts.synthesize(text);
   });
-  // join 后 get_id() 不再有效，先在 join 前保存工作线程 id 供断言使用。
-  const std::thread::id worker_id = worker.get_id();
-  {
-    std::unique_lock<std::mutex> lock(barrier_mutex);
-    reached_cv.wait(lock, [&] { return target_hit; });
-  }
-  CHECK(itts.cancel().ok());
+  result.worker_id = worker.get_id();  // join 后 get_id() 不再有效，先固化。
+
+  wait_until_ready();  // 合成已停在可复现点（第 N 帧回调内或 synthesize 入口）。
+  CHECK(tts.cancel().ok());
   {
     std::lock_guard<std::mutex> lock(barrier_mutex);
     released = true;
   }
   release_cv.notify_one();
   worker.join();
+  result.delivered = delivered.load();
+  return result;
+}
 
-  CHECK(outcome.error.code == domain::ErrorCode::kCancelled);
-  CHECK(delivered.load() == 2);
-  CHECK(frames.size() == 2);
-  CHECK(callback_thread == worker_id);
-  // 取消置位仍然保持：直接重试与重新注册后的行为与串行取消一致。
+// 并发取消（首块前）：cancel() 先于 synthesize 入口的检查到达（从另一线程
+// 到达，而非串行调用顺序），合成必须一帧不交即收敛为 kCancelled。
+void TestConcurrentCancelBeforeFirstFrame() {
+  backend::FakeTts tts;
+  capability::ITts& itts = tts;
+  const auto result = RunConcurrentCancel(tts, std::string(400, 'a'), 0);
+  CHECK(result.outcome.error.code == domain::ErrorCode::kCancelled);
+  CHECK(result.delivered == 0);
+  CHECK(result.frames.empty());
+  // 回调从未运行，无需线程归属断言；取消封锁保持到重新注册为止。
+  CHECK(itts.synthesize("再试").error.code == domain::ErrorCode::kCancelled);
+}
+
+// 并发取消（块间线性化）：合成线程交付第 2 帧后停在屏障上，主线程此时
+// 调用 cancel()。回调返回后 synthesize 在“第 3 帧交付前”的检查点收敛为
+// kCancelled：恰好 2 帧被保留、其后没有任何新帧，取消前交付的帧不撤回；
+// 回调必须运行在合成线程（无隐藏线程），取消后封锁保持。
+void TestConcurrentCancelStopsBeforeNextFrame() {
+  backend::FakeTts tts;
+  capability::ITts& itts = tts;
+  const auto result = RunConcurrentCancel(tts, std::string(400, 'a'), 2);
+  CHECK(result.outcome.error.code == domain::ErrorCode::kCancelled);
+  CHECK(result.delivered == 2);
+  CHECK(result.frames.size() == 2);
+  CHECK(result.callback_thread == result.worker_id);
   CHECK(itts.synthesize("再试").error.code == domain::ErrorCode::kCancelled);
 }
 
 // 并发取消（结束边界）：文本只有 2 帧，主线程在第 2 帧（最后一帧）回调
 // 进行中取消；synthesize 在“全部帧交付后、返回成功前”的检查点收敛为
-// kCancelled，证明“帧已发完”不会被误报成成功终态。
+// kCancelled，证明“帧已发完”不会被误报成成功终态（整段已交付，外层不得
+// 把该结果当可重试失败而整段重放）。
 void TestConcurrentCancelAtFinalFrame() {
   backend::FakeTts tts;
   capability::ITts& itts = tts;
-  const std::string text(32, 'a');  // 恰好 2 帧。
-  std::vector<domain::AudioFrame> frames;
-  std::atomic<int> delivered{0};
-
-  std::mutex barrier_mutex;
-  std::condition_variable reached_cv;
-  std::condition_variable release_cv;
-  bool target_hit = false;
-  bool released = false;
-
-  CHECK(itts.set_callback([&](const domain::AudioFrame& frame) {
-             frames.push_back(frame);
-             const int count = delivered.fetch_add(1) + 1;
-             if (count == 2) {
-               std::unique_lock<std::mutex> lock(barrier_mutex);
-               target_hit = true;
-               reached_cv.notify_one();
-               release_cv.wait(lock, [&] { return released; });
-             }
-           }).ok());
-
-  domain::OperationResult outcome = domain::OperationResult::success();
-  std::thread worker([&] {
-    outcome = itts.synthesize(text);
-  });
-  {
-    std::unique_lock<std::mutex> lock(barrier_mutex);
-    reached_cv.wait(lock, [&] { return target_hit; });
-  }
-  CHECK(itts.cancel().ok());
-  {
-    std::lock_guard<std::mutex> lock(barrier_mutex);
-    released = true;
-  }
-  release_cv.notify_one();
-  worker.join();
-
-  CHECK(outcome.error.code == domain::ErrorCode::kCancelled);
-  CHECK(delivered.load() == 2);
-  CHECK(frames.size() == 2);
+  const auto result = RunConcurrentCancel(tts, std::string(32, 'a'), 2);
+  CHECK(result.outcome.error.code == domain::ErrorCode::kCancelled);
+  CHECK(result.delivered == 2);
+  CHECK(result.frames.size() == 2);
+  CHECK(result.callback_thread == result.worker_id);
   CHECK(itts.synthesize("再试").error.code == domain::ErrorCode::kCancelled);
 }
 
@@ -304,6 +337,8 @@ int main() {
   TestInvalidInputRejectsWithoutFrames();
   TestCancelLocksUntilReregister();
   TestCallbackFailureLocksRound();
+  TestRepeatAndNoResidue();
+  TestConcurrentCancelBeforeFirstFrame();
   TestConcurrentCancelStopsBeforeNextFrame();
   TestConcurrentCancelAtFinalFrame();
 }

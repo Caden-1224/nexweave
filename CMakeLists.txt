@@ -85,7 +85,7 @@ nexweave_test(fake_llm tests/unit/fake_llm_test.cpp unit)
 nexweave_test(fake_tts tests/unit/fake_tts_test.cpp unit)
 nexweave_test(interaction_contract tests/unit/interaction_contract_test.cpp unit)
 # 同一公共能力测试同时进入 contract 门禁，避免只测最小 Fixture 而漏掉实际 Fake。
-set_tests_properties(fake_asr_unit PROPERTIES LABELS "unit;contract")
+set_tests_properties(fake_asr_unit fake_tts_unit PROPERTIES LABELS "unit;contract")
 nexweave_test(protocol_boundaries tests/unit/protocol_boundaries_test.cpp unit)
 
 # 门禁测试只在构建目录创建独立夹具，源码从不被改动；失败也以 trap 清理临时资源。

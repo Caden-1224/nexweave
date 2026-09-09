@@ -13,8 +13,9 @@
 namespace nexweave::backend {
 
 // 每帧（20 ms）承载的 UTF-8 输入字节数；只决定帧数步长，不代表真实语速或
-// 音素时长（真实合成与重采样由任务 42 的 MeloTTS 适配器交付）。数值是 v1
-// 设计约束，变更会同时改变全部确定性输出，需同步本文件与单元测试。
+// 音素时长（真实语速、重采样与尾帧语义见总规格“统一音频与尾部”，由真实
+// MeloTTS 适配器与后续 Session 层交付，本 Fake 不建模）。数值是 v1 设计
+// 约束，变更会同时改变全部确定性输出，需同步本文件与单元测试。
 inline constexpr std::size_t kFakeTtsBytesPerFrame = 16;
 
 // 合成波形的周期（采样数）：80 样本 @16 kHz = 5 ms，对应 200 Hz 方波。
@@ -35,7 +36,8 @@ inline constexpr std::int16_t kFakeTtsSquareAmplitude = 8000;
  * 同一文本每次合成得到逐采样一致的 PCM；不同文本因长度与起始相位不同而不同。
  * 本规则是“按文本增量产生确定性 PCM”的设计约束，不是对真实语音的建模；
  * 帧元数据固定为 v1 音频契约（16 kHz/单声道/S16_LE/320 样本），不产生短帧，
- * 不需要补零尾帧，尾部与重采样语义由 15/42 在各自层处理。
+ * 不需要补零尾帧；尾部补零与真实重采样语义见总规格“统一音频与尾部”，
+ * 由输入侧契约与真实适配器处理。
  *
  * 对象拥有回调副本与一个原子取消标志，不保存输出队列、不创建文件、线程、
  * 进程、socket 或设备句柄，也无内部 deadline。回调在 synthesize 的调用线程
@@ -47,10 +49,12 @@ inline constexpr std::int16_t kFakeTtsSquareAmplitude = 8000;
  * 与另一个线程上正在执行的 synthesize 并发；唯一例外是 cancel()，它可随时
  * 与其他线程进行中的 synthesize 并发（内部用 std::atomic 同步）。取消的
  * 线性化点是 synthesize 内“每帧交付前”的检查与“最后一帧交付后、返回前”
- * 的检查：已进入回调的帧不会被抢占或撤回，但取消置位后不再构造或交付新帧；
- * 若取消在全部帧交付后、返回成功前到达，synthesize 收敛为 kCancelled。
- * 取消后（无论是否曾并发）后续 synthesize 返回 kCancelled，只有成功
- * set_callback 才能开启新轮次；重复取消幂等且不抛异常、无分配。
+ * 的检查：取消在检查前到达的帧不会再交付；已通过检查或已进入回调的那一帧
+ * 至多完成本次交付，不会被撤回或抢占（并发窗口，无法撤销），取消从下一帧
+ * 的检查开始生效。若取消在全部帧交付后、返回成功前到达，synthesize 收敛为
+ * kCancelled——此时整段音频已经交付，调用方不得把该结果当作可重试失败而
+ * 整段重放。取消后（无论是否曾并发）后续 synthesize 返回 kCancelled，只有
+ * 成功 set_callback 才能开启新轮次；重复取消幂等且不抛异常、无分配。
  *
  * 错误与恢复：空文本或缺回调返回 kInvalidInput 且不发任何帧；回调或分配
  * 抛出的异常原样向上传播，同时置位取消封锁本轮，避免重试产生重复交付，
@@ -70,11 +74,13 @@ class FakeTts final : public capability::ITts {
 
   // 先查取消、再查回调与空文本，分别返回 kCancelled/kInvalidInput，失败不
   // 交付任何帧。成功时按确定性规则同步逐帧回调并返回 success；返回后没有
-  // 在途回调或迟到帧。详见类注释的线性化点与并发约定。
+  // 在途回调或迟到帧。并发取消的精确生效窗口见类注释与 cancel()。
   domain::OperationResult synthesize(const std::string& text) override;
 
   // 幂等、无分配、不抛异常；与进行中的 synthesize 并发安全，线性化点见类
-  // 注释。返回后已交付的帧无法撤回，也不会再有新的帧交付。
+  // 注释。串行使用时返回后绝无后续帧；并发使用时，若取消恰在一帧通过其
+  // 交付前检查之后到达，该帧仍会完成本次交付（无法撤回），此后不再有任何
+  // 新帧开始交付。已交付的帧始终归接收方所有。
   domain::OperationResult cancel() noexcept override;
 
  private:

@@ -46,9 +46,9 @@ domain::OperationResult FakeTts::synthesize(const std::string& text) {
 
   try {
     for (std::size_t frame_index = 0; frame_index < frame_count; ++frame_index) {
-      // 每帧交付前检查取消：这是并发 cancel 的线性化点之一。检查放在构造
-      // 帧之前，取消置位后不再消耗一次构造成本，也不会交付“取消后”的帧；
-      // 已进入回调的帧不在检查范围内，回调返回后下一次检查才生效。
+      // 每帧交付前检查取消：这是并发 cancel 的线性化点之一。取消在检查前
+      // 到达则本帧不再构造与交付；取消恰在检查之后、回调结束前到达时，本帧
+      // 仍会完成交付（并发窗口，无法撤回），取消从下一帧的检查开始生效。
       if (cancelled_.load()) {
         return domain::OperationResult::failure(domain::ErrorCode::kCancelled);
       }
@@ -69,8 +69,9 @@ domain::OperationResult FakeTts::synthesize(const std::string& text) {
     }
 
     // 结束边界：全部帧已交付但尚未返回时取消到达，仍收敛为 kCancelled，
-    // 不能把“帧已发完”误报为成功完成；已交付的帧无法撤回，取消只禁止
-    // 未来的新帧与新轮次。
+    // 不能把“帧已发完”误报为成功终态；整段音频已经交付，外层不得把该结果
+    // 当作可重试失败整段重放。已交付的帧无法撤回，取消只禁止后续新帧开始
+    // 交付以及开启新轮次。
     if (cancelled_.load()) {
       return domain::OperationResult::failure(domain::ErrorCode::kCancelled);
     }
@@ -86,6 +87,7 @@ domain::OperationResult FakeTts::synthesize(const std::string& text) {
 
 domain::OperationResult FakeTts::cancel() noexcept {
   // 原子置位即为串行与并发两种场景下的统一取消请求；无分配、不抛异常。
+  // 生效窗口（至多再交付一帧）由 synthesize 内的检查点决定，见头文件注释。
   cancelled_.store(true);
   return domain::OperationResult::success();
 }
