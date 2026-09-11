@@ -176,8 +176,9 @@ class ResidentAudioInput final : public IBargeInMonitor {
   // 源读取失败的统一处理：EOF 视为正常结束，其它错误视为需要放弃在途说话的失败。
   domain::Result<std::size_t> handle_source_error(const domain::Error& error,
                                                   std::size_t read_frames);
-  // 置终态并唤醒等待者，要求调用方已持有 mutex_。返回“是否需要关闭音频源”，
-  // 因为关闭可能等待工作线程退出，必须在锁外执行。
+  // 置终态并清除“仍在采集”，要求调用方已持有 mutex_；本函数不唤醒等待者，
+  // 唤醒统一由 finish_capture 在锁外完成。返回“是否需要关闭音频源”，因为关闭可能
+  // 等待工作线程退出，必须在锁外执行。
   bool close_capture_locked();
   // 在锁外关闭音频源；关闭失败只在尚无更早错误时记入 last_error_。
   void close_source(bool must_close);
