@@ -197,7 +197,12 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   cancel_requested_.store(false);
   queue_overflow_ = false;
   asr_text_.clear();
+  speech_interrupt_ = false;
+  speech_interrupt_notice_ = SpeechStartNotice{};
   router_.reset();
+  // 清空上一轮遗留的起音通知：那些语音属于本轮或更晚的说话，本轮回答还没有开口，
+  // 没有任何旧回答需要被打断；不清空会让新回答刚说出第一帧就被自己打断。
+  drain_barge_in_notices();
 
   if (!state_machine_.dispatch(SessionStateMachine::Event::kAudioStart).ok()) {
     result.error = domain::Error{ErrorCode::kInvalidInput, "会话已有在途轮次，必须先结束或取消"};
@@ -384,6 +389,9 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
       playback_started = true;
       contract_.start_playback(contract_.generation());
     }
+    // 播放交付边界是打断的线性化点：本帧已经交给播放组件之后才询问是否出现新语音，
+    // 因此“打断”与“已播出的声音”不会互相矛盾——已播出的帧永远保留。
+    poll_barge_in();
   });
 
   const auto synthesized = tts_.synthesize(result.text);
@@ -426,6 +434,13 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   if (cancel_requested_.load()) {
     result.cancelled = true;
     result.playback_done = false;
+    // 取消来源有三类：设备回调里的停止指令、控制意图、以及新语音打断。只有最后
+    // 一类会让 interrupted_by_speech 为真，使“回答被打断”和“用户喊停”在结果与
+    // 运行证据里可区分，而不是都表现为一次无来源的取消。
+    result.interrupted_by_speech = speech_interrupt_;
+    if (speech_interrupt_) {
+      result.interrupt_notice = speech_interrupt_notice_;
+    }
     playback_.stop();
     state_machine_.dispatch(SessionStateMachine::Event::kCancel, state_machine_.generation());
     finish_turn(result);
@@ -498,6 +513,38 @@ domain::OperationResult SessionRuntime::cancel() noexcept {
     return OperationResult::success();
   }
   return state_machine_.dispatch(SessionStateMachine::Event::kCancel);
+}
+
+void SessionRuntime::set_barge_in_monitor(IBargeInMonitor* monitor) noexcept {
+  barge_in_ = monitor;
+}
+
+void SessionRuntime::drain_barge_in_notices() {
+  if (barge_in_ == nullptr) {
+    return;
+  }
+  // 监视器每次只交付一条最早通知，因此循环取空。这里取到的通知一律丢弃而不是当成
+  // 打断：它们描述的是本轮开始之前就已经出现的说话，没有旧回答需要被打断；
+  // 对应的音频仍然留在常驻输入队列里，会作为本轮的输入被取走。
+  while (barge_in_->take_speech_started().has_value()) {
+  }
+}
+
+void SessionRuntime::poll_barge_in() {
+  if (barge_in_ == nullptr || cancel_requested_.load()) {
+    return;
+  }
+  const auto notice = barge_in_->take_speech_started();
+  if (!notice.has_value()) {
+    return;
+  }
+  // 顺序固定为“记录归属 → 置位停止标志 → 推进状态机”。先记录归属保证结果里一定
+  // 有打断原因；先置位再迁移，保证即使迁移因为代际过期而失败，也不会出现
+  // “状态机仍显示 Speaking，但停止标志已经置位”这种中间态被后续判定误读。
+  speech_interrupt_ = true;
+  speech_interrupt_notice_ = *notice;
+  cancel_requested_.store(true);
+  state_machine_.dispatch(SessionStateMachine::Event::kCancel, state_machine_.generation());
 }
 
 const SessionStateMachine& SessionRuntime::state_machine() const noexcept {

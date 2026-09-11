@@ -15,6 +15,7 @@
 #include "../capability/backend.hpp"
 #include "interaction_contract.hpp"
 #include "session_state_machine.hpp"
+#include "speech_segmentation.hpp"
 
 namespace nexweave::runtime {
 
@@ -59,6 +60,14 @@ struct SessionTurnResult {
   bool input_done = false;
   bool playback_started = false;
   bool playback_done = false;
+  // 本轮是否被“用户新语音”打断。它与控制意图取消（用户喊停）和设备失败区分开：
+  // 三者都以取消终态收敛，但只有它为真时 interrupt_notice 才携带新语音的归属。
+  bool interrupted_by_speech = false;
+  // 触发打断的新语音归属快照：stream_id 与 segment_id 说明是哪条输入流里的第几次
+  // 说话，start_sequence 说明该次说话的第一帧（含段头前置缓冲）。仅在
+  // interrupted_by_speech 为真时有效。打断只作废旧回答的输出，不取走新语音，
+  // 因此这些音频仍然留在常驻输入里，可以被下一轮完整取走。
+  SpeechStartNotice interrupt_notice;
 };
 
 // 具备确定性播放节奏的输出组件契约。Session 只负责“把合成帧交给播放组件并在
@@ -239,6 +248,13 @@ bool is_stop_control_action(const std::string& control_action);
 // 删除常驻输入流；停止类控制意图在本轮不合成任何音频，因此不会把“停止”变成知识
 // 问答，也不会为新回答留下残留输出。
 //
+// 打断语义（可选）：挂接 IBargeInMonitor 后，会话在每个播放交付边界消费一次
+// “用户是否开始说话”。出现新语音即走同一条取消路径打断当前回答，并把新语音的
+// 归属写入轮次结果。线性化点固定在“一帧已经交付给播放组件之后”：打断因此一定
+// 发生在某一帧的边界上，不会在两次交付之间凭空改变决定。会话只消费通知、不取走
+// 音频，所以新语音的开头仍然留在常驻输入里等下一轮取走。未挂接监视器时行为与
+// 既有串行路径完全一致。
+//
 // 资源与失败：Session 不拥有线程、文件、socket 或设备句柄，只借用注入的能力对象；
 // 唯一的自有资源是每轮结束即析构的标量与帧容器。任一阶段返回错误时，本轮按
 // “封锁旧输出 → 退出执行 → 清理播放 → Cancelling → Idle”收敛并保留结构化错误，
@@ -269,12 +285,29 @@ class SessionRuntime final {
   // 无轮次在途时调用是空操作，不影响下一次 run() 的新代际。
   domain::OperationResult cancel() noexcept;
 
+  // 挂接打断监视器：会话在每个播放交付边界消费一次“用户新语音起音”通知，
+  // 出现即按统一取消语义打断当前回答。monitor 是借用指针，必须比本对象活得久；
+  // 传 nullptr 关闭监视，这是默认行为，与既有串行路径一致。
+  // 每轮开始时监视器的遗留通知会被清空：那些通知属于本轮前后才出现的说话，
+  // 把它们算到新回答头上会让新回答刚开口就被自己打断。
+  void set_barge_in_monitor(IBargeInMonitor* monitor) noexcept;
+
   // 状态机只读访问：供测试与运行证据核对阶段轨迹和当前代际。
   const SessionStateMachine& state_machine() const noexcept;
   // 活动标记快照，顺序即提交顺序。
   std::vector<ActivityMarker> trace() const;
 
  private:
+  // 在一个播放交付边界消费打断监视器：出现新语音就置位停止标志并把状态机推进到
+  // Cancelling，同时记录归属。它只做一次非阻塞查询、一次原子置位和一次状态迁移，
+  // 不等待后端；未挂接监视器或本轮已经取消时是空操作。
+  // 同步前提：按 IAsr/ITts 的既有约定，能力回调在发起调用的线程上同步执行，因此本函数
+  // 与 run() 同线程，speech_interrupt_ 等成员不需要原子化；ITts 另行保证 synthesize
+  // 返回前所有回调都已结束，回调不会活过本轮。若后续适配器改为在独立回调线程上投递
+  // 事件，必须先为这些成员补上同步并重新声明回调寿命，不能直接复用本实现。
+  void poll_barge_in();
+  // 清空监视器里遗留的起音通知；每轮开始时调用，避免把本轮之前的旧语音算成打断。
+  void drain_barge_in_notices();
   // 结束本轮的状态机与活动标记：无论成功、取消还是失败都收敛到 Idle，并追加
   // 恰好一个终态标记。调用前必须已经停止播放并解除停止标志借用。
   void finish_turn(SessionTurnResult& result);
@@ -292,6 +325,13 @@ class SessionRuntime final {
   SessionStateMachine state_machine_;
   InteractionContractFixture contract_;
   std::atomic<bool> cancel_requested_{false};
+
+  // 可选的打断监视器（借用）。nullptr 表示关闭打断监视：回调里因此不产生任何
+  // 额外分支，既有串行路径的行为与开销都不变。
+  IBargeInMonitor* barge_in_ = nullptr;
+  // 本轮是否由新语音触发取消，以及该语音的归属；每轮开始时清空。
+  bool speech_interrupt_ = false;
+  SpeechStartNotice speech_interrupt_notice_;
 
   // 常驻输入流状态：stream_id 跨轮次保持，只有 finish_stream() 关闭。输入序号由
   // 交互契约夹具自己维护（本路径的逐帧音频由 ASR 消费，不经过夹具）。

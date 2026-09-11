@@ -33,7 +33,7 @@ NexWeave 面向华为昇腾 AI 计算平台、鲲鹏处理器平台、瑞芯微 
 | WSL / 通用 Linux 开发环境 | 构建核心模块和执行确定性测试 | 已验证当前开发配置 |
 | 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | 硬件适配尚未完成 |
 
-> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS 与 Fake RAG 路由。完整 Session、网络服务、真实模型和板端语音交互尚未交付。
+> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由，以及常驻音频输入与语音分段。完整 Session、网络服务、真实模型和板端语音交互尚未交付。
 
 <a id="background"></a>
 
@@ -229,7 +229,8 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | Fake RAG L0-L3 路由 | 已实现 | 固定检索夹具、分级决策与取消封锁 |
 | Fake 流式 LLM | 已实现 | 确定性 token 流、取消与回调失败封锁 |
 | Fake 流式 TTS | 已实现 | 逐帧 PCM、确定性波形与并发取消 |
-| Session L0/L1 语音路径 | 已实现基础版 | 音频到识别、L1 直答、播放节奏与取消收敛；L2/L3、持续输入和端到端取消待后续任务 |
+| Session L0/L1 语音路径 | 已实现基础版 | 音频到识别、L1 直答、播放节奏与取消收敛；L2/L3 与端到端取消待后续任务 |
+| 常驻音频输入与语音分段 | 已实现基础版 | 跨轮次保持的单一输入拥有者、确定性活动脚本、前置缓冲与容量上限、播报期间新语音打断旧回答；真实 VAD、跨进程取消待后续任务 |
 | Gateway、Supervisor 与 ZeroMQ | 规划中 | 控制响应、增量传输、背压和子进程生命周期 |
 | 本地知识库与真实检索 | 规划中 | 知识数据加载、词项检索和路由校准 |
 | RK3576 模型与音频前端 | 规划中 | RKNN、RKLLM、MeloTTS、ALSA、AEC 和 VAD |
@@ -238,6 +239,8 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 Fake ASR 不识别真实波形，而是按预设脚本产生事件。它用于验证协议和生命周期，不提供语音识别准确率。
 
 Session 的 L0/L1 路径同样只编排注入的确定性能力：它把输入音频交给识别能力，按路由级别选择直答文本，逐帧合成 PCM 并交给播放组件，最后以“文本定稿 → 合成结束 → 播放结束”的顺序收尾。播放是否完成由注入的播放组件报告，因此同一段音频在设备时间不前进时会被如实报告为“未完成”，而不是把合成结束当成播放结束。停止类控制意图不进入检索与合成，按统一取消语义收敛。
+
+常驻音频输入把“持续采集”和“按轮次回答”分开：一条输入流只有一个拥有者，采集生命周期跨越多轮回答，回答正常收尾或被取消都不会关闭采集，也不会丢弃已经攒下的新语音。语音分段由固定活动脚本驱动，用显式的前置缓冲、静音超时和长度上限复现起音、结束、短脉冲与最长说话，不依赖真实时间或睡眠；逐帧活动判定是一个可替换接缝，真实 VAD 将在后续任务接入同一分段契约。会话在播放交付边界消费“用户开始说话”的通知，按统一取消语义打断旧回答，而新语音的开头仍留在输入队列里，作为下一轮的输入被逐帧识别。
 
 <a id="quick-start"></a>
 
@@ -339,7 +342,7 @@ ctest --test-dir build/strict -L contract --output-on-failure
 |---|---|
 | [core/domain](https://github.com/Caden-1224/nexweave/tree/main/core/domain) | 标识、生成代际、音频帧、版本与错误 |
 | [core/capability](https://github.com/Caden-1224/nexweave/tree/main/core/capability) | 后端接口及输入、取消、回调约定 |
-| [core/runtime](https://github.com/Caden-1224/nexweave/tree/main/core/runtime) | Session 状态迁移与代际检查 |
+| [core/runtime](https://github.com/Caden-1224/nexweave/tree/main/core/runtime) | Session 状态迁移与代际检查、常驻音频输入、语音分段与打断接缝 |
 | [core/protocol](https://github.com/Caden-1224/nexweave/tree/main/core/protocol) | 控制消息、数据事件与序列化校验 |
 | [core/backend](https://github.com/Caden-1224/nexweave/tree/main/core/backend) | Fake 音频与流式 ASR |
 | [core/observability](https://github.com/Caden-1224/nexweave/tree/main/core/observability) | 运行清单、事件与指标值对象 |
@@ -356,7 +359,8 @@ ctest --test-dir build/strict -L contract --output-on-failure
 - [x] 标识、音频、错误、状态机、代际与协议基础
 - [x] Fake 音频输入输出与流式 ASR
 - [ ] 交互契约扩展、Fake RAG/LLM/TTS 与完整 Session
-- [ ] 持续监听、生成播放重叠与端到端取消
+- [x] 常驻音频输入、语音分段与播报期间打断（确定性 Fake）
+- [ ] 生成与播放重叠、端到端取消
 - [ ] Gateway、Supervisor、增量传输与有界多进程链路
 - [ ] 本地知识库、真实检索与路由校准
 - [ ] RK3576 模型、全双工音频前端与语音打断
