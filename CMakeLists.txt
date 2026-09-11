@@ -44,6 +44,7 @@ add_library(nexweave_core_domain STATIC
   core/backend/fake_llm.cpp
   core/backend/fake_tts.cpp
   core/runtime/interaction_contract.cpp
+  core/runtime/session_runtime.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -83,7 +84,9 @@ nexweave_test(fake_asr tests/unit/fake_asr_test.cpp unit)
 nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
 nexweave_test(fake_llm tests/unit/fake_llm_test.cpp unit)
 nexweave_test(fake_tts tests/unit/fake_tts_test.cpp unit)
+nexweave_test(playback_clock tests/unit/playback_clock_test.cpp unit)
 nexweave_test(interaction_contract tests/unit/interaction_contract_test.cpp unit)
+nexweave_test(session_l0_l1 tests/integration/session_l0_l1_test.cpp integration)
 # 同一公共能力测试同时进入 contract 门禁，避免只测最小 Fixture 而漏掉实际 Fake。
 set_tests_properties(fake_asr_unit fake_tts_unit PROPERTIES LABELS "unit;contract")
 nexweave_test(protocol_boundaries tests/unit/protocol_boundaries_test.cpp unit)

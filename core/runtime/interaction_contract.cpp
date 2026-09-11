@@ -209,4 +209,8 @@ bool InteractionContractFixture::terminal() const noexcept {
   return terminal_;
 }
 
+std::uint64_t InteractionContractFixture::generation() const noexcept {
+  return generation_;
+}
+
 }  // namespace nexweave::runtime

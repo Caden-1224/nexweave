@@ -88,6 +88,10 @@ class InteractionContractFixture final {
   ActivityMarker last_marker() const noexcept;
   std::vector<ActivityMarker> trace() const;
   bool terminal() const noexcept;
+  // 当前回答代际水位。调用方（例如 Session 编排）在提交完成标记或取消时必须使用
+  // 这个值，而不是自己维护的副本：夹具在 begin_generation() 里推进水位，本地副本
+  // 一旦脱节，标记就会被当成旧代际而拒绝。未开启任何代际时返回 0。
+  std::uint64_t generation() const noexcept;
 
  private:
   std::string stream_id_;
