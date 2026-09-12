@@ -47,6 +47,29 @@ std::string normalize_action(const std::string& action) {
   return output;
 }
 
+// “某个后端本轮确实在途”的作用域标记：构造置位、析构清零。取消传播据此只触碰真正
+// 在执行的调用，而不会给本轮没跑过的后端留下副作用。之所以用 RAII 而不是前后成对赋值：
+// 生成器与合成器都允许异常向上传播，手写配对会在异常路径上漏掉清零，从而让一次异常
+// 在会话里留下“后端仍在途”的假象，下一次取消就会去打一个已经返回的后端。
+// 标记本身是原子量：取消可以由设备或能力组件的回调发起，而按类注释的并发约定，那条
+// 回调未必与 run() 同线程，普通 bool 的读写在那种调用下是数据竞争。
+// 不可嵌套使用：内层析构会提前把标志清零，使外层仍在执行的调用被误判成“已经返回”。
+// 本类只在同一处成对使用，因此无需引用计数。
+class ActiveRoundGuard final {
+ public:
+  explicit ActiveRoundGuard(std::atomic<bool>& flag) noexcept : flag_(flag) {
+    flag_.store(true);
+  }
+  ~ActiveRoundGuard() {
+    flag_.store(false);
+  }
+  ActiveRoundGuard(const ActiveRoundGuard&) = delete;
+  ActiveRoundGuard& operator=(const ActiveRoundGuard&) = delete;
+
+ private:
+  std::atomic<bool>& flag_;
+};
+
 // 会话是否已经识别到可回答的文本。全空白文本等价于“没有语音”，必须在路由前
 // 收敛：否则静音会被当成一次检索请求，产生没有用户意图的回答。
 bool has_speech_text(const std::string& text) {
@@ -253,6 +276,11 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   llm_error_.reset();
   playback_backpressure_ = false;
   playback_peak_pending_ = 0;
+  // 取消传播的簿记同样每轮复位：上一轮的“已经通知过后端”不能让本轮的取消变成静默，
+  // 而上一轮残留的“后端在途”标记会让本轮取消去触碰一个并没有在跑的后端。
+  llm_round_active_.store(false);
+  tts_round_active_.store(false);
+  execution_cancel_notified_.store(false);
   // 清空上一轮遗留的起音通知：那些语音属于本轮或更晚的说话，本轮回答还没有开口，
   // 没有任何旧回答需要被打断；不清空会让新回答刚说出第一帧就被自己打断。
   drain_barge_in_notices();
@@ -318,7 +346,14 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
 
   // 逐帧提交给 ASR：最后一帧带 is_last，Fake ASR 据此发布 final。补零尾部在这里
   // 保持其真实有效样本数（由 pad_audio_samples 计算），ASR 只关心帧本身。
+  // 每个帧边界先检查停止标志：能力组件可以在回调里请求取消（例如识别在某一帧上判定
+  // “用户喊停”），受理后继续送帧只会把已经被作废的音频接着喂给识别。
+  bool all_frames_submitted = true;
   for (std::size_t index = 0; index < frames.value->size(); ++index) {
+    if (cancel_requested_.load()) {
+      all_frames_submitted = false;
+      break;
+    }
     const bool is_last = index + 1 == frames.value->size();
     const auto fed = asr_.feed(frames.value->at(index).frame, is_last);
     if (!fed.ok()) {
@@ -327,7 +362,19 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
       return result;
     }
   }
-  result.input_done = true;
+  result.input_done = all_frames_submitted;
+  if (cancel_requested_.load()) {
+    // Listening 阶段的统一取消（也覆盖紧随其后的 Routing 边界，见头文件第 2 条）：送帧
+    // 已经停止，本轮不可能再产生回答，因此既不提交 AsrFinal 迁移，也不检索、不生成、不合成。
+    // asr_.cancel() 刻意放在循环之外：IAsr 不允许在 feed 回调中重入，而这里调用栈上已经
+    // 没有任何识别回调。迟到的 partial/final 即使已经写进 asr_text_，也不会被任何后续步骤
+    // 读取——本函数直接返回，asr_text_ 由下一轮开头清空，这就是“旧识别结果不污染新请求”的落点。
+    (void)asr_.cancel();
+    result.cancelled = true;
+    state_machine_.dispatch(SessionStateMachine::Event::kCancel, state_machine_.generation());
+    finish_turn(result);
+    return result;
+  }
 
   // 空文本或全空白文本表示没有可回答的语音内容：在路由之前收敛，避免把静音
   // 变成一次检索、一次合成或一次空洞回答。
@@ -363,10 +410,11 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
     if (is_stop_control_action(decision.value->control_action)) {
       // 停止类控制动作是唯一有明确定义的 L0 行为，按统一取消语义收尾；规格不允许
       // 把它降级成普通知识问答，因此这里没有“仅记录并拒绝”的替代策略。
+      // 刻意走与设备回调、新语音打断同一个 cancel() 入口：置位、向在途后端传播、状态迁移
+      // 三件事只有一份实现，将来若在这个分支与路由之间插入任何在途后端调用，也不会漏掉
+      // “通知执行退出”这一步。
       result.cancelled = true;
-      cancel_requested_.store(true);
-      state_machine_.dispatch(SessionStateMachine::Event::kCancel,
-                              state_machine_.generation());
+      (void)cancel();
     } else {
       // 其余控制动作不在本版 L0/L1 语义内：明确拒绝，也不伪造回答。
       result.error = domain::Error{ErrorCode::kInvalidInput, "控制意图不由 L0/L1 语音路径回答"};
@@ -424,7 +472,13 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
     (void)deliver_frame(frame, playback_started);
   });
 
-  const auto synthesized = tts_.synthesize(result.text);
+  OperationResult synthesized;
+  {
+    // 合成期间标记 TTS 在途：取消若在某一帧的回调里到达，就会据此把 cancel() 传播给
+    // 合成器，让它从下一帧起停止产出，而不是把整段回答算完再整段丢弃。
+    ActiveRoundGuard tts_round(tts_round_active_);
+    synthesized = tts_.synthesize(result.text);
+  }
   // 回调按引用捕获本轮局部量，必须在本函数返回前注销，否则下一轮合成会调用过期回调。
   detach_tts_callback();
   playback_.set_cancelled_flag(nullptr);
@@ -533,14 +587,10 @@ bool SessionRuntime::settle_playback_stage(SessionTurnResult& result,
     finish_turn(result);
     return false;
   }
-  if (!synthesized.ok()) {
-    result.playback_done = false;
-    result.error = synthesized.error;
-    abort_playback(result, outcome);
-    finish_turn(result);
-    return false;
-  }
   if (cancel_requested_.load()) {
+    // 取消排在合成/生成失败之前：取消一旦受理，本轮就已经是取消，被取消的后端随后返回的
+    // kCancelled（或它自己的失败）只是取消的结果，不是独立故障；顺序若反过来，一次正常
+    // 取消会被报成后端错误，调用方就分不清“用户停止”和“节点坏掉”。
     result.cancelled = true;
     result.playback_done = false;
     // 三类取消（设备回调里的停止指令、控制意图、新语音打断）共用这条收敛路径，只有
@@ -550,6 +600,13 @@ bool SessionRuntime::settle_playback_stage(SessionTurnResult& result,
     // 取消必须显式推进状态机：轨迹里要出现 Cancelling，而不是从 Thinking/Speaking
     // 直接跳回 Idle，否则“旧输出已封锁”这一事实会消失。
     state_machine_.dispatch(SessionStateMachine::Event::kCancel, state_machine_.generation());
+    finish_turn(result);
+    return false;
+  }
+  if (!synthesized.ok()) {
+    result.playback_done = false;
+    result.error = synthesized.error;
+    abort_playback(result, outcome);
     finish_turn(result);
     return false;
   }
@@ -594,7 +651,13 @@ void SessionRuntime::abort_playback(SessionTurnResult& result,
                                     const PlaybackOutcome& outcome) {
   // 顺序固定为“停止播放 → 填入证据”。先停止保证返回后不会再有新帧写出；证据在停止
   // 之后读取，如实反映“停止前交付了多少、播完了多少”。
-  playback_.stop();
+  // 停止的返回值必须留下来：清理失败意味着“待播数据已经被丢弃”这一事实并不成立，
+  // 此时把取消报告成已经静默就是虚假承诺。只记第一处失败，避免收尾里的第二次 stop()
+  // 覆盖根因；终态本身不受影响，因为本轮确实已经被取消。
+  const auto stopped = playback_.stop();
+  if (!stopped.ok() && result.cleanup_error.ok()) {
+    result.cleanup_error = stopped.error;
+  }
   result.pcm_frames = playback_.played_frames();
   result.playback_started = outcome.started;
   result.playback_done = false;
@@ -740,17 +803,24 @@ void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
 
   OperationResult generated;
   bool generation_threw = false;
-  try {
-    generated = llm_->generate(prompt);
-  } catch (const std::exception& error) {
-    // 后端抛出异常：按后端失败收敛，但播放、回调与状态机仍必须走统一的清理路径，
-    // 因此先记录错误，让控制流继续到收尾，而不是让异常穿过本对象。
-    llm_error_ = domain::Error{ErrorCode::kBackendFailure,
-                               std::string("LLM 生成抛出异常: ") + error.what()};
-    generation_threw = true;
-  } catch (...) {
-    llm_error_ = domain::Error{ErrorCode::kBackendFailure, "LLM 生成抛出未知异常"};
-    generation_threw = true;
+  {
+    // 生成期间标记 LLM 在途：取消若在 token 回调（含由该 token 触发的合成与播放回调）
+    // 里到达，就会据此把 cancel() 传播给生成器，使它从下一个 token 起停止产出。
+    // 作用域刻意收在这一次 generate 调用内：之后的尾段刷新属于合成阶段，那时的取消
+    // 应当传导给合成器，而不是继续打在一个已经返回的生成器上。
+    ActiveRoundGuard llm_round(llm_round_active_);
+    try {
+      generated = llm_->generate(prompt);
+    } catch (const std::exception& error) {
+      // 后端抛出异常：按后端失败收敛，但播放、回调与状态机仍必须走统一的清理路径，
+      // 因此先记录错误，让控制流继续到收尾，而不是让异常穿过本对象。
+      llm_error_ = domain::Error{ErrorCode::kBackendFailure,
+                                 std::string("LLM 生成抛出异常: ") + error.what()};
+      generation_threw = true;
+    } catch (...) {
+      llm_error_ = domain::Error{ErrorCode::kBackendFailure, "LLM 生成抛出未知异常"};
+      generation_threw = true;
+    }
   }
   if (probe != nullptr) {
     // 只报告真实发生的事实：正常返回才算“生成完成”，异常路径报告失败。把异常也报成
@@ -797,7 +867,9 @@ void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
 
   result.text = llm_text_;
   // 生成侧的错误在裁决之前挂到 operation result 上，使两条路径共用同一段判定顺序：
-  // 背压 → 生成/合成失败 → 取消 → 设备错误 → 无输出 → 未播完。
+  // 背压 → 取消 → 生成/合成失败 → 设备错误 → 无输出 → 未播完。取消排在生成/合成失败
+  // 之前，是因为被取消的后端随后返回的 kCancelled 是取消的结果而不是独立故障，理由见
+  // settle_playback_stage 的注释。
   OperationResult generated_result;
   if (llm_error_.has_value()) {
     generated_result = OperationResult::failure(llm_error_->code, llm_error_->message);
@@ -843,8 +915,24 @@ void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
 }
 
 bool SessionRuntime::synthesize_chunk(const TextChunk& chunk) {
-  const auto synthesized = tts_.synthesize(chunk.text);
+  // 停止已受理：不再启动新的合成。kCancelled 与“合成失败”是两件事，因此下面的失败
+  // 分支要按停止标志区分，不能把取消造成的提前返回记成合成器故障。
+  if (cancel_requested_.load()) {
+    return false;
+  }
+  domain::OperationResult synthesized;
+  {
+    // 合成期间标记 TTS 在途：取消若在某一帧的回调里到达，就会据此把 cancel() 传播给
+    // 合成器，让它从下一帧起停止产出。片段是逐句合成的，被取消时后续片段不再开始。
+    ActiveRoundGuard tts_round(tts_round_active_);
+    synthesized = tts_.synthesize(chunk.text);
+  }
   if (!synthesized.ok()) {
+    if (cancel_requested_.load()) {
+      // 合成是被本轮取消打断的：这是取消的结果，不是独立故障。把它写成 llm_error_
+      // 会让一次正常取消在终态裁决里被报成后端错误，调用方也就分不清“用户停止”和“节点坏掉”。
+      return false;
+    }
     // 合成失败：记录第一处失败并停止后续片段。继续合成只会把更多音频交付给一个已经
     // 无法成功收尾的轮次，既浪费算力也让“哪一处失败”变得难以追溯。
     if (!llm_error_.has_value()) {
@@ -879,10 +967,37 @@ domain::OperationResult SessionRuntime::finish_stream() {
 
 domain::OperationResult SessionRuntime::cancel() noexcept {
   cancel_requested_.store(true);
+  // 先传播停止再迁移状态：传播的线性化点由此落在“状态机已经显示 Cancelling”之前完成，
+  // 任何在后端回调里读到的阶段都不会出现“仍在 Thinking/Speaking 但后端已经停了”的反向错觉。
+  // 注意这两步的幂等性并不相同：传播由 execution_cancel_notified_ 去重，重复调用是空操作；
+  // 状态迁移则不是幂等的——已经处于 Cancelling 时再次 dispatch(kCancel) 会返回 kInvalidInput，
+  // 如实表达“本次调用没有改变任何状态”，并且不会产生第二个终态。
+  notify_execution_cancel();
   if (state_machine_.state() == SessionStateMachine::State::kIdle) {
     return OperationResult::success();
   }
   return state_machine_.dispatch(SessionStateMachine::Event::kCancel);
+}
+
+void SessionRuntime::notify_execution_cancel() noexcept {
+  // exchange 而不是“先读后写”：取消可能由设备或能力组件的回调发起，那条回调未必与 run()
+  // 同线程；check-then-set 会让两次并发取消都通过判断，从而把“一次取消”放大成两次后端
+  // 副作用，与“每轮至多传播一次”的承诺不符。
+  if (execution_cancel_notified_.exchange(true)) {
+    return;
+  }
+  // 顺序固定为“先内层合成、后外层生成”。生成器的 token 回调会同步驱动合成与播放，
+  // 因此取消到达时两者可能同时在途；先让正在产出音频的合成器停下，可以少合成一帧，
+  // 再让生成器停止产出 token。反过来做也能收敛，但会多交付一段注定被丢弃的音频。
+  // 两次调用都依赖 capability/backend.hpp 声明的重入例外：ILlm 与 ITts 的 cancel() 必须
+  // 可在投递回调内被调用且非阻塞。这是能力契约的一部分，适配器不满足即为不合规，会话不
+  // 为不合规的适配器准备降级路径。
+  if (tts_round_active_.load()) {
+    (void)tts_.cancel();
+  }
+  if (llm_round_active_.load() && llm_ != nullptr) {
+    (void)llm_->cancel();
+  }
 }
 
 void SessionRuntime::set_barge_in_monitor(IBargeInMonitor* monitor) noexcept {
@@ -908,12 +1023,15 @@ void SessionRuntime::poll_barge_in() {
   if (!notice.has_value()) {
     return;
   }
-  // 顺序固定为“记录归属 → 置位停止标志 → 推进状态机”。先记录归属保证结果里一定
-  // 有打断原因；先置位再迁移，保证即使迁移因为代际过期而失败，也不会出现
+  // 顺序固定为“记录归属 → 置位停止标志 → 传播后端停止 → 推进状态机”。先记录归属保证
+  // 结果里一定有打断原因；先置位再迁移，保证即使迁移因为代际过期而失败，也不会出现
   // “状态机仍显示 Speaking，但停止标志已经置位”这种中间态被后续判定误读。
+  // 传播放在迁移之前：后端停止是“执行退出”的事实，状态机的 Cancelling 是对它的登记，
+  // 先有事实再登记，证据链才不会被解释成“先宣布停止、之后才真的停”。
   speech_interrupt_ = true;
   speech_interrupt_notice_ = *notice;
   cancel_requested_.store(true);
+  notify_execution_cancel();
   state_machine_.dispatch(SessionStateMachine::Event::kCancel, state_machine_.generation());
 }
 
@@ -930,7 +1048,12 @@ void SessionRuntime::finish_turn(SessionTurnResult& result) {
   // 无论成功、取消还是失败，播放组件都必须在本轮结束时停止并释放轮次资源：
   // 成功路径同样要释放，否则常驻会话的下一轮会因为“上一轮还开着”而无法开始播放。
   // stop() 幂等，重复调用无副作用；已写入设备的声音不受影响。
-  playback_.stop();
+  // 与 abort_playback 共用同一处失败记录：取消/失败路径上 abort_playback 已经调用过一次
+  // stop()，这里只补记它的失败，不覆盖更早的根因。
+  const auto stopped = playback_.stop();
+  if (!stopped.ok() && result.cleanup_error.ok()) {
+    result.cleanup_error = stopped.error;
+  }
   playback_.set_cancelled_flag(nullptr);
   result.state = state_machine_.state();
 
