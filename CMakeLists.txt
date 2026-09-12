@@ -59,6 +59,21 @@ target_link_libraries(nexweave_core_domain
   PUBLIC Threads::Threads
 )
 
+# 应用层：把能力夹具、会话编排与输入生产者组装成可运行对象。它与核心库分开编译，
+# 因此“应用入口”不进入核心依赖，核心也不会反向依赖命令行。
+add_library(nexweave_app STATIC
+  core/app/session_app.cpp
+)
+target_include_directories(nexweave_app PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/app
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+)
+target_link_libraries(nexweave_app
+  PUBLIC nexweave_core_domain
+  PRIVATE nexweave_warnings nlohmann_json::nlohmann_json
+)
+
 enable_testing()
 # 所有测试通过同一配置入口注册，新增目标不会漏掉警告门禁。
 function(nexweave_test name source label)
@@ -99,7 +114,28 @@ nexweave_test(resident_input tests/integration/resident_input_session_test.cpp i
 set_tests_properties(resident_input_integration PROPERTIES TIMEOUT 60)
 # 同一公共能力测试同时进入 contract 门禁，避免只测最小 Fixture 而漏掉实际 Fake。
 set_tests_properties(fake_asr_unit fake_tts_unit PROPERTIES LABELS "unit;contract")
+nexweave_test(session_app tests/integration/session_app_test.cpp integration)
+# 应用测试同时需要应用层与核心层：它既验收组装结果，也比对会话层的公开证据。
+target_link_libraries(nexweave_session_app_test PRIVATE nexweave_app)
+target_include_directories(nexweave_session_app_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/app)
 nexweave_test(protocol_boundaries tests/unit/protocol_boundaries_test.cpp unit)
+
+# 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。
+add_executable(nexweave_session_app apps/session_app/main.cpp)
+target_link_libraries(nexweave_session_app PRIVATE
+  nexweave_app nexweave_warnings nlohmann_json::nlohmann_json)
+target_include_directories(nexweave_session_app PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/observability)
+
+# 命令行门禁：验收参数错误、三种输入模式可运行、确定性一致与信号退出。
+# 它只调用已经构建好的可执行文件，不修改源码，也不后台启动进程。
+add_test(NAME session_app_cli
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/gate/session_app_cli_test.sh
+          $<TARGET_FILE:nexweave_session_app>)
+set_tests_properties(session_app_cli PROPERTIES LABELS "gate" TIMEOUT 60)
 
 # 门禁测试只在构建目录创建独立夹具，源码从不被改动；失败也以 trap 清理临时资源。
 add_test(NAME gate_scripts_failure COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/gate/gate_test.sh)

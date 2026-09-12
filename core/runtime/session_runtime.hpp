@@ -363,6 +363,14 @@ class SessionRuntime final {
   // 把它们算到新回答头上会让新回答刚开口就被自己打断。
   void set_barge_in_monitor(IBargeInMonitor* monitor) noexcept;
 
+  // 挂接生成进度观察者（借用指针，可为 nullptr）。后端同时实现 IGenerationProbe 时，本类
+  // 在每次生成期间把自己包装成观察者并转发给它，因此“首段播放早于生成结束”这类跨阶段
+  // 事实可以被外部按事件顺序核对，而不需要知道后端的具体类型。未挂接时不产生任何额外
+  // 分支；后端不支持该接缝时挂接被忽略，生成与取消语义不变。
+  // 生命周期：观察者必须活到本对象析构。它是借用指针，因此可以在本对象构造之后再挂接。
+  // 回调在生成线程上同步执行，实现必须非阻塞、不抛异常。
+  void set_generation_observer(capability::IGenerationObserver* observer) noexcept;
+
   // 状态机只读访问：供测试与运行证据核对阶段轨迹和当前代际。
   const SessionStateMachine& state_machine() const noexcept;
   // 活动标记快照，顺序即提交顺序。
@@ -470,6 +478,9 @@ class SessionRuntime final {
   // 可选的打断监视器（借用）。nullptr 表示关闭打断监视：回调里因此不产生任何
   // 额外分支，既有串行路径的行为与开销都不变。
   IBargeInMonitor* barge_in_ = nullptr;
+  // 可选的生成进度观察者（借用，可为 nullptr）。每轮重新挂到支持该接缝的后端上，
+  // 因此它可以在本对象构造之后再注册。
+  capability::IGenerationObserver* generation_observer_ = nullptr;
   // 本轮是否由新语音触发取消，以及该语音的归属；每轮开始时清空。
   bool speech_interrupt_ = false;
   SpeechStartNotice speech_interrupt_notice_;

@@ -70,6 +70,49 @@ class ActiveRoundGuard final {
   std::atomic<bool>& flag_;
 };
 
+// 生成进度转发器：把“后端报告的生成事实”转给会话拥有者注册的观察者。
+// 会话层实现 IGenerationProbe（它需要接收后端的事实来驱动分句与播放），而运行证据需要的
+// 是同一批事实的副本，因此这里再包一层：后端只认一个探针，探针内部把事件同时交给会话与
+// 观察者。观察者可以为空，此时本对象等价于会话自己，不产生任何额外分支。
+class RelayGenerationProbe final : public capability::IGenerationProbe {
+ public:
+  RelayGenerationProbe(capability::IGenerationProbe& inner,
+                       capability::IGenerationObserver* observer) noexcept
+      : inner_(inner), observer_(observer) {}
+
+  void on_generation_started() override {
+    inner_.on_generation_started();
+    if (observer_ != nullptr) {
+      observer_->on_generation_started();
+    }
+  }
+
+  void on_token_delivered(const std::string& token) override {
+    inner_.on_token_delivered(token);
+    if (observer_ != nullptr) {
+      observer_->on_token_delivered(token);
+    }
+  }
+
+  void on_generation_completed() override {
+    inner_.on_generation_completed();
+    if (observer_ != nullptr) {
+      observer_->on_generation_completed();
+    }
+  }
+
+  void on_generation_failed(const std::string& message) override {
+    inner_.on_generation_failed(message);
+    if (observer_ != nullptr) {
+      observer_->on_generation_failed(message);
+    }
+  }
+
+ private:
+  capability::IGenerationProbe& inner_;
+  capability::IGenerationObserver* observer_ = nullptr;
+};
+
 // 会话是否已经识别到可回答的文本。全空白文本等价于“没有语音”，必须在路由前
 // 收敛：否则静音会被当成一次检索请求，产生没有用户意图的回答。
 bool has_speech_text(const std::string& text) {
@@ -718,9 +761,13 @@ void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
   // “本轮”只有会话知道：调用方跨轮次挂探针会把上一轮的迟到通知一起收进来；而只在
   // generate 期间挂着，可以保证后端持有的借用指针活不过一次生成。
   auto* const probe = dynamic_cast<capability::IGenerationProbe*>(llm_);
+  // 转发器的作用域严格收在一次生成之内：后端持有的借用指针因此永远指向本函数栈上的对象，
+  // 生成本身返回后不可能再有迟到通知打到已经析构的转发器上。
+  std::optional<RelayGenerationProbe> relay;
   if (probe != nullptr) {
-    llm_->set_progress_probe(probe);
-    probe->on_generation_started();
+    relay.emplace(*probe, generation_observer_);
+    llm_->set_progress_probe(&*relay);
+    relay->on_generation_started();
   }
 
   // 播放组件在本轮拿到停止标志的借用引用：判定为真后不得再写出新帧。
@@ -1002,6 +1049,10 @@ void SessionRuntime::notify_execution_cancel() noexcept {
 
 void SessionRuntime::set_barge_in_monitor(IBargeInMonitor* monitor) noexcept {
   barge_in_ = monitor;
+}
+
+void SessionRuntime::set_generation_observer(capability::IGenerationObserver* observer) noexcept {
+  generation_observer_ = observer;
 }
 
 void SessionRuntime::drain_barge_in_notices() {
