@@ -1,6 +1,7 @@
-﻿// Session L0/L1 语音路径：把输入音频、识别结果、路由决策、合成 PCM 和播放
-// 收尾编排成一个可审计的串行轮次。本文件只依赖能力契约、领域值和既有状态机
-// 与交互夹具，不包含任何模型、设备、线程或传输实现；真实适配器由外层注入。
+// Session 语音路径：把输入音频、识别结果、路由决策、文本生成（L2/L3 走 LLM）、分句
+// 合成、PCM 播放和收尾编排成一个可审计的轮次。本文件只依赖能力契约、领域值和既有
+// 状态机、交互夹具与分句器，不包含任何模型、设备、线程或传输实现；真实适配器由外层
+// 注入。L0/L1 直答不调用 LLM，因此未注入 LLM 时行为与既有串行路径完全一致。
 #pragma once
 
 #include <atomic>
@@ -8,14 +9,17 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "../backend/fake_rag.hpp"
 #include "../capability/backend.hpp"
+#include "../capability/generation_probe.hpp"
 #include "interaction_contract.hpp"
 #include "session_state_machine.hpp"
 #include "speech_segmentation.hpp"
+#include "text_segmentation.hpp"
 
 namespace nexweave::runtime {
 
@@ -31,18 +35,20 @@ struct SessionTurnInput {
   std::vector<std::int16_t> pcm_samples;
 };
 
-// 一次轮次的验收输出。字段分成三类，便于测试和运行证据分别核对：
+// 一次轮次的验收输出。字段分成四类，便于测试和运行证据分别核对：
 //   - 终态：state、terminal_marker、error、cancelled、completed；
 //   - 可审计证据：route、decision（含命中与原因）、text、pcm_frames；
-//   - 生命周期标记：input_done / playback_started / playback_done。
-// 成功时标记提交顺序固定为“文本定稿（kGenerationDone）→ 播放开始（kPlaybackStarted）
+//   - 生命周期标记：input_done / playback_started / playback_done；
+//   - 有界性证据：peak_pending_frames（播放缓冲峰值）与 backpressure（是否触发上限）。
+// 成功时标记提交顺序固定为“播放开始（kPlaybackStarted）→ 文本定稿（kGenerationDone）
 // → 合成结束（kSynthesisDone）→ 播放结束（kPlaybackDone）→ 唯一成功终态”；其中
-// 播放开始严格早于合成结束，这正是“生成未结束就开始播放”的流式重叠证据。取消与
-// 失败路径改为提交“受理 → 旧输出封锁 → 执行退出 → 播放清理 → 唯一取消终态”。
+// 播放开始严格早于文本定稿，这正是“生成未结束就开始播放”的流式重叠证据。三个局部
+// 完成各自独立：文本定稿只依赖生成与分句，不等待音频播完。取消与失败路径改为提交
+// “受理 → 旧输出封锁 → 执行退出 → 播放清理 → 唯一取消终态”。
 // pcm_frames 是已经交给播放组件、由其负责播放或丢弃的帧；被取消丢弃的待播帧仍会
 // 出现在这里（它们确实交付过），而 played_count() 才是真正播完的数量。
-// L0/L1 不调用 LLM，因此本结构没有生成过程字段；L2/L3 的 token 流由后续任务
-// 在 Thinking 阶段补充，并复用同一组生命周期标记。
+// text 的语义按路由级别区分：L0/L1 是直答文本（同时就是本轮回答），L2/L3 是 LLM
+// 交付的全部 token 按顺序拼接出的完整回答；片段级切分只影响合成时机，不改变这个值。
 struct SessionTurnResult {
   // 本轮的请求标识：原样回显调用方传入的 request_id，使结果能归回到具体一次操作，
   // 而不是只靠调用顺序对应。不影响任何判定逻辑。
@@ -60,6 +66,13 @@ struct SessionTurnResult {
   bool input_done = false;
   bool playback_started = false;
   bool playback_done = false;
+  // 播放缓冲峰值（帧）：本轮“已经写出设备、但在交付当时尚未播完”的帧数最大值，也就是
+  // 生成相对播放最多领先了多少帧。它不超过声明的播放容量，是“播放侧的等待有界、不是在
+  // 模型回调里无界堆积”的直接证据；反过来说，它不能说明真实设备缓冲深度或端到端延迟。
+  std::size_t peak_pending_frames = 0;
+  // 本轮是否因播放缓冲达到声明容量而以 backpressure（背压）失败收敛。为真时本轮已经
+  // 停止播放并丢弃未播部分，因此不会留下「半段回答仍然发声」的残留。
+  bool backpressure = false;
   // 本轮是否被“用户新语音”打断。它与控制意图取消（用户喊停）和设备失败区分开：
   // 三者都以取消终态收敛，但只有它为真时 interrupt_notice 才携带新语音的归属。
   bool interrupted_by_speech = false;
@@ -222,20 +235,36 @@ struct SessionRuntimeConfig {
   // 取 0 表示不限制队列长度，仅用于受控测试；长回答会线性占用内存。
   // 这里的“队列”指已经交给播放组件、尚未播完的帧，因此它就是缓冲上限。
   std::size_t playback_queue_capacity = 256;
+  // 生成文本的分句字节上限：单个文本片段达到该字节数即切分，不等句末标点。它同时是
+  // “生成侧文本缓冲”的容量上界（含未收完的 UTF-8 字符时最多多出 3 字节），因此无标点
+  // 长文本不会让待合成文本无界增长。取 0 表示只按标点切分，仅用于受控测试；默认值按
+  // v1 中文短句规模选取，属于设计约束而不是实测语速结论。
+  // 说明：生成路径不接受 0，因为那会让“文本缓冲有明确容量”这一条不变量失效。
+  std::size_t text_chunk_max_bytes = 60;
 };
 
 // 控制动作是否为停止类语义。调用方据此决定是否立即请求统一取消；判定只使用
 // 路由给出的动作名，不解析用户原始文本，因此新增动作不会误触发停止。
 bool is_stop_control_action(const std::string& control_action);
 
-// L0/L1 串行 Session 编排。职责：注册输入回调、逐帧送 ASR、按路由级别选择直答、
-// 合成 PCM 并交给播放组件，最后按“文本定稿/合成结束/播放结束”分别标记并产生唯一
-// 终态。它不实现检索、模型推理、设备驱动和传输；这些能力全部经构造函数注入，
-// 生命周期由调用方保证且必须长于本对象。
+// 单进程 Session 编排。职责：注册输入回调、逐帧送 ASR、按路由级别选择直答（L0/L1）
+// 或 LLM 生成（L2/L3），把生成的文本按句切成有界片段逐段合成 PCM 并交给播放组件，
+// 最后按“播放开始/文本定稿/合成结束/播放结束”分别标记并产生唯一终态。它不实现检索、
+// 模型推理、设备驱动和传输；这些能力全部经构造函数注入，生命周期由调用方保证且必须
+// 长于本对象。
 //
 // 调用模型：一个 SessionRuntime 代表一个常驻会话，可连续执行多个轮次；常驻输入
 // stream 只在第一轮建立，后续轮次复用同一 stream 并继续推进输入序号，因此“旧回答
 // 清理”不会删除新语音的开头。调用方在会话结束时调用 finish_stream() 关闭输入流。
+//
+// L2/L3 重叠执行：生成过程中每凑齐一个完整片段就立即合成并把 PCM 交给播放组件，因此
+// 首段播放发生在生成结束之前，而生成回调本身不需要等待播放——等待体现在“播放缓冲
+// 达到容量后本轮明确拒绝继续合成”，而不是在回调里无界阻塞。片段切分规则见
+// TextChunker；文本与音频缓冲的容量都由本配置显式声明。
+//
+// 进度观测（可选）：后端同时实现 capability::IGenerationProbe 时，本类在生成开始前把
+// 自己挂上去、生成返回后立刻摘掉，于是“首段播放早于生成结束”可以用事件先后关系断言，
+// 而不依赖墙钟。未实现该接缝的后端只是失去这项观测能力，生成与取消语义不变。
 //
 // 线程与并发约定：run()、finish_stream() 与 cancel() 由调用方串行调度，同一时刻
 // 只允许一个轮次在途。cancel() 的唯一合法并发来源是播放或能力组件在帧边界处的
@@ -244,9 +273,10 @@ bool is_stop_control_action(const std::string& control_action);
 // 前提。状态机内部有互斥量保护，但本类不承诺更宽的并发语义。
 //
 // 取消语义：取消依次建立旧输出封锁（状态机推进代际，旧代事件被拒绝）、通知执行
-// 退出、丢弃播放组件的排队帧、产生唯一取消终态。取消不撤回已经交付的 PCM，也不
-// 删除常驻输入流；停止类控制意图在本轮不合成任何音频，因此不会把“停止”变成知识
-// 问答，也不会为新回答留下残留输出。
+// 退出（L2/L3 同时向 LLM 传播 cancel()，阻止后续 token 继续进入合成）、丢弃播放组件
+// 的排队帧、产生唯一取消终态。取消不撤回已经交付的 PCM，也不删除常驻输入流；停止类
+// 控制意图在本轮不合成任何音频，因此不会把“停止”变成知识问答，也不会为新回答留下
+// 残留输出。
 //
 // 打断语义（可选）：挂接 IBargeInMonitor 后，会话在每个播放交付边界消费一次
 // “用户是否开始说话”。出现新语音即走同一条取消路径打断当前回答，并把新语音的
@@ -262,18 +292,23 @@ bool is_stop_control_action(const std::string& control_action);
 class SessionRuntime final {
  public:
   // 借用全部能力对象：asr/router/tts/playback 必须比本对象活得久；retriever 必须
-  // 比 router 活得久。router 的取消封锁由本类在每轮开始时显式 reset()，调用方
-  // 无需在轮次之间手动解除。构造不创建外部资源，失败只可能来自标准库分配。
+  // 比 router 活得久。llm 是可选的第四个后端（借用指针）：提供时承接 L2/L3 生成，
+  // 为空时 L2/L3 轮次明确失败而不是伪造回答；L0/L1 路径不使用它。router 的取消封锁
+  // 由本类在每轮开始时显式 reset()，调用方无需在轮次之间手动解除。构造不创建外部
+  // 资源，失败只可能来自标准库分配。
   SessionRuntime(capability::IAsr& asr, capability::IRag& retriever,
                  backend::FakeRagRouter& router, capability::ITts& tts,
-                 IAudioPlayback& playback, SessionRuntimeConfig config = {});
+                 IAudioPlayback& playback, capability::ILlm* llm = nullptr,
+                 SessionRuntimeConfig config = {});
 
   SessionRuntime(const SessionRuntime&) = delete;
   SessionRuntime& operator=(const SessionRuntime&) = delete;
 
-  // 同步执行一个 L0/L1 轮次并返回验收结果。空输入、无语音文本、控制意图、播放
-  // 失败和取消都返回结构化错误或取消终态，绝不抛出业务异常；成功仅当所需输出
-  // 全部播放完成，且完成标记的顺序为“文本定稿 → 合成结束 → 播放结束 → 唯一终态”。
+  // 同步执行一个轮次并返回验收结果。空输入、无语音文本、控制意图、未注入 LLM 的
+  // L2/L3、播放失败和取消都返回结构化错误或取消终态，绝不抛出业务异常；成功仅当
+  // 所需输出全部播放完成，且标记顺序为“播放开始 → 文本定稿 → 合成结束 → 播放结束 →
+  // 唯一终态”。文本定稿在生成返回后立即提交：它记录的是“文字不再增长”，因此不需要
+  // 等待音频播完，播放失败时它依然作为独立事实存在。
   SessionTurnResult run(const SessionTurnInput& input);
 
   // 关闭常驻输入流：必须在所有轮次结束后、销毁本对象前调用。关闭后不再接受新
@@ -316,10 +351,58 @@ class SessionRuntime final {
   // 取消收敛阶段，而不是直接从中间阶段跳回 Idle。
   void force_idle();
 
+  // ---- L2/L3 生成路径 ----
+
+  // 生成一处文本片段就立刻合成并交付播放。返回 false 表示本轮已经不可能成功
+  // （背压、能力失败或停止已受理），调用方必须立即停止向本函数投递后续片段；
+  // 返回后停止标志与 TTS 回调借用的清理由收尾函数负责。
+  bool synthesize_chunk(const TextChunk& chunk);
+  // 完整的 L2/L3 轮次：构造 prompt、逐 token 分句合成、收尾并判定终态。
+  void run_generation_turn(SessionTurnResult& result);
+  // 把打断归属写入结果：三类取消共用同一条收敛路径，只有新语音打断会携带归属，
+  // 使“回答被打断”和“用户喊停”在证据里可区分。
+  void attach_interrupt_notice(SessionTurnResult& result);
+
+  // ---- 与路由级别无关的播放侧收尾 ----
+
+  // 播放收尾后的判定结果：交给交付循环与终态判定共用，避免两条路径各写一套顺序。
+  struct PlaybackOutcome {
+    // 本轮是否已经交付过至少一帧（即“播放已开始”），由播放组件已写出的帧数推出。
+    bool started = false;
+    // 全部已写出帧是否都已经播完。
+    bool all_played = false;
+  };
+
+  // 合成结束后刷新播放进度并判定“是否真的播完”。它只做一次 poll、一次错误查询和
+  // 两次计数读取，不写设备、不睡眠、不等待 deadline；poll 在停止已受理或发生背压时
+  // 跳过，因为那时本轮已经在清理，没有“还欠多少播放时间”可言。
+  PlaybackOutcome finalize_playback(bool synthesized_ok, bool backpressure);
+  // 两处交付循环共用的交付边界：背压检查、写入播放组件、记录峰值与打断判定。第一次
+  // 成功交付时它还负责提交“播放已开始”标记——两条路径的重叠判据都是“首帧交付早于
+  // 文本定稿”，因此线性化点固定在这里，而不是各写一份。返回 false 表示本帧未交付且
+  // 本轮必须停止继续合成。
+  bool deliver_frame(const domain::AudioFrame& frame, bool& started);
+  // 两条路径共用的终态裁决：把播放侧证据写回结果并判定本轮是失败、取消还是完成，
+  // 返回 false 表示本轮已经有终态，调用方必须立刻返回，不再提交任何完成标记。判定顺序
+  // 是语义的一部分（背压 → 合成失败 → 取消 → 设备错误 → 无输出 → 未播完），两条路径
+  // 必须一致，否则同一批音频会因为走哪条路由而得到不同的错误码。
+  bool settle_playback_stage(SessionTurnResult& result, const PlaybackOutcome& outcome,
+                             const domain::OperationResult& synthesized);
+  // 提交“合成结束”标记并迁移状态机；只允许在播放确实完成后的成功路径上调用。
+  void commit_synthesis_done();
+  // 放弃本轮播放：停止播放并填入播放侧证据。它不改变终态判定，因此失败、取消与背压
+  // 可以共用同一条清理顺序。
+  void abort_playback(SessionTurnResult& result, const PlaybackOutcome& outcome);
+  // 解除 TTS 回调借用。Session 持有的 TTS 回调按引用捕获本轮成员状态，回调必须在
+  // 本轮任何状态被改写之前注销；异常路径也要走到这里，否则回调会引用过期状态。
+  void detach_tts_callback();
+
   capability::IAsr& asr_;
   backend::FakeRagRouter& router_;
   capability::ITts& tts_;
   IAudioPlayback& playback_;
+  // 可选的 LLM（借用）：为空表示本会话只服务 L0/L1，L2/L3 轮次会明确失败。
+  capability::ILlm* llm_ = nullptr;
   SessionRuntimeConfig config_;
 
   SessionStateMachine state_machine_;
@@ -341,8 +424,17 @@ class SessionRuntime final {
 
   // ASR 最终文本的暂存区：run() 开始时清空，回调期间写入，路由前读取。
   // 代际水位不在这里缓存——它统一由 state_machine_ 提供，避免两份水位脱节。
-  bool queue_overflow_ = false;
   std::string asr_text_;
+
+  // 生成路径暂存区，全部在单轮内有效且不跨轮次复用。之所以放在成员里而不是回调捕获
+  // 的局部量：回调需要把错误写回 run()，而按引用捕获局部量会在异常路径上留下悬空引用；
+  // 这些量在每轮开始时显式清空，语义等价于局部量，却不依赖局部量的生命周期。
+  // llm_error 有值即表示本轮生成/合成已失败，后续片段不再投递、错误不再被覆盖。
+  std::string llm_text_;
+  std::vector<TextChunk> llm_chunks_;
+  std::optional<domain::Error> llm_error_;
+  bool playback_backpressure_ = false;
+  std::size_t playback_peak_pending_ = 0;
 };
 
 }  // namespace nexweave::runtime

@@ -45,6 +45,7 @@ add_library(nexweave_core_domain STATIC
   core/backend/fake_tts.cpp
   core/runtime/interaction_contract.cpp
   core/runtime/session_runtime.cpp
+  core/runtime/text_segmentation.cpp
   core/runtime/speech_segmentation.cpp
   core/runtime/resident_audio_input.cpp
 )
@@ -89,7 +90,9 @@ nexweave_test(fake_tts tests/unit/fake_tts_test.cpp unit)
 nexweave_test(playback_clock tests/unit/playback_clock_test.cpp unit)
 nexweave_test(interaction_contract tests/unit/interaction_contract_test.cpp unit)
 nexweave_test(session_l0_l1 tests/integration/session_l0_l1_test.cpp integration)
+nexweave_test(session_l2_l3 tests/integration/session_l2_l3_test.cpp integration)
 nexweave_test(speech_segmentation tests/unit/speech_segmentation_test.cpp unit)
+nexweave_test(text_segmentation tests/unit/text_segmentation_test.cpp unit)
 nexweave_test(resident_input tests/integration/resident_input_session_test.cpp integration)
 # 该目标包含真实线程交错：条件变量漏唤醒会表现为挂起，超时让它在 60 秒内变成明确失败。
 set_tests_properties(resident_input_integration PROPERTIES TIMEOUT 60)

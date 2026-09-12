@@ -13,6 +13,7 @@
 
 #include "audio_frame.hpp"
 #include "error.hpp"
+#include "generation_probe.hpp"
 
 namespace nexweave::capability {
 enum class TextEventKind {
@@ -66,12 +67,18 @@ class IRag {
 // LLM（Large Language Model，大语言模型）：非空 prompt 成功产生 token* 后一次 done。
 // 空输入返回 kInvalidInput；失败用结构化错误/错误事件报告，取消后禁止提交迟到 token。
 // 注册与取消的所有权及并发约定同 IAsr；实现不得把启动成功当成异步生成已经完成。
+//
+// 进度观测：同时实现 IGenerationProbe 的适配器必须override本方法，把编排层挂上来的
+// 探针保存下来并在 generate 期间把交付事实同步转给它；不支持观测的适配器沿用默认空
+// 实现即可，因此既有适配器无需改动。探针由调用方拥有，生命周期必须覆盖“挂上到摘掉”
+// 这一段；适配器只在指针非空期间报告，收到 nullptr 后不得再报告。
 class ILlm {
  public:
   virtual ~ILlm() = default;
   virtual domain::OperationResult set_callback(TextEventCallback callback) = 0;
   virtual domain::OperationResult generate(const std::string& prompt) = 0;
   virtual domain::OperationResult cancel() noexcept = 0;
+  virtual void set_progress_probe(IGenerationProbe* /*probe*/) noexcept {}
 };
 
 // TTS（Text-to-Speech，文本转语音）：本版 synthesize 为同步完成操作，返回前所有 PCM

@@ -1,19 +1,38 @@
-﻿#include "session_runtime.hpp"
+#include "session_runtime.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <utility>
 
 namespace nexweave::runtime {
 namespace {
 
+using domain::Error;
 using domain::ErrorCode;
 using domain::OperationResult;
 
 // 能力对象拒绝回调注册时的诊断文本；机器决策仍只使用错误码。
 constexpr char kAsrCallbackRejected[] = "ASR 未接受回调注册";
+
+// L2 提示词版式版本：检索片段与用户问题按固定版式拼接后交给 LLM。版式变化必须同时
+// 改动本常量与对应测试，使“某次回答依据哪一版上下文版式产生”可追溯，而不是让新旧
+// 证据混在一起。本版式只是核心层的确定性拼装，不含模型私有对话模板，真实适配器在
+// 外层再做各自的包装。
+constexpr char kL2PromptVersion[] = "nexweave-l2-v1";
+
+// 下列诊断文本只用于定位，机器决策一律使用错误码。
+constexpr char kLlmNotInjected[] = "会话未注入 LLM，L2/L3 轮次不能生成回答";
+constexpr char kLlmCallbackRejected[] = "LLM 未接受回调注册";
+constexpr char kTextChunkLimitRejected[] = "文本片段字节上限为 0，生成路径拒绝该配置";
+constexpr char kIncompleteUtf8Rejected[] = "生成文本不是完整的 UTF-8 序列";
+constexpr char kPlaybackBackpressureRejected[] = "播放缓冲达到上限，本轮拒绝继续合成";
+constexpr char kPlaybackIncomplete[] = "播放尚未完成，仍有未播完的帧";
+constexpr char kNoSynthesisOutput[] = "合成未产生任何 PCM 帧";
+constexpr char kEmptyGenerationRejected[] = "生成未产生任何可播放音频，本轮不算完成";
+constexpr char kBlankGenerationRejected[] = "生成未产生可合成的文本";
 
 // 归一化控制动作：只做 ASCII 小写与去空白，不做语义改写；空串表示无动作。
 std::string normalize_action(const std::string& action) {
@@ -32,6 +51,32 @@ std::string normalize_action(const std::string& action) {
 // 收敛：否则静音会被当成一次检索请求，产生没有用户意图的回答。
 bool has_speech_text(const std::string& text) {
   return text.find_first_not_of(" \t\r\n") != std::string::npos;
+}
+
+// 按路由级别构造交给 LLM 的 prompt。
+//   - kL3：没有可用命中，不注入任何未经支持的知识，只提交用户问题本身；
+//   - kL2：把检索片段按后端返回顺序（已由路由器按分数排序）拼进上下文区，再提交用户
+//     问题，使“回答依据哪几条命中产生”可以从 prompt 直接复算；
+//   - kL0/kL1 不走 LLM，返回空串，由调用方判定错误而不是把空 prompt 送进后端。
+// 返回值是按值构造的独立字符串，不引用 decision 或 question 的存储。
+std::string build_generation_prompt(backend::RagRouteLevel level,
+                                    const backend::RagRouteDecision& decision,
+                                    const std::string& question) {
+  if (level == backend::RagRouteLevel::kL3) {
+    return question;
+  }
+  if (level != backend::RagRouteLevel::kL2) {
+    return {};
+  }
+  std::string prompt = std::string("[") + kL2PromptVersion + "]\ncontext:\n";
+  for (const auto& hit : decision.hits) {
+    prompt += "- ";
+    prompt += hit.text;
+    prompt += '\n';
+  }
+  prompt += "question: ";
+  prompt += question;
+  return prompt;
 }
 
 }  // namespace
@@ -178,11 +223,13 @@ void LogicalClockPlayback::set_cancelled_flag(const std::atomic<bool>* flag) noe
 
 SessionRuntime::SessionRuntime(capability::IAsr& asr, capability::IRag& retriever,
                                backend::FakeRagRouter& router, capability::ITts& tts,
-                               IAudioPlayback& playback, SessionRuntimeConfig config)
+                               IAudioPlayback& playback, capability::ILlm* llm,
+                               SessionRuntimeConfig config)
     : asr_(asr),
       router_(router),
       tts_(tts),
       playback_(playback),
+      llm_(llm),
       config_(config) {
   // retriever 只用于明确生命周期关系：路由器持有它的引用，因此检索器必须比路由器
   // 活得久。Session 自己不做检索，命中信息由路由决策携带，故不再保存副本。
@@ -195,11 +242,17 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   // 每轮开始时解除上一轮的取消封锁：取消只封锁当时在途的那一代，不能永久锁死
   // 会话。router 的 reset/cancel 都是幂等值操作，因此重复调用安全。
   cancel_requested_.store(false);
-  queue_overflow_ = false;
   asr_text_.clear();
   speech_interrupt_ = false;
   speech_interrupt_notice_ = SpeechStartNotice{};
   router_.reset();
+  // 生成路径的暂存状态同样每轮清空；漏清会让上一轮的回答文本或错误出现在新一轮，
+  // 这正是“输出残留”类缺陷的来源，因此与取消标志放在同一处复位。
+  llm_text_.clear();
+  llm_chunks_.clear();
+  llm_error_.reset();
+  playback_backpressure_ = false;
+  playback_peak_pending_ = 0;
   // 清空上一轮遗留的起音通知：那些语音属于本轮或更晚的说话，本轮回答还没有开口，
   // 没有任何旧回答需要被打断；不清空会让新回答刚说出第一帧就被自己打断。
   drain_barge_in_notices();
@@ -323,10 +376,9 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   }
 
   if (decision.value->level != backend::RagRouteLevel::kL1) {
-    // kL2/kL3 需要 LLM，属于 Thinking 阶段，由后续任务实现；这里显式拒绝而不
-    // 编造回答，避免把未实现的路径伪装成成功。
-    result.error = domain::Error{ErrorCode::kInvalidInput, "该路由级别不在 L0/L1 语音路径范围内"};
-    finish_turn(result);
+    // kL2/kL3 需要 LLM：转交生成路径。它自己负责收尾与终态，因此这里直接返回，
+    // 不再走下面的直答分支，避免两条路径同时向同一代际提交完成标记。
+    run_generation_turn(result);
     return result;
   }
 
@@ -360,122 +412,32 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   const auto playback_opened = playback_.start();
   if (!playback_opened.ok()) {
     result.error = playback_opened.error;
+    playback_.set_cancelled_flag(nullptr);
     finish_turn(result);
     return result;
   }
 
   bool playback_started = false;
-  std::vector<domain::AudioFrame> delivered;
-  tts_.set_callback([this, &result, &delivered, &playback_started](
-                        const domain::AudioFrame& frame) {
-    // 停止已受理：不再接收新帧，也不把它交给播放组件，避免排队数据在取消后发声。
-    if (cancel_requested_.load()) {
-      return;
-    }
-    // 播放队列上限是显式策略：达到上限时本轮明确失败，而不是静默丢帧。
-    if (config_.playback_queue_capacity > 0 &&
-        playback_.pending_count() >= config_.playback_queue_capacity) {
-      queue_overflow_ = true;
-      return;
-    }
-    const auto rendered = playback_.render(frame);
-    if (!rendered.ok()) {
-      return;
-    }
-    delivered.push_back(frame);
-    if (!playback_started) {
-      // 第一帧进入播放组件即证明“播放已开始”，它严格早于合成结束标记，
-      // 这就是流式重叠的线性化证据，而不是仅仅同时存在 token 和 PCM。
-      playback_started = true;
-      contract_.start_playback(contract_.generation());
-    }
-    // 播放交付边界是打断的线性化点：本帧已经交给播放组件之后才询问是否出现新语音，
-    // 因此“打断”与“已播出的声音”不会互相矛盾——已播出的帧永远保留。
-    poll_barge_in();
+  // 交付回调只把帧交给播放组件；文本定稿、停止判定与计数都在 synthesize 返回后统一
+  // 处理，避免在能力回调里做终态决策（回调期间本轮状态尚未收敛）。
+  tts_.set_callback([this, &playback_started](const domain::AudioFrame& frame) {
+    (void)deliver_frame(frame, playback_started);
   });
 
   const auto synthesized = tts_.synthesize(result.text);
+  // 回调按引用捕获本轮局部量，必须在本函数返回前注销，否则下一轮合成会调用过期回调。
+  detach_tts_callback();
   playback_.set_cancelled_flag(nullptr);
 
-  // 合成结束只是局部完成：帧虽然已经写进设备，但设备时间可能在合成期间只推进了
-  // 一部分。这里轮询一次播放进度，让“已播出多少”追上当前设备时间，再据此判断本轮
-  // 是否真的播完。poll 不写设备、不睡眠，因此不会把“还没播完”伪装成成功。
-  if (!cancel_requested_.load() && !queue_overflow_) {
-    playback_.poll();
-  }
-
-  // pcm_frames 记录的是“已经交付给播放组件、由其负责播放或丢弃”的帧；不能用
-  // played_frames() 覆盖它，否则缓冲中的音频会既播不出来也拿不回去。
-  result.pcm_frames = delivered;
-  result.playback_started = playback_started;
-  // 判据是“所有已写入设备的帧都播完了”：合成刚开始时没有写入任何帧，因此还要求
-  // 至少播完一帧，避免把“什么都没播”当成完成。这里不调用 stop()，所以计数仍
-  // 反映本轮的播放进度。
-  const bool all_played = playback_.played_count() > 0 &&
-                          playback_.pending_count() == 0;
-  result.playback_done = playback_started && !cancel_requested_.load() && !queue_overflow_ &&
-                         playback_.error().ok() && all_played;
-
-  if (queue_overflow_) {
-    result.pcm_frames.clear();
-    result.playback_done = false;
-    result.error = domain::Error{ErrorCode::kBackendFailure, "播放队列已满，本轮拒绝继续合成"};
-    playback_.stop();
-    finish_turn(result);
-    return result;
-  }
-  if (!synthesized.ok()) {
-    result.playback_done = false;
-    result.error = synthesized.error;
-    playback_.stop();
-    finish_turn(result);
-    return result;
-  }
-  if (cancel_requested_.load()) {
-    result.cancelled = true;
-    result.playback_done = false;
-    // 取消来源有三类：设备回调里的停止指令、控制意图、以及新语音打断。只有最后
-    // 一类会让 interrupted_by_speech 为真，使“回答被打断”和“用户喊停”在结果与
-    // 运行证据里可区分，而不是都表现为一次无来源的取消。
-    result.interrupted_by_speech = speech_interrupt_;
-    if (speech_interrupt_) {
-      result.interrupt_notice = speech_interrupt_notice_;
-    }
-    playback_.stop();
-    state_machine_.dispatch(SessionStateMachine::Event::kCancel, state_machine_.generation());
-    finish_turn(result);
-    return result;
-  }
-  const auto playback_error = playback_.error();
-  if (!playback_error.ok()) {
-    result.playback_done = false;
-    result.error = playback_error.error;
-    playback_.stop();
-    finish_turn(result);
-    return result;
-  }
-  if (!playback_started) {
-    // 合成成功却没有交付任何帧：没有可播放的输出，不能报告成功。
-    result.error = domain::Error{ErrorCode::kBackendFailure, "合成未产生任何 PCM 帧"};
-    playback_.stop();
-    finish_turn(result);
-    return result;
-  }
-  if (!all_played) {
-    // 仍有未播完的帧：设备时间还没覆盖这些音频。本轮不算完成，由调用方推进设备
-    // 时间后重跑，或按取消收敛；这里明确失败而不是把“还没播完”写成成功。
-    result.error = domain::Error{ErrorCode::kTimeout, "播放尚未完成，仍有未播完的帧"};
-    playback_.stop();
-    finish_turn(result);
+  const auto outcome = finalize_playback(synthesized.ok(), playback_backpressure_);
+  if (!settle_playback_stage(result, outcome, synthesized)) {
     return result;
   }
 
-  contract_.mark_synthesis_done(contract_.generation());
-  const auto speech_done =
-      state_machine_.dispatch(SessionStateMachine::Event::kTtsDone, state_machine_.generation());
-  if (!speech_done.ok()) {
-    result.error = speech_done.error;
+  commit_synthesis_done();
+  if (!result.error.ok()) {
     result.playback_done = false;
+    abort_playback(result, outcome);
     finish_turn(result);
     return result;
   }
@@ -483,6 +445,414 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   result.completed = true;
   finish_turn(result);
   return result;
+}
+
+bool SessionRuntime::deliver_frame(const domain::AudioFrame& frame, bool& started) {
+  // 停止已受理：不再接收新帧，也不把它交给播放组件，避免排队数据在取消后发声。
+  if (cancel_requested_.load()) {
+    return false;
+  }
+  // 播放缓冲容量是显式策略：达到上限即本轮拒绝继续合成，而不是静默丢帧。判定发生在
+  // 写入之前，因此交付的帧数永远不超过容量，峰值也只是“把上限用满”而不是越过上限。
+  // 这里不等待、不睡眠：模型回调因此不需要为了等播放腾出空间而阻塞，等待语义由调用方
+  // 通过背压结果决定（失败、重试或改为丢弃无关音频）。
+  if (config_.playback_queue_capacity > 0 &&
+      playback_.pending_count() >= config_.playback_queue_capacity) {
+    playback_backpressure_ = true;
+    // 已经确定本轮失败：立即让播放组件进入停止态，避免未播完的旧回答继续发声。
+    playback_.stop();
+    return false;
+  }
+  // 打断必须在“本帧已经写出”之后消费：交付边界是打断的线性化点，先写出再询问是否
+  // 出现新语音，才能保证“已播出的声音”与“打断决定”不矛盾。顺序若反过来，落在最后
+  // 一帧上的起音将永远无人消费——之后不再有交付边界，打断事实会丢失。没有新语音时
+  // 它只是一次非阻塞查询。
+  const auto rendered = playback_.render(frame);
+  if (!rendered.ok()) {
+    // 设备拒绝本帧：不计入交付、不推进开始标记；具体错误由调用方在合成结束后通过
+    // playback_.error() 读取，避免在回调里做终态决策。
+    return false;
+  }
+  poll_barge_in();
+  // 峰值在写入之后取：它记录的是“已经写出设备、此刻尚未播完”的帧数最大值，也就是生成
+  // 相对播放最多领先了多少帧。用 played_frames() 的规模减去已播完计数，而不是用交付
+  // 计数：设备可能在两次交付之间就已经播完若干帧，交付计数会把“曾经在缓冲里”误算成
+  // “此刻仍在缓冲里”，从而把峰值虚高到与实际积压无关的数值。
+  const auto written = playback_.played_frames().size();
+  const auto played = playback_.played_count();
+  playback_peak_pending_ =
+      std::max(playback_peak_pending_, written > played ? written - played : std::size_t{0});
+  if (!started) {
+    // 第一帧进入播放组件即证明“播放已开始”。标记提交在这里而不在调用方，是因为它
+    // 必须严格早于“文本定稿”，而文本定稿发生在生成结束之后——这正是重叠的线性化点。
+    started = true;
+    contract_.start_playback(contract_.generation());
+  }
+  return true;
+}
+
+SessionRuntime::PlaybackOutcome SessionRuntime::finalize_playback(bool synthesized_ok,
+                                                                  bool backpressure) {
+  // 合成结束只是局部完成：帧虽然已经写进设备，但设备时间可能在合成期间只推进了
+  // 一部分。这里轮询一次播放进度，让“已播出多少”追上当前设备时间，再据此判断本轮
+  // 是否真的播完。poll 不写设备、不睡眠，因此不会把“还没播完”伪装成成功。
+  // 停止已受理或发生背压时跳过：那时本轮已经在清理，没有“还欠多少播放时间”可言。
+  if (!cancel_requested_.load() && !backpressure) {
+    playback_.poll();
+  }
+  PlaybackOutcome outcome;
+  // “播放已开始”的判据是播放组件确实写出过帧。这里读取的是已写出帧快照的规模，而不是
+  // 交付计数：两者只在“写设备失败”时不同，而那种情况由调用方按设备错误收敛。
+  outcome.started = !playback_.played_frames().empty();
+  // 判据是“所有已写入设备的帧都播完了”：合成刚开始时没有写入任何帧，因此还要求
+  // 至少播完一帧，避免把“什么都没播”当成完成。这里不调用 stop()，所以计数仍
+  // 反映本轮的播放进度。
+  outcome.all_played = outcome.started && playback_.played_count() > 0 &&
+                       playback_.pending_count() == 0;
+  const bool playback_ok = synthesized_ok && !cancel_requested_.load() && !backpressure &&
+                           playback_.error().ok();
+  outcome.all_played = outcome.all_played && playback_ok;
+  return outcome;
+}
+
+bool SessionRuntime::settle_playback_stage(SessionTurnResult& result,
+                                            const PlaybackOutcome& outcome,
+                                            const domain::OperationResult& synthesized) {
+  result.pcm_frames = playback_.played_frames();
+  result.playback_started = outcome.started;
+  result.playback_done = outcome.all_played;
+  result.peak_pending_frames = playback_peak_pending_;
+  result.backpressure = playback_backpressure_;
+
+  if (playback_backpressure_) {
+    // 播放缓冲达到上限：本轮以背压失败收敛。已经写出设备的帧仍留在 pcm_frames 里
+    // （它们确实交付过），未播完的部分被丢弃——这就是“有界等待”的可观察代价。
+    result.playback_done = false;
+    result.error = domain::Error{ErrorCode::kBackendFailure, kPlaybackBackpressureRejected};
+    abort_playback(result, outcome);
+    finish_turn(result);
+    return false;
+  }
+  if (!synthesized.ok()) {
+    result.playback_done = false;
+    result.error = synthesized.error;
+    abort_playback(result, outcome);
+    finish_turn(result);
+    return false;
+  }
+  if (cancel_requested_.load()) {
+    result.cancelled = true;
+    result.playback_done = false;
+    // 三类取消（设备回调里的停止指令、控制意图、新语音打断）共用这条收敛路径，只有
+    // 新语音打断携带归属，使“回答被打断”和“用户喊停”在证据里可区分。
+    attach_interrupt_notice(result);
+    abort_playback(result, outcome);
+    // 取消必须显式推进状态机：轨迹里要出现 Cancelling，而不是从 Thinking/Speaking
+    // 直接跳回 Idle，否则“旧输出已封锁”这一事实会消失。
+    state_machine_.dispatch(SessionStateMachine::Event::kCancel, state_machine_.generation());
+    finish_turn(result);
+    return false;
+  }
+  const auto playback_error = playback_.error();
+  if (!playback_error.ok()) {
+    // 设备错误优先于“没有交付帧”报告：它解释了为什么没有帧可播，比后者更接近根因。
+    result.playback_done = false;
+    result.error = playback_error.error;
+    abort_playback(result, outcome);
+    finish_turn(result);
+    return false;
+  }
+  if (!outcome.started) {
+    // 成功收尾却没有交付任何帧：没有可播放的输出，不能报告成功。直答为空与生成只产出
+    // 标点都会走到这里，因此不需要另设一条按文本内容判断的分支。
+    result.error = domain::Error{ErrorCode::kBackendFailure, kNoSynthesisOutput};
+    abort_playback(result, outcome);
+    finish_turn(result);
+    return false;
+  }
+  if (!outcome.all_played) {
+    // 仍有未播完的帧：设备时间还没覆盖这些音频。本轮不算完成，由调用方推进设备时间后
+    // 重跑或按取消收敛；这里明确失败而不是把“还没播完”写成成功。
+    result.error = domain::Error{ErrorCode::kTimeout, kPlaybackIncomplete};
+    abort_playback(result, outcome);
+    finish_turn(result);
+    return false;
+  }
+  return true;
+}
+
+void SessionRuntime::commit_synthesis_done() {
+  contract_.mark_synthesis_done(contract_.generation());
+  const auto speech_done =
+      state_machine_.dispatch(SessionStateMachine::Event::kTtsDone, state_machine_.generation());
+  if (!speech_done.ok()) {
+    llm_error_ = speech_done.error;
+  }
+}
+
+void SessionRuntime::abort_playback(SessionTurnResult& result,
+                                    const PlaybackOutcome& outcome) {
+  // 顺序固定为“停止播放 → 填入证据”。先停止保证返回后不会再有新帧写出；证据在停止
+  // 之后读取，如实反映“停止前交付了多少、播完了多少”。
+  playback_.stop();
+  result.pcm_frames = playback_.played_frames();
+  result.playback_started = outcome.started;
+  result.playback_done = false;
+}
+
+void SessionRuntime::detach_tts_callback() {
+  // 以“什么都不做”的回调覆盖借用：既有实现把空回调定义为非法注册，因此不能靠传空来
+  // 注销；覆盖之后接收方不再持有本轮局部量的引用，回调也不会再进入本轮状态。
+  tts_.set_callback([](const domain::AudioFrame&) {});
+}
+
+void SessionRuntime::attach_interrupt_notice(SessionTurnResult& result) {
+  // 设备回调里的停止指令、控制意图与“用户新语音”都以取消终态收敛，只有最后一类
+  // 携带归属信息，使“回答被打断”和“用户喊停”在结果与运行证据里可区分。
+  result.interrupted_by_speech = speech_interrupt_;
+  if (speech_interrupt_) {
+    result.interrupt_notice = speech_interrupt_notice_;
+  }
+}
+
+void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
+  if (llm_ == nullptr) {
+    // 未注入 LLM 却走到 L2/L3：明确失败，绝不伪造回答。这是“能力缺失”而不是“输入
+    // 非法”，因此用后端失败码，调用方可以据此决定补齐依赖还是回退到直答策略。
+    result.error = domain::Error{ErrorCode::kBackendFailure, kLlmNotInjected};
+    finish_turn(result);
+    return;
+  }
+  if (config_.text_chunk_max_bytes == 0) {
+    // 0 在本配置里表示“只按标点切分”，代价是待合成文本与整段回答等长、没有上界。
+    // 生成路径不接受这种配置：它会让“文本缓冲有明确容量”这一条不变量失效。受控测试
+    // 若需要不限长行为，应改用足够大的具体字节数。
+    result.error = domain::Error{ErrorCode::kInvalidInput, kTextChunkLimitRejected};
+    finish_turn(result);
+    return;
+  }
+
+  const std::string question = asr_text_;
+  const std::string prompt = build_generation_prompt(result.route, result.decision, question);
+  if (prompt.empty()) {
+    result.error = domain::Error{ErrorCode::kBackendFailure, "该路由级别没有可用的生成提示词"};
+    finish_turn(result);
+    return;
+  }
+
+  // 状态机迁移先于任何能力调用：Thinking 表示“已经进入生成阶段”，即使生成立即失败，
+  // 轨迹也能解释本轮去过哪里。迁移失败说明代际或状态已经过期，不再继续调用后端。
+  const auto routed = state_machine_.dispatch(SessionStateMachine::Event::kRouteL2L3,
+                                              state_machine_.generation());
+  if (!routed.ok()) {
+    result.error = routed.error;
+    finish_turn(result);
+    return;
+  }
+
+  // 生成进度观测是可选接缝：后端同时实现 IGenerationProbe 时（确定性夹具即是如此）
+  // 由会话在生成开始前挂上、生成返回后立即摘掉。注册责任放在会话而不是调用方，是因为
+  // “本轮”只有会话知道：调用方跨轮次挂探针会把上一轮的迟到通知一起收进来；而只在
+  // generate 期间挂着，可以保证后端持有的借用指针活不过一次生成。
+  auto* const probe = dynamic_cast<capability::IGenerationProbe*>(llm_);
+  if (probe != nullptr) {
+    llm_->set_progress_probe(probe);
+    probe->on_generation_started();
+  }
+
+  // 播放组件在本轮拿到停止标志的借用引用：判定为真后不得再写出新帧。
+  playback_.set_cancelled_flag(&cancel_requested_);
+  const auto playback_opened = playback_.start();
+  if (!playback_opened.ok()) {
+    result.error = playback_opened.error;
+    playback_.set_cancelled_flag(nullptr);
+    finish_turn(result);
+    return;
+  }
+
+  // 每轮一个全新的分句器实例：它按引用捕获本轮局部状态，跨轮复用会把上一轮的未完成
+  // 缓冲带进新回答。容量取配置值，因此待合成文本的上界与回答长度无关。
+  TextChunker chunker(config_.text_chunk_max_bytes);
+  bool playback_started = false;
+  // TTS 回调与 L0/L1 共用同一条交付边界，因此背压检查、打断判定与峰值统计只有一份：
+  // 合成阶段的每一帧都按相同规则决定“交付、拒绝还是丢弃”。
+  tts_.set_callback([this, &playback_started](const domain::AudioFrame& frame) {
+    (void)deliver_frame(frame, playback_started);
+  });
+
+  // token 回调按“先交付、后统计”的顺序处理：token 一旦到达就立刻进入分句与合成，
+  // 因此“首段播放”可以发生在 generate 返回之前；统计只记录事实，不改变交付顺序。
+  const auto token_callback = [this, &chunker](const capability::TextEvent& event) {
+    if (llm_error_.has_value() || cancel_requested_.load() || playback_backpressure_) {
+      // 本轮已经不可能成功：不再分句、不再合成。继续处理只会让回调耗时随输出长度
+      // 增长，而不会产生任何可交付的结果。
+      return;
+    }
+    if (event.kind == capability::TextEventKind::kError) {
+      llm_error_ = event.error.ok()
+                       ? domain::Error{ErrorCode::kBackendFailure, "LLM 报错事件缺少错误码"}
+                       : event.error;
+      return;
+    }
+    if (event.kind == capability::TextEventKind::kDone) {
+      // 局部完成：这里的 done 只表示“文本不再增长”，不代表播放或会话已经完成，
+      // 因此不在这里提交任何完成标记；标记由文本定稿与播放判定分别提交。
+      return;
+    }
+    if (event.kind == capability::TextEventKind::kPartial) {
+      // 识别类中间结果不属于生成回答：混入会让同一段文字被合成两次，因此显式忽略。
+      return;
+    }
+    if (event.kind != capability::TextEventKind::kToken) {
+      return;
+    }
+    llm_text_ += event.text;
+    if (!has_speech_text(llm_text_)) {
+      // 到目前为止只有空白：等价于“没有可合成文本”。空白帧虽然能通过统一音频契约，
+      // 但对着空气播一段静音不是一次回答，因此这里不合成、也不交付，直接记录失败并在
+      // 收尾时拒绝本轮。判定放在分句之前，避免空白被当作正常文本切出片段送进合成器。
+      llm_error_ = domain::Error{ErrorCode::kBackendFailure, kBlankGenerationRejected};
+      return;
+    }
+    // 片段列表每帧复用同一个成员容器：清空后 feed 只追加本次切出的片段，因此“帧”与
+    // “片段”不会错位，也不会保留上一帧的片段。
+    llm_chunks_.clear();
+    chunker.feed(event.text, llm_chunks_);
+    for (const auto& chunk : llm_chunks_) {
+      if (!synthesize_chunk(chunk)) {
+        return;
+      }
+    }
+  };
+
+  const auto registered = llm_->set_callback(token_callback);
+  if (!registered.ok()) {
+    // 生成回调注册被拒绝：本轮没有任何文本来源，按失败收敛。此时 TTS 已注册回调，
+    // 必须注销，否则它会持有一个指向本轮局部量的引用。
+    llm_error_ = domain::Error{ErrorCode::kBackendFailure, kLlmCallbackRejected};
+    detach_tts_callback();
+    playback_.set_cancelled_flag(nullptr);
+    result.error = *llm_error_;
+    abort_playback(result, finalize_playback(false, playback_backpressure_));
+    finish_turn(result);
+    return;
+  }
+
+  OperationResult generated;
+  bool generation_threw = false;
+  try {
+    generated = llm_->generate(prompt);
+  } catch (const std::exception& error) {
+    // 后端抛出异常：按后端失败收敛，但播放、回调与状态机仍必须走统一的清理路径，
+    // 因此先记录错误，让控制流继续到收尾，而不是让异常穿过本对象。
+    llm_error_ = domain::Error{ErrorCode::kBackendFailure,
+                               std::string("LLM 生成抛出异常: ") + error.what()};
+    generation_threw = true;
+  } catch (...) {
+    llm_error_ = domain::Error{ErrorCode::kBackendFailure, "LLM 生成抛出未知异常"};
+    generation_threw = true;
+  }
+  if (probe != nullptr) {
+    // 只报告真实发生的事实：正常返回才算“生成完成”，异常路径报告失败。把异常也报成
+    // 完成会让“首段播放早于生成结束”这条证据在失败轮次里也成立，从而失去区分能力。
+    if (generation_threw) {
+      probe->on_generation_failed("generate threw");
+    } else if (generated.ok() && !llm_error_.has_value()) {
+      probe->on_generation_completed();
+    }
+    // 立即摘掉借用：后端不再持有指向本次生成观测者的指针，轮次之间也就没有悬空引用。
+    llm_->set_progress_probe(nullptr);
+  }
+
+  if (!generation_threw) {
+    // 收尾刷新只在这里调用一次，且只在生成正常返回时调用：取消或失败路径下尾段是否
+    // 完整无法确认，把它合成出来等于把截断的文本当成完整回答。
+    std::vector<TextChunk> tail;
+    chunker.flush(tail);
+    for (const auto& chunk : tail) {
+      if (!synthesize_chunk(chunk)) {
+        break;
+      }
+    }
+    if (chunker.incomplete_utf8() && !llm_error_.has_value()) {
+      // 收尾时缓冲仍停在半个字符上：生成文本不是合法 UTF-8。这里拒绝而不是丢弃半截
+      // 字节，否则证据里会出现“回答少了一个字”却没有任何错误的情况。
+      llm_error_ = domain::Error{ErrorCode::kInvalidInput, kIncompleteUtf8Rejected};
+    }
+    if (!has_speech_text(llm_text_) && !llm_error_.has_value()) {
+      // 全空白回答等价于“没有可合成文本”（正常路径已在 token 回调里拦下，这里兜住
+      // “一个字都没到达”的情况）：与 ASR 路径同序，在合成之前收敛。
+      llm_error_ = domain::Error{ErrorCode::kBackendFailure, kBlankGenerationRejected};
+    }
+    if (!generated.ok() && !llm_error_.has_value()) {
+      // 生成返回失败且回调没有记下更早的错误：以返回码为准，避免把失败报告成完成。
+      llm_error_ = generated.error;
+    }
+  }
+
+  // 注销 TTS 回调与停止标志借用必须在任何进一步判定之前完成：此后本函数不再产生新
+  // 交付，播放组件也回到“本轮可以停止”的状态。
+  detach_tts_callback();
+  playback_.set_cancelled_flag(nullptr);
+
+  result.text = llm_text_;
+  // 生成侧的错误在裁决之前挂到 operation result 上，使两条路径共用同一段判定顺序：
+  // 背压 → 生成/合成失败 → 取消 → 设备错误 → 无输出 → 未播完。
+  OperationResult generated_result;
+  if (llm_error_.has_value()) {
+    generated_result = OperationResult::failure(llm_error_->code, llm_error_->message);
+  } else if (!generated.ok()) {
+    generated_result = generated;
+  }
+  const auto outcome = finalize_playback(generated_result.ok(), playback_backpressure_);
+  if (!settle_playback_stage(result, outcome, generated_result)) {
+    return;
+  }
+
+  // 文本定稿：生成与分句都已完成，且所有已交付音频都播完了，才提交 kGenerationDone
+  // 并进入 Speaking。顺序固定为“播放开始 → 文本定稿 → 合成结束 → 播放结束”，其中
+  // “播放开始早于文本定稿”正是生成与播放重叠的可复现证据。
+  const auto generation_done = contract_.mark_generation_done(contract_.generation());
+  if (!generation_done.ok()) {
+    result.error = generation_done.error;
+    result.playback_done = false;
+    abort_playback(result, outcome);
+    finish_turn(result);
+    return;
+  }
+  const auto thinking_done =
+      state_machine_.dispatch(SessionStateMachine::Event::kLlmDone, state_machine_.generation());
+  if (!thinking_done.ok()) {
+    result.error = thinking_done.error;
+    result.playback_done = false;
+    abort_playback(result, outcome);
+    finish_turn(result);
+    return;
+  }
+  commit_synthesis_done();
+  if (result.error.ok()) {
+    result.completed = true;
+  }
+  if (!result.completed) {
+    result.playback_done = false;
+    abort_playback(result, outcome);
+    finish_turn(result);
+    return;
+  }
+  finish_turn(result);
+}
+
+bool SessionRuntime::synthesize_chunk(const TextChunk& chunk) {
+  const auto synthesized = tts_.synthesize(chunk.text);
+  if (!synthesized.ok()) {
+    // 合成失败：记录第一处失败并停止后续片段。继续合成只会把更多音频交付给一个已经
+    // 无法成功收尾的轮次，既浪费算力也让“哪一处失败”变得难以追溯。
+    if (!llm_error_.has_value()) {
+      llm_error_ = synthesized.error;
+    }
+    return false;
+  }
+  return true;
 }
 
 domain::OperationResult SessionRuntime::finish_stream() {
