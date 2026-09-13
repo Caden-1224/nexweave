@@ -71,7 +71,40 @@ void TestFailuresBoundariesAndReplay() {
 
 }  // namespace
 
+// 同分排序不变量：分数相同时按 id 字典序返回，结果与夹具里的写入顺序无关，top_k 截断
+// 发生在排序之后。此前没有任何同分夹具，改坏 tie-break 全量回归也不会红。
+void TestEqualScoresBreakTiesByLexicographicId() {
+  backend::FakeRag rag({{"z", "灯光亮度", 0.5},
+                        {"a", "灯光亮度", 0.5},
+                        {"m", "灯光亮度", 0.5}});
+  const auto hits = rag.retrieve("灯光", 3);
+  CHECK(hits.ok());
+  CHECK(hits.value->size() == 3);
+  CHECK((*hits.value)[0].id == "a");
+  CHECK((*hits.value)[1].id == "m");
+  CHECK((*hits.value)[2].id == "z");
+
+  // 反转写入顺序后结果必须一致：排序结果不能依赖夹具的书写顺序。
+  backend::FakeRag reversed({{"m", "灯光亮度", 0.5},
+                             {"z", "灯光亮度", 0.5},
+                             {"a", "灯光亮度", 0.5}});
+  const auto again = reversed.retrieve("灯光", 3);
+  CHECK(again.ok());
+  CHECK(again.value->size() == 3);
+  for (std::size_t index = 0; index < 3; ++index) {
+    CHECK((*again.value)[index].id == (*hits.value)[index].id);
+  }
+
+  // 截断发生在排序之后：留下的是字典序最小的两条，而不是最先写进去的两条。
+  const auto limited = rag.retrieve("灯光", 2);
+  CHECK(limited.ok());
+  CHECK(limited.value->size() == 2);
+  CHECK((*limited.value)[0].id == "a");
+  CHECK((*limited.value)[1].id == "m");
+}
+
 int main() {
   TestRetrievalAndThresholdRoutes();
+  TestEqualScoresBreakTiesByLexicographicId();
   TestFailuresBoundariesAndReplay();
 }

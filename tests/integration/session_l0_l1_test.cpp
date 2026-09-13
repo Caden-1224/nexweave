@@ -1,4 +1,4 @@
-﻿#include "../test_support.hpp"
+#include "../test_support.hpp"
 
 #include <algorithm>
 #include <atomic>

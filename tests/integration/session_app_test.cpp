@@ -531,7 +531,8 @@ void TestEmptyTextInputProducesNoTurn() {
   CHECK(asr.fed_frames() == 0);
   CHECK(sink.writes() == 0);
 
-  // 第二种情形：文本存在但全是空白。它必须产生一个明确的失败轮次，而不是静默无输出。
+  // 第二种情形：文本存在但全是空白。它与“没有输入”等价：不产生轮次、不产生音频，
+  // 也不算失败——把它记成一个失败轮次会让“用户没说话”看起来像一次故障。
   SessionAppConfig blank_config;
   blank_config.mode = SessionAppInputMode::kText;
   blank_config.text = " \t\n";
@@ -596,8 +597,11 @@ void TestGenerationModeOverlapsPlaybackWithGeneration() {
   CHECK(sink.writes() > 2);
   // 保护的不变量：播放开始严格早于生成结束。两条事实都来自后端同步报告的事件序列，
   // 不依赖墙钟或睡眠。
+  // “播放开始早于生成结束”由上面的 progress（后端同步报告的事实）断言，它记录的是
+  // 被测对象产生的顺序。观察者那一路不再断言顺序：RecordingObserver 是按结果里的标志位
+  // 依次 push 的，比较它的顺序只能验证本测试自己的 push 顺序，属于同义反复。
+  // 端到端的重叠证据另见 session_l2_l3_test.cpp 对会话 trace 的断言。
   CHECK(Before(progress.events, "token", "generation_completed"));
-  CHECK(Before(observer.events, "playback_started", "turn_completed"));
   CheckBoundedPlayback(turn, config.session_config.playback_queue_capacity);
 }
 

@@ -359,8 +359,12 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   // 一旦与它脱节，失败/取消过的轮次就会带着过期代际提交事件并被拒绝。这里统一在
   // 每次提交前读取状态机，使“夹具记录的代际”与“状态机裁决的代际”永远是同一个值。
 
-  // ASR 回调只接受本轮代际的最终文本；取消会推进状态机代际，迟到回调不会把旧
-  // 识别结果标成当前轮次。回调在 feed 的调用线程同步执行，因此这里不需要加锁。
+  // ASR 回调把本轮收到的最终文本记下来。这里**不**按代际过滤：capability 的 TextEvent
+  // 不携带代际，识别结果与代际的对应关系由适配器契约保证——取消的线性化点之后不得再
+  // 开始回调，而回调只在 feed 的调用线程同步执行，因此写进来的文本只可能属于本轮。
+  // 残余风险如实记下：违反该契约的适配器（在 feed 返回后从别的线程补一个 final）会让
+  // 这个迟到文本落进 asr_text_，并由下一轮开头清空——本函数返回的路径因此不再读取它。
+  // 回调在 feed 的调用线程同步执行，所以这里不需要加锁。
   const auto registered = asr_.set_callback([this](const capability::TextEvent& event) {
     if (event.kind == capability::TextEventKind::kFinal) {
       asr_text_ = event.text;
@@ -524,6 +528,7 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
   }
   // 回调按引用捕获本轮局部量，必须在本函数返回前注销，否则下一轮合成会调用过期回调。
   detach_tts_callback();
+  detach_llm_callback();
   playback_.set_cancelled_flag(nullptr);
 
   const auto outcome = finalize_playback(synthesized.ok(), playback_backpressure_);
@@ -712,6 +717,17 @@ void SessionRuntime::detach_tts_callback() {
   tts_.set_callback([](const domain::AudioFrame&) {});
 }
 
+void SessionRuntime::detach_llm_callback() {
+  // LLM 的 token 回调按引用捕获本轮函数局部的分句器，而适配器契约明确允许 generate()
+  // 返回之后继续投递 token（见 capability/backend.hpp：启动成功不等于异步生成已完成）。
+  // 因此这里的注销不是可选的清理，而是避免后端持有一个指向已析构对象的回调——那属于
+  // 未定义行为，测试里的迟到 token 会直接走进去。没有 LLM（L0/L1 会话）时无事可做。
+  if (llm_ == nullptr) {
+    return;
+  }
+  llm_->set_callback([](const capability::TextEvent&) {});
+}
+
 void SessionRuntime::attach_interrupt_notice(SessionTurnResult& result) {
   // 设备回调里的停止指令、控制意图与“用户新语音”都以取消终态收敛，只有最后一类
   // 携带归属信息，使“回答被打断”和“用户喊停”在结果与运行证据里可区分。
@@ -841,6 +857,7 @@ void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
     // 必须注销，否则它会持有一个指向本轮局部量的引用。
     llm_error_ = domain::Error{ErrorCode::kBackendFailure, kLlmCallbackRejected};
     detach_tts_callback();
+  detach_llm_callback();
     playback_.set_cancelled_flag(nullptr);
     result.error = *llm_error_;
     abort_playback(result, finalize_playback(false, playback_backpressure_));
@@ -910,6 +927,7 @@ void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
   // 注销 TTS 回调与停止标志借用必须在任何进一步判定之前完成：此后本函数不再产生新
   // 交付，播放组件也回到“本轮可以停止”的状态。
   detach_tts_callback();
+  detach_llm_callback();
   playback_.set_cancelled_flag(nullptr);
 
   result.text = llm_text_;
@@ -1111,25 +1129,33 @@ void SessionRuntime::finish_turn(SessionTurnResult& result) {
   const bool success = result.error.ok() && result.completed && result.playback_done &&
                        result.playback_started;
   const std::uint64_t generation = contract_.generation();
+  // 终态标记只在夹具**确实接受**提交时才改写：它是本轮提交过的终态，不是本函数的意图。
+  // 夹具在“本轮尚未开启任何代际”时会拒绝提交（例如输入流建立失败），那种情况下 trace
+  // 里没有任何终态，字段因此保留默认值。默认值是取消终态（保守默认，避免默认值伪装
+  // 成功），它**不等于**“trace 里记录了取消终态”——要判断本轮到底记录了哪个终态，必须
+  // 看 trace。这条区别写进了 SessionTurnResult::terminal_marker 的注释里。
   if (success) {
     // 顺序固定为“文本定稿 → 播放开始 → 合成结束 → 播放结束”。播放完成是本轮唯一
     // 的成功收尾条件，它在任务 15 的夹具里同时产出唯一 kTerminalSucceeded 标记。
-    contract_.mark_playback_done(generation);
-    result.terminal_marker = ActivityMarker::kTerminalSucceeded;
+    if (contract_.mark_playback_done(generation).ok()) {
+      result.terminal_marker = ActivityMarker::kTerminalSucceeded;
+    }
     return;
   }
   if (result.cancelled) {
     // 取消只产生一个取消终态，且不撤回已经播放的声音：夹具按“受理 → 封锁旧输出
     // → 执行退出 → 播放清理 → 取消终态”的固定顺序记录。
-    contract_.cancel(generation);
-    result.terminal_marker = ActivityMarker::kTerminalCancelled;
+    if (contract_.cancel(generation).ok()) {
+      result.terminal_marker = ActivityMarker::kTerminalCancelled;
+    }
     return;
   }
   // 失败路径也必须有唯一终态，否则调用方无法区分“尚未完成”和“已经失败终止”。
   // 这里借用取消收敛（封锁旧输出、丢弃排队输出），保证失败不会留下半完成轮次；
-  // 夹具对“尚未开启代际”的取消会拒绝，因此该调用失败即为空操作。
-  contract_.cancel(generation);
-  result.terminal_marker = ActivityMarker::kTerminalCancelled;
+  // 夹具对“尚未开启代际”的取消会拒绝，此时不改写终态标记（见上）。
+  if (contract_.cancel(generation).ok()) {
+    result.terminal_marker = ActivityMarker::kTerminalCancelled;
+  }
 }
 
 void SessionRuntime::force_idle() {

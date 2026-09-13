@@ -130,7 +130,8 @@ nexweave_test(resident_input tests/integration/resident_input_session_test.cpp i
 # 该目标包含真实线程交错：条件变量漏唤醒会表现为挂起，超时让它在 60 秒内变成明确失败。
 set_tests_properties(resident_input_integration PROPERTIES TIMEOUT 60)
 # 同一公共能力测试同时进入 contract 门禁，避免只测最小 Fixture 而漏掉实际 Fake。
-set_tests_properties(fake_asr_unit fake_tts_unit PROPERTIES LABELS "unit;contract")
+set_tests_properties(fake_asr_unit fake_tts_unit fake_audio_unit
+  PROPERTIES LABELS "unit;contract")
 nexweave_test(session_app tests/integration/session_app_test.cpp integration)
 # 应用测试同时需要应用层与核心层：它既验收组装结果，也比对会话层的公开证据。
 target_link_libraries(nexweave_session_app_test PRIVATE nexweave_app)

@@ -25,21 +25,27 @@ std::size_t ExpectedFrameCount(const std::string& text) {
 // 与 fake_tts.cpp 相同的采样公式：测试按文档规则推导期望电平，另用硬编码
 // 锚点样本复核手算值，防止实现与测试 helper 犯同一处错误。
 std::int16_t ExpectedLevel(const std::string& text, std::size_t global_sample) {
+  // 与实现一致：相位同时取字节和与位置加权和，使等长且字节和相同的文本也能区分开。
   std::size_t byte_sum = 0;
+  std::size_t weighted_sum = 0;
+  std::size_t position_in_text = 0;
   for (unsigned char byte : text) {
+    position_in_text += 1;
     byte_sum += static_cast<std::size_t>(byte);
+    weighted_sum += position_in_text * static_cast<std::size_t>(byte);
   }
+  const std::size_t phase = (byte_sum + 31 * weighted_sum) % backend::kFakeTtsCycleSamples;
   const std::size_t position =
-      (byte_sum % backend::kFakeTtsCycleSamples + global_sample) % backend::kFakeTtsCycleSamples;
+      (phase + global_sample) % backend::kFakeTtsCycleSamples;
   return position < backend::kFakeTtsCycleSamples / 2 ? backend::kFakeTtsSquareAmplitude
                                                       : -backend::kFakeTtsSquareAmplitude;
 }
 
-// 成功路径：80 个 'a'（字节和 7760，起始相位 0）应产生 5 帧；每帧 320 样本、
-// 元数据符合 v1 契约，回调全部发生在 synthesize 返回之前、调用线程之内，
-// 且任意时刻最多一帧在途（无隐藏队列/线程）。锚点按手算值硬编码：
-// 相位 0 时 g=0..39 为 +8000，g=40..79 为 -8000，320 % 80 == 0 使每帧帧首
-// 相位相同，帧间相位连续。
+// 成功路径：80 个 'a' 应产生 5 帧（帧数只由字节长度决定）；每帧 320 样本、元数据符合
+// v1 契约，回调全部发生在 synthesize 返回之前、调用线程之内，且任意时刻最多一帧在途
+// （无隐藏队列/线程）。起始相位由文本的字节和与位置加权和共同决定，因此本用例不假设
+// 帧首落在哪个半周：电平一律用 ExpectedLevel 按文档公式推导，另按“相隔 40 反相、
+// 相隔 80 同相”的方波结构复核。320 % 80 == 0 使帧间相位连续，5 帧逐采样一致。
 void TestSynchronousChunkedDelivery() {
   backend::FakeTts tts;
   capability::ITts& itts = tts;
@@ -68,13 +74,18 @@ void TestSynchronousChunkedDelivery() {
   CHECK(frames.size() == 5);
   CHECK(max_in_flight == 1);
   CHECK(callback_thread == std::this_thread::get_id());
-  CHECK(frames[0].samples[0] == backend::kFakeTtsSquareAmplitude);
-  CHECK(frames[0].samples[39] == backend::kFakeTtsSquareAmplitude);
-  CHECK(frames[0].samples[40] == -backend::kFakeTtsSquareAmplitude);
-  CHECK(frames[0].samples[79] == -backend::kFakeTtsSquareAmplitude);
-  // 第二帧帧首：全局样本 320，320 % 80 == 0，仍处于正半周，相位无跳变。
-  CHECK(frames[1].samples[0] == backend::kFakeTtsSquareAmplitude);
-  // 起始相位 0 时每帧都完整覆盖整数个周期，任意两帧逐采样一致。
+  // 方波形状按与相位无关的方式断言：一帧内只出现正负两种幅度，相隔 40 个样本必然反相、
+  // 相隔 80 个样本必然同相。帧首落在哪个半周由文本的起始相位决定（相位由字节和与位置
+  // 加权和共同决定），这里不把它钉死在某一个象限上。
+  for (const auto sample : frames[0].samples) {
+    CHECK(sample == backend::kFakeTtsSquareAmplitude ||
+          sample == -backend::kFakeTtsSquareAmplitude);
+  }
+  for (std::size_t index = 0; index + 80 < frames[0].samples.size(); ++index) {
+    CHECK(frames[0].samples[index] == frames[0].samples[index + 80]);
+  }
+  CHECK(frames[0].samples[0] != frames[0].samples[40]);
+  // 每帧 320 个样本正好覆盖 4 个整周期，因此帧与帧之间逐采样一致（与起始相位无关）。
   for (std::size_t index = 1; index < frames.size(); ++index) {
     CHECK(frames[index].samples == frames[0].samples);
   }
@@ -108,12 +119,21 @@ void TestDeterminismAndContentDependence() {
     CHECK(run3[index].samples == run1[index].samples);
   }
 
-  // 不同文本 → 不同 PCM：40 个 'a'（字节和 3880，起始相位 40）首样本为
-  // 负半周，与 80 个 'a'（起始相位 0）的首样本相反；帧数也随长度变化。
+  // 不同文本 → 不同 PCM：40 个 'a' 与 80 个 'a' 的字节长度不同，帧数不同；每一帧的
+  // 电平一律按文档公式推导，并额外要求它与长文本同一位置的样本不同——只比较帧首会漏掉
+  // “两个文本恰好落在同一象限”的情况。
   backend::FakeTts other;
-  const auto short_run = collect(other, std::string(40, 'a'));
-  CHECK(short_run.size() == ExpectedFrameCount(std::string(40, 'a')));
-  CHECK(short_run[0].samples[0] == -backend::kFakeTtsSquareAmplitude);
+  const std::string short_text(40, 'a');
+  const auto short_run = collect(other, short_text);
+  CHECK(short_run.size() == ExpectedFrameCount(short_text));
+  bool differs = false;
+  for (std::size_t index = 0; index < short_run[0].samples.size(); ++index) {
+    CHECK(short_run[0].samples[index] == ExpectedLevel(short_text, index));
+    if (short_run[0].samples[index] != run1[0].samples[index]) {
+      differs = true;
+    }
+  }
+  CHECK(differs);
 
   // 长度边界 1..40 字节：回调帧数必须等于 ⌈len/16⌉，杜绝漏帧/多帧。
   for (std::size_t length = 1; length <= 40; ++length) {
@@ -318,6 +338,33 @@ void TestConcurrentCancelStopsBeforeNextFrame() {
 // 进行中取消；synthesize 在“全部帧交付后、返回成功前”的检查点收敛为
 // kCancelled，证明“帧已发完”不会被误报成成功终态（整段已交付，外层不得
 // 把该结果当可重试失败而整段重放）。
+// 内容相关性不变量：等长且字节和相同的文本也必须产生不同波形。相位只取字节和时，
+// "ab" 与 "ba" 会得到逐采样一致的 PCM，于是“不同回答产生不同音频”这条证据就不成立。
+void TestEqualLengthTextsWithEqualByteSumDiffer() {
+  backend::FakeTts first;
+  std::vector<domain::AudioFrame> first_frames;
+  CHECK(first.set_callback([&](const domain::AudioFrame& frame) { first_frames.push_back(frame); })
+            .ok());
+  CHECK(first.synthesize("ab").ok());
+
+  backend::FakeTts second;
+  std::vector<domain::AudioFrame> second_frames;
+  CHECK(second.set_callback([&](const domain::AudioFrame& frame) { second_frames.push_back(frame); })
+            .ok());
+  CHECK(second.synthesize("ba").ok());
+
+  // 两个文本都是 2 字节、字节和都是 195，因此差异只能来自位置：长度相同、内容不同。
+  CHECK(first_frames.size() == second_frames.size());
+  CHECK(!first_frames.empty());
+  bool differs = false;
+  for (std::size_t index = 0; index < first_frames.size() && !differs; ++index) {
+    if (first_frames.at(index).samples != second_frames.at(index).samples) {
+      differs = true;
+    }
+  }
+  CHECK(differs);
+}
+
 void TestConcurrentCancelAtFinalFrame() {
   backend::FakeTts tts;
   capability::ITts& itts = tts;
@@ -341,4 +388,5 @@ int main() {
   TestConcurrentCancelBeforeFirstFrame();
   TestConcurrentCancelStopsBeforeNextFrame();
   TestConcurrentCancelAtFinalFrame();
+  TestEqualLengthTextsWithEqualByteSumDiffer();
 }

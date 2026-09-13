@@ -102,7 +102,7 @@ flowchart TB
 | 控制面 | 创建、查询、取消、退出及受理响应 | 版本化 JSON RPC、ZeroMQ 适配 | deadline、幂等、结构化错误，推理期间仍可响应 |
 | 数据面 | 输入音频、识别文本、token、PCM 和结束事件 | JSON 元数据 + 二进制 PCM multipart | 流归属、顺序、长度、有界缓冲与关闭语义 |
 
-当前已实现消息与事件的基础编解码、校验和值语义；表中的网络服务与传输适配尚未实现。具体 socket 模式应服务于控制响应和流式行为，不将某种同步收发方式固定为所有后端的执行方式。
+当前已实现消息与事件的基础编解码、校验和值语义，以及进程内 Gateway 的 NDJSON 分帧与控制请求入口：半包、粘包、超长消息、断连取消和慢客户端关闭都已按上表约定实现；真实 TCP、ZeroMQ 传输与二进制 PCM 下行尚未实现。具体 socket 模式应服务于控制响应和流式行为，不将某种同步收发方式固定为所有后端的执行方式。
 
 ### 标识与结果归属
 
@@ -220,8 +220,8 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 |---|---|---|
 | C++17、CMake、CTest 与许可证 | 已实现 | 独立构建、测试入口及构建失败门禁 |
 | 标识、错误和音频帧 | 已实现 | 值对象、范围和格式校验 |
-| 后端能力接口 | 已实现基础版 | 六类能力接口及最小契约夹具；交互扩展待补充 |
-| Session 状态与生成代际 | 已实现基础版 | 状态迁移、取消代际与过时事件拒绝；完整输出取消待实现 |
+| 后端能力接口 | 已实现基础版 | 六类能力接口及最小契约夹具；交互契约扩展已实现（流输入事件、尾帧生产与代际封锁） |
+| Session 状态与生成代际 | 已实现基础版 | 状态迁移、取消代际与过时事件拒绝；各阶段统一取消与旧输出隔离已实现（见下方 Session 语音路径行） |
 | 控制消息与数据事件 | 已实现基础版 | JSON 编解码、元数据与二进制 PCM 校验；网络服务未实现 |
 | Fake 音频输入输出 | 已实现 | 模拟帧输入、输出、取消和轮次行为 |
 | Fake 流式 ASR | 已实现 | 脚本驱动的 partial/final/done、取消与重开 |
@@ -229,7 +229,7 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | Fake RAG L0-L3 路由 | 已实现 | 固定检索夹具、分级决策与取消封锁 |
 | Fake 流式 LLM | 已实现 | 确定性 token 流、取消与回调失败封锁 |
 | Fake 流式 TTS | 已实现 | 逐帧 PCM、确定性波形与并发取消 |
-| Session 语音路径 | 已实现基础版 | L0/L1 音频到识别与直答；L2/L3 走 LLM 并按句流式合成，首段播放早于生成结束；端到端取消待后续任务 |
+| Session 语音路径 | 已实现基础版 | L0/L1 音频到识别与直答；L2/L3 走 LLM 并按句流式合成，首段播放早于生成结束；端到端取消已实现（旧结果不再提交） |
 | 常驻音频输入与语音分段 | 已实现基础版 | 跨轮次保持的单一输入拥有者、确定性活动脚本、前置缓冲与容量上限、播报期间新语音打断旧回答；真实 VAD、跨进程取消待后续任务 |
 | 进程内 Supervisor 生命周期 | 已实现基础版 | 设备级单活跃会话、忙碌拒绝、取消受理与清理完成的分别报告、清理未完成时槽位不可复用；子进程生命周期待后续任务 |
 | 进程内 Gateway 请求入口 | 已实现基础版 | NDJSON 分帧、四类控制操作、受理响应与执行终态分离、请求幂等、有界发送与慢客户端关闭、断连取消策略；真实 TCP/ZeroMQ 传输、PCM 逐帧下行与端到端背压待后续任务 |
@@ -264,7 +264,7 @@ cd nexweave
 ./scripts/test.sh
 ```
 
-测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库与测试套件，尚无完整语音应用启动命令。
+测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件与单进程 Mock 应用 `nexweave_session_app`（命令行门禁 `session_app_cli` 覆盖参数错误、三种输入模式、确定性一致与信号退出），真实传输与板端入口尚未交付。
 
 <details>
 <summary>Debug、严格警告与契约测试</summary>
@@ -305,15 +305,18 @@ ctest --test-dir build/strict -L contract --output-on-failure
 
 当前测试覆盖已实现模块的正常路径、非法输入、边界、取消与重开。后续验证沿相同接口扩展，既检查输出内容，也检查输出归属和失败后的状态。
 
-| 层级 | 主要验证内容 |
-|---|---|
-| Unit | 标识、音频格式、错误、状态迁移、协议、路由与播放节奏 |
-| Contract | Fake 和真实后端是否满足同一类能力约定 |
-| Integration | 请求转发、进程生命周期、数据传输和设备协作 |
-| End-to-end | 文本或音频输入到最终文本、PCM 与播放结果 |
-| Fault | 取消、超时、断连、满队列、节点退出与设备异常 |
-| Hardware | 模型/驱动兼容、双向音频、声学行为与资源占用 |
-| Stability | 固定输入和配置下的重复闭环及资源趋势 |
+当前在 `CMakeLists.txt` 中注册的 CTest 标签只有 `unit`、`contract`、`integration` 与 `gate` 四类；下表中标注“后续任务”的层级是验证目标，尚未注册为测试标签。
+
+| 层级 | 当前是否注册 | 主要验证内容 |
+|---|---|---|
+| Unit | 已注册 | 标识、音频格式、错误、状态迁移、协议、路由与播放节奏 |
+| Contract | 已注册 | Fake 和真实后端是否满足同一类能力约定 |
+| Integration | 已注册 | 请求转发、进程生命周期、数据传输和设备协作 |
+| Gate | 已注册 | 构建脚本可读失败、源码变化必须先重建，以及命令行入口的参数错误、三种输入模式、确定性一致与信号退出 |
+| End-to-end | 后续任务 | 文本或音频输入到最终文本、PCM 与播放结果 |
+| Fault | 后续任务 | 取消、超时、断连、满队列、节点退出与设备异常 |
+| Hardware | 后续任务 | 模型/驱动兼容、双向音频、声学行为与资源占用 |
+| Stability | 后续任务 | 固定输入和配置下的重复闭环及资源趋势 |
 
 目标证据包含运行清单、原始事件、指标与摘要，关联源码 commit、工具版本、设备、模型、驱动、配置和输入哈希。测试通过只说明对应行为被验证，不能直接换算为系统吞吐或可靠性。
 
@@ -348,10 +351,10 @@ ctest --test-dir build/strict -L contract --output-on-failure
 |---|---|
 | [core/domain](https://github.com/Caden-1224/nexweave/tree/main/core/domain) | 标识、生成代际、音频帧、版本与错误 |
 | [core/capability](https://github.com/Caden-1224/nexweave/tree/main/core/capability) | 后端接口及输入、取消、回调约定 |
-| [core/runtime](https://github.com/Caden-1224/nexweave/tree/main/core/runtime) | 会话监督器与单活跃槽位、Session 状态迁移与代际检查、常驻音频输入、语音分段与打断接缝 |
+| [core/runtime](https://github.com/Caden-1224/nexweave/tree/main/core/runtime) | 会话监督器与单活跃槽位、Session 状态迁移与代际检查、L0-L3 会话编排与流式分句、交互契约扩展、常驻音频输入与语音分段 |
 | [core/protocol](https://github.com/Caden-1224/nexweave/tree/main/core/protocol) | 控制消息、数据事件与序列化校验 |
 | [core/gateway](https://github.com/Caden-1224/nexweave/tree/main/core/gateway) | NDJSON 增量分帧、控制请求路由、幂等记录与有界发送 |
-| [core/backend](https://github.com/Caden-1224/nexweave/tree/main/core/backend) | Fake 音频与流式 ASR |
+| [core/backend](https://github.com/Caden-1224/nexweave/tree/main/core/backend) | Fake 音频、Fake 流式 ASR、Fake RAG、Fake LLM 与 Fake TTS |
 | [core/observability](https://github.com/Caden-1224/nexweave/tree/main/core/observability) | 运行清单、事件与指标值对象 |
 | [tests](https://github.com/Caden-1224/nexweave/tree/main/tests) | 单元、契约及构建门禁测试 |
 | [scripts](https://github.com/Caden-1224/nexweave/tree/main/scripts) | 构建与测试入口 |
@@ -365,7 +368,7 @@ ctest --test-dir build/strict -L contract --output-on-failure
 - [x] 独立构建、许可证和测试门禁
 - [x] 标识、音频、错误、状态机、代际与协议基础
 - [x] Fake 音频输入输出与流式 ASR
-- [ ] 交互契约扩展、Fake RAG/LLM/TTS 与完整 Session
+- [x] 交互契约扩展、Fake RAG/LLM/TTS 与完整 Session
 - [x] 常驻音频输入、语音分段与播报期间打断（确定性 Fake）
 - [x] 生成与播放重叠、端到端取消
 - [x] 进程内 Supervisor 与单活跃会话生命周期

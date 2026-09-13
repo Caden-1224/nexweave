@@ -11,11 +11,18 @@ namespace {
 // 按确定性规则计算起始相位：UTF-8 字节和模波形周期。unsigned char 保证
 // 高字节（>127）不会被符号扩展为负值，同一文本在不同实现上得到同一相位。
 std::size_t initial_phase(const std::string& text) noexcept {
+  // 相位同时取字节和与位置加权和。只取字节和会让等长且字节和相同的文本（例如 "ab" 与
+  // "ba"）得到逐采样一致的 PCM，于是“不同回答产生不同音频”这条证据就不再成立——
+  // 用它论证新旧输出隔离时，两个不同的回答可能恰好是同一条波形。
   std::size_t byte_sum = 0;
+  std::size_t weighted_sum = 0;
+  std::size_t position = 0;
   for (unsigned char byte : text) {
+    position += 1;
     byte_sum += static_cast<std::size_t>(byte);
+    weighted_sum += position * static_cast<std::size_t>(byte);
   }
-  return byte_sum % kFakeTtsCycleSamples;
+  return (byte_sum + 31 * weighted_sum) % kFakeTtsCycleSamples;
 }
 }  // namespace
 

@@ -204,8 +204,9 @@ class CooperativeLlm final : public capability::ILlm {
       return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput);
     }
     callback_ = std::move(callback);
-    delivered_ = 0;
-    cancel_calls_ = 0;
+    // 只重新武装取消标志；本轮的计数在 generate() 真正开始时才清零。会话在轮次收尾会把
+    // 回调注销成一个空操作，而注销本身也是一次注册——在这里清零，收尾那次注销就会把整轮
+    // 计数抹掉；而在被拒绝的生成调用上清零，又会抹掉本轮已经记下的事实。
     cancelled_.store(false);
     return domain::OperationResult::success();
   }
@@ -217,6 +218,8 @@ class CooperativeLlm final : public capability::ILlm {
     if (!callback_ || prompt.empty()) {
       return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput);
     }
+    delivered_ = 0;
+    cancel_calls_ = 0;
     for (const auto& token : tokens_) {
       // 交付前的检查就是后端侧的取消线性化点：会话在回调内传播过来的 cancel() 从下一个
       // token 起生效，已经交付的那一个 token 无法撤回（并发窗口，不做虚假承诺）。
@@ -272,8 +275,9 @@ class StubbornLlm final : public capability::ILlm {
       return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput);
     }
     callback_ = std::move(callback);
-    delivered_ = 0;
-    cancel_calls_ = 0;
+    // 只重新武装取消标志；本轮的计数在 generate() 真正开始时才清零。会话在轮次收尾会把
+    // 回调注销成一个空操作，而注销本身也是一次注册——在这里清零，收尾那次注销就会把整轮
+    // 计数抹掉；而在被拒绝的生成调用上清零，又会抹掉本轮已经记下的事实。
     return domain::OperationResult::success();
   }
 
@@ -281,6 +285,8 @@ class StubbornLlm final : public capability::ILlm {
     if (!callback_ || prompt.empty()) {
       return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput);
     }
+    delivered_ = 0;
+    cancel_calls_ = 0;
     for (const auto& token : tokens_) {
       // 刻意不检查取消：本夹具的职责就是把“取消之后仍然到达的旧结果”真的送出来。
       callback_({capability::TextEventKind::kToken, token, {}});
@@ -985,7 +991,9 @@ void TestBargeInDuringGenerationStopsBackendsAndKeepsNewSpeech() {
   CHECK(llm.delivered() < tokens.size());
   CheckCancelTrace(session);
 
-  // 打断不消耗新语音：会话只取走通知，音频仍留在输入侧等待下一轮。
+  // 下面两条断言的是**夹具自己**的账目：monitor 是本用例的替身，会话拿不到它的
+  // pending_speech，因此它们只能证明“夹具没有消费掉新语音”，不能证明被测对象的保留
+  // 行为。端到端的保留由 resident_input_session_test.cpp 对真实常驻输入断言。
   CHECK(monitor.pending_speech.size() == 3);
   CHECK(monitor.pending_speech.front().samples.front() == 900);
 

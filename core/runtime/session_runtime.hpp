@@ -54,7 +54,11 @@ struct SessionTurnResult {
   // 而不是只靠调用顺序对应。不影响任何判定逻辑。
   std::string request_id;
   SessionStateMachine::State state = SessionStateMachine::State::kIdle;
-  // 默认取取消终态：只有确认播放完成才会被改写为成功终态，避免默认值伪装成功。
+  // 本轮**提交过**的终态标记：成功提交后为 kTerminalSucceeded，取消或失败提交后为
+  // kTerminalCancelled。默认取取消终态，它是保守默认（避免默认值伪装成功），而不是对
+  // trace 的描述：本轮若没有开启任何代际（例如输入流建立失败），夹具会拒绝终止提交，
+  // 此时本字段保持默认值且 trace 中没有任何终态标记。判断“本轮到底记录了哪个终态”必须
+  // 以 trace 为准；本字段只回答“本轮的收尾意图是否被接受”。
   runtime::ActivityMarker terminal_marker = runtime::ActivityMarker::kTerminalCancelled;
   domain::Error error{};
   bool cancelled = false;
@@ -450,6 +454,12 @@ class SessionRuntime final {
   // 解除 TTS 回调借用。Session 持有的 TTS 回调按引用捕获本轮成员状态，回调必须在
   // 本轮任何状态被改写之前注销；异常路径也要走到这里，否则回调会引用过期状态。
   void detach_tts_callback();
+  // 解除 LLM token 回调借用。与 TTS 同理但更强：token 回调按引用捕获本轮**函数局部**的
+  // 分句器，而 ILlm 的实现契约明确允许 generate() 返回之后继续投递 token（见
+  // capability/backend.hpp 里“启动成功不等于异步生成已完成”的约定）。因此轮次结束时若
+  // 不注销，后端手里就留下一个指向已析构分句器的回调——那是未定义行为，而不是“迟到事件
+  // 被忽略”。注销成空操作后，迟到 token 既不触碰本轮状态，也不会被当成下一轮的输入。
+  void detach_llm_callback();
 
   capability::IAsr& asr_;
   backend::FakeRagRouter& router_;

@@ -121,6 +121,13 @@ void FakeLlm::notify_completed() {
 }
 
 void FakeLlm::notify_failed(const std::string& message) {
+  // 与 token/完成报告同守卫：观察者一旦置位 failed()，就表示“本次生成以失败收敛”，
+  // 后端不得再报告任何后续事件（见 capability/generation_probe.hpp 的约定）。少了这道
+  // 守卫会出现最自相矛盾的一种证据——后续轮次被全程抑制，却单独收到一条失败，而它从未
+  // 见过对应轮次的开始。
+  if (reporting_suppressed()) {
+    return;
+  }
   if (observer_ != nullptr) {
     observer_->on_generation_failed(message);
   }

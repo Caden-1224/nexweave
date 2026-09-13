@@ -210,6 +210,54 @@ class ScriptedTokenLlm final : public capability::ILlm {
 
 // 在第 N 次写入时开始失败的设备：让“合成进行到一半时播放设备报错”这条路径可复现。
 // 已经成功写入的帧保留在设备里，用于核对失败轮次不会把已播内容从证据里抹掉。
+// 允许“generate 返回之后继续投递”的 LLM 替身：ILlm 的契约只要求启动成功不等于异步生成
+// 已完成，因此后端在返回后再交付一个 token 是合法行为。会话必须在轮次收尾时把回调注销成
+// 空操作，否则这个迟到 token 会写进本轮已经析构的分句器——那是未定义行为。
+class LateTokenLlm final : public capability::ILlm {
+ public:
+  explicit LateTokenLlm(std::vector<std::string> tokens) : tokens_(std::move(tokens)) {}
+
+  domain::OperationResult set_callback(capability::TextEventCallback callback) override {
+    if (!callback) {
+      return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput);
+    }
+    ++registrations_;
+    callback_ = std::move(callback);
+    return domain::OperationResult::success();
+  }
+
+  domain::OperationResult generate(const std::string& prompt) override {
+    if (!callback_ || prompt.empty()) {
+      return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput);
+    }
+    for (const auto& token : tokens_) {
+      callback_({capability::TextEventKind::kToken, token, {}});
+    }
+    callback_({capability::TextEventKind::kDone, "", {}});
+    return domain::OperationResult::success();
+  }
+
+  domain::OperationResult cancel() noexcept override {
+    return domain::OperationResult::success();
+  }
+
+  // 轮次结束之后由用例调用：模拟后端“返回后仍继续投递”。
+  void deliver_late_token(const std::string& text) {
+    if (callback_) {
+      callback_({capability::TextEventKind::kToken, text, {}});
+    }
+  }
+
+  int registrations() const noexcept {
+    return registrations_;
+  }
+
+ private:
+  std::vector<std::string> tokens_;
+  capability::TextEventCallback callback_;
+  int registrations_ = 0;
+};
+
 class FailingSink final : public capability::IAudioSink {
  public:
   explicit FailingSink(std::size_t fail_from_write) : fail_from_(fail_from_write) {}
@@ -893,8 +941,39 @@ void TestPlaybackDeviceFailureFailsTurnWithoutResidue() {
 
 }  // namespace
 
+// 回调生命周期不变量：轮次收尾必须把 token 回调注销成空操作。ILlm 允许 generate() 返回
+// 之后继续投递，因此“迟到 token”是契约内的正常行为；如果回调仍指向本轮的分句器，它就会
+// 写进一个已经析构的对象。可观测判据是“迟到 token 不再产生任何合成调用”。
+void TestLateTokenAfterTurnIsIgnored() {
+  auto rag = MakeIndex();
+  backend::FakeRagRouter router(rag, backend::FakeRagRouter::Config{1.01, 0.50, 3});
+  backend::FakeAsr asr({kL2Question});
+  LateTokenLlm llm(SplitTokens(kL2Answer, 4));
+  RecordingTts tts;
+  runtime::ManualPlaybackClock clock;
+  AdvancingSink sink(clock);
+  CHECK(sink.open().ok());
+  runtime::LogicalClockPlayback playback(sink, clock);
+  SessionRuntimeConfig config;
+  config.text_chunk_max_bytes = 12;
+  SessionRuntime session(asr, rag, router, tts, playback, &llm, config);
+
+  const auto result = session.run(TurnInput("mic-late-token", "req-late-token"));
+  CHECK(result.completed);
+  CHECK(result.text == kL2Answer);
+  // 轮次内注册过一次，收尾时又被注销覆盖一次：注销必须真的发生。
+  CHECK(llm.registrations() >= 2);
+
+  // 轮次已经结束。此刻投递 token 属于契约允许的行为，但必须落进空操作回调：
+  // 一旦它还能触发合成，就说明回调仍指向本轮已经析构的分句器。
+  const std::size_t synthesized_before = tts.texts.size();
+  llm.deliver_late_token("轮次结束之后才到达的 token");
+  CHECK(tts.texts.size() == synthesized_before);
+}
+
 int main() {
   TestL2OverlapAndEvidence();
+  TestLateTokenAfterTurnIsIgnored();
   TestMultiSentenceChunkingKeepsOrder();
   TestPromptContainsContextOnlyForL2();
   TestPlaybackBackpressureFailsTurnInBoundedWay();

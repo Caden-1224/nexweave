@@ -32,6 +32,19 @@ fail() {
   failures=$((failures + 1))
 }
 
+# 取一个必须存在的整数字段。字段缺失时直接记一次失败并返回 -1：否则 [ "" -le 1 ] 只会往
+# stderr 报一句 integer expression expected 并走 else 分支，检查就无声地不再保护任何东西。
+require_int() {  # require_int <用例名> <输出文件> <字段>
+  local label="$1" file="$2" field="$3" value
+  value="$(json_int "$file" "$field")"
+  if [ -z "$value" ]; then
+    fail "$label：汇总输出缺少整数字段 $field，该检查会静默失效"
+    printf '%s' -1
+    return
+  fi
+  printf '%s' "$value"
+}
+
 # 运行一条命令并把退出码写入全局 RC：调用方随后用 expect_rc 断言，避免 $? 被中间命令覆盖。
 RC=0
 run() {
@@ -96,7 +109,7 @@ run "$APP" --input text --text "the weather in paris" --stream-id gate-l2 \
 expect_rc 0 "L2 生成应当正常收敛"
 expect_eq "L2 生成完成一轮" "$(json_int "$work/last.log" turns_completed)" "1"
 expect_eq "L2 生成路由为 L2" "$(json_word "$work/last.log" route)" "L2"
-if [ "$(json_int "$work/last.log" pcm_frames)" -le 1 ]; then
+if [ "$(require_int "L2 生成" "$work/last.log" pcm_frames)" -le 1 ]; then
   fail "L2 生成应当产生多帧输出（流式分句）"
 fi
 cp "$work/last.log" "$work/l2.log"
@@ -106,7 +119,7 @@ run "$APP" --input text --text "the weather in paris" --stream-id gate-cancel \
 expect_rc 0 "取消后应当正常收敛（取消是正常语义）"
 expect_match "取消轮次以取消终态收敛" '"marker":"cancelled"' "$work/last.log"
 expect_eq "取消不产生完成轮次" "$(json_int "$work/last.log" turns_completed)" "0"
-if [ "$(json_int "$work/last.log" pcm_frames)" -lt 1 ]; then
+if [ "$(require_int "取消耗时" "$work/last.log" pcm_frames)" -lt 1 ]; then
   fail "取消前已经写出的帧应当保留"
 fi
 cp "$work/last.log" "$work/cancel.log"
