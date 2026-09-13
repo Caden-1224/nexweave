@@ -76,6 +76,21 @@ target_link_libraries(nexweave_app
   PRIVATE nexweave_warnings nlohmann_json::nlohmann_json
 )
 
+# 请求入口层：把外部控制请求与数据事件接到监督器上。它依赖应用层（会话组装结果）与核心层
+# （监督器、协议），因此单独成一个目标：命令行入口与后续传输适配器共用同一份请求处理逻辑，
+# 不必各自复制一份控制路由。
+add_library(nexweave_gateway STATIC
+  core/gateway/ndjson_framer.cpp
+  core/gateway/gateway.cpp
+)
+target_include_directories(nexweave_gateway PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/gateway
+)
+target_link_libraries(nexweave_gateway
+  PUBLIC nexweave_app
+  PRIVATE nexweave_warnings nlohmann_json::nlohmann_json
+)
+
 enable_testing()
 # 所有测试通过同一配置入口注册，新增目标不会漏掉警告门禁。
 function(nexweave_test name source label)
@@ -131,6 +146,15 @@ nexweave_test(supervisor_lifecycle tests/integration/supervisor_lifecycle_test.c
 # 该目标包含真实线程交错：闸门不放行会表现为挂起，超时让它在 60 秒内变成明确失败。
 set_tests_properties(supervisor_lifecycle_integration PROPERTIES TIMEOUT 60)
 nexweave_test(protocol_boundaries tests/unit/protocol_boundaries_test.cpp unit)
+nexweave_test(ndjson_framer tests/unit/ndjson_framer_test.cpp unit)
+# 解帧是纯值逻辑，但实现位于入口库内，因此测试同时链接入口层，避免出现“只有测试里能用”的副本。
+target_link_libraries(nexweave_ndjson_framer_test PRIVATE nexweave_gateway)
+nexweave_test(gateway_entry tests/integration/gateway_entry_test.cpp integration)
+# 入口测试同时需要入口层、会话应用与核心层：它验收的是把真实会话接到外部请求入口之后的
+# 行为，并包含真实线程交错（会话在工作线程上执行而控制请求在调用线程上处理）。
+target_link_libraries(nexweave_gateway_entry_test PRIVATE nexweave_gateway)
+# 闸门不放行或事件交付漏唤醒会表现为挂起，超时让它在 60 秒内变成明确失败。
+set_tests_properties(gateway_entry_integration PROPERTIES TIMEOUT 60)
 
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。
 add_executable(nexweave_session_app apps/session_app/main.cpp)

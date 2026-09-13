@@ -59,6 +59,26 @@ struct SessionAppRunRecord {
   SessionAppRunResult result;
 };
 
+// 最近一次已收敛会话的记录来源。
+//
+// 它存在的理由：请求入口要回答“刚才那次会话交付了什么”，但它不应该知道会话是怎样被跑起来
+// 的。把这个问题的接口固定下来，进程内应用与后续的多进程适配器就能各自实现同一份契约，
+// 而请求入口只依赖接口；测试也可以注入一个不跑真实会话的记录来源。
+//
+// 阻塞与截止时间：本接口没有任何等待语义——实现必须立即返回，不得等待在途会话、不得睡眠、
+// 不得访问设备或网络；调用方（请求入口）因此可以在处理控制请求的路径上安全地调用它。
+// 没有“超时”这个概念，因为不存在需要等待的对象。
+//
+// 线程安全：实现必须允许从任意线程调用；返回的记录是不可变快照，调用方可以长期保留。
+class ISessionRunSource {
+ public:
+  virtual ~ISessionRunSource() = default;
+
+  // 返回最近一次收敛会话的快照；还没有任何会话收敛过时返回空指针。
+  // 实现不得阻塞、不得等待在途会话，也不得在返回前复制逐帧音频。
+  virtual std::shared_ptr<const SessionAppRunRecord> last_run() const = 0;
+};
+
 // 会话拥有者工厂：按同一份应用配置为每次会话构造一个**全新**的 SessionApp。
 //
 // 为什么每次新建而不是复用一个应用对象：会话收敛后槽位会被下一个会话复用，而复用同一个
@@ -74,7 +94,7 @@ struct SessionAppRunRecord {
 // 借用关系：asr/retriever/router/tts/playback 必须比本对象活得久，retriever 还必须比 router
 // 活得久；resident 只在模拟常驻模式下使用，llm 可为空。全部按借用保存，本对象不负责它们的
 // 生命周期，也不在析构时释放它们。
-class SessionAppOwnerFactory final : public ISessionOwnerFactory {
+class SessionAppOwnerFactory final : public ISessionOwnerFactory, public ISessionRunSource {
  public:
   SessionAppOwnerFactory(SessionAppConfig config, capability::IAsr& asr,
                          capability::IRag& retriever, backend::FakeRagRouter& router,
@@ -96,7 +116,7 @@ class SessionAppOwnerFactory final : public ISessionOwnerFactory {
   // 最近一次收敛会话的运行记录。返回空指针表示还没有任何会话收敛过。
   // 返回值是**不可变快照**：调用方可以任意保留，它不会被后续会话改写；也不需要复制，
   // 因此这条控制路径的开销与会话产出了多少 PCM 无关。
-  std::shared_ptr<const SessionAppRunRecord> last_run() const;
+  std::shared_ptr<const SessionAppRunRecord> last_run() const override;
 
  private:
   // 一次会话的拥有者。定义在实现文件里：它只有生命周期入口，不构成对外契约。
