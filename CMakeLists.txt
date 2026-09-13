@@ -48,6 +48,7 @@ add_library(nexweave_core_domain STATIC
   core/runtime/text_segmentation.cpp
   core/runtime/speech_segmentation.cpp
   core/runtime/resident_audio_input.cpp
+  core/runtime/supervisor.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -63,6 +64,7 @@ target_link_libraries(nexweave_core_domain
 # 因此“应用入口”不进入核心依赖，核心也不会反向依赖命令行。
 add_library(nexweave_app STATIC
   core/app/session_app.cpp
+  core/app/session_app_owner.cpp
 )
 target_include_directories(nexweave_app PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/app
@@ -119,6 +121,15 @@ nexweave_test(session_app tests/integration/session_app_test.cpp integration)
 target_link_libraries(nexweave_session_app_test PRIVATE nexweave_app)
 target_include_directories(nexweave_session_app_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/core/app)
+nexweave_test(supervisor_session_app tests/integration/supervisor_session_app_test.cpp integration)
+# 该目标同时需要应用层与核心层：它验收的是把会话应用接到监督器接缝上之后的行为。
+target_link_libraries(nexweave_supervisor_session_app_test PRIVATE nexweave_app)
+target_include_directories(nexweave_supervisor_session_app_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/app)
+set_tests_properties(supervisor_session_app_integration PROPERTIES TIMEOUT 60)
+nexweave_test(supervisor_lifecycle tests/integration/supervisor_lifecycle_test.cpp integration)
+# 该目标包含真实线程交错：闸门不放行会表现为挂起，超时让它在 60 秒内变成明确失败。
+set_tests_properties(supervisor_lifecycle_integration PROPERTIES TIMEOUT 60)
 nexweave_test(protocol_boundaries tests/unit/protocol_boundaries_test.cpp unit)
 
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。

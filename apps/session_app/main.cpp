@@ -318,6 +318,8 @@ class RunReporter final : public SessionAppObserver {
         return "backend_failure";
       case ErrorCode::kDeviceFailure:
         return "device_failure";
+      case ErrorCode::kBusy:
+        return "busy";
     }
     return "unknown";
   }

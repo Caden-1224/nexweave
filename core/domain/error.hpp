@@ -15,7 +15,12 @@ enum class ErrorCode {
   kCancelled = 4,
   kTimeout = 5,
   kBackendFailure = 6,
-  kDeviceFailure = 7
+  kDeviceFailure = 7,
+  // 目标资源当前已被占用：本次操作没有受理、也没有副作用，属于“暂时不行、稍后可再试”，
+  // 而不是参数错误或任务已经结束。它专用于设备自身的正常单活跃约束（一台设备只允许一个
+  // 活跃会话）；容量耗尽表达的是资源不足，应继续用 kBackendFailure，避免调用方把
+  // “等一会儿再来”误读成“扩容就能过”。
+  kBusy = 8
 };
 
 // 接受且仅接受上面定义的错误码；未知强制转换值返回 false，无分配、无状态修改。

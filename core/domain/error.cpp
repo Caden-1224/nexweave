@@ -11,6 +11,7 @@ bool is_valid_error_code(ErrorCode code) noexcept {
     case ErrorCode::kTimeout:
     case ErrorCode::kBackendFailure:
     case ErrorCode::kDeviceFailure:
+    case ErrorCode::kBusy:
       return true;
   }
   return false;
@@ -25,6 +26,7 @@ ErrorDisposition Error::disposition() const noexcept {
     case ErrorCode::kTimeout:
     case ErrorCode::kBackendFailure:
     case ErrorCode::kDeviceFailure:
+    case ErrorCode::kBusy:
       return ErrorDisposition::kRetryable;
     case ErrorCode::kInvalidInput:
     case ErrorCode::kMissingField:
