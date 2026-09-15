@@ -120,10 +120,12 @@ target_link_libraries(nexweave_gateway
   PRIVATE nexweave_warnings nlohmann_json::nlohmann_json
 )
 
-# 控制传输适配器：把进程内 Gateway 接到 ZeroMQ REQ/REP 控制面。Context/socket 类型只在实现
-# 文件里出现，公共头文件只暴露 NexWeave 值对象，避免传输细节进入 Session。
+# ZeroMQ 传输适配器：控制面使用 REQ/REP 接入进程内 Gateway，数据面使用 PAIR multipart
+# 搬运输入音频与输出事件。Context/socket 类型只在实现文件里出现，公共头文件只暴露
+# NexWeave 值对象，避免传输细节进入 Session。
 add_library(nexweave_transport STATIC
   core/transport/zmq_control.cpp
+  core/transport/zmq_data.cpp
 )
 target_include_directories(nexweave_transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/transport
@@ -236,6 +238,11 @@ set_tests_properties(gateway_entry_integration PROPERTIES TIMEOUT 60)
 nexweave_test(zmq_control tests/integration/zmq_control_test.cpp integration)
 target_link_libraries(nexweave_zmq_control_test PRIVATE nexweave_transport)
 set_tests_properties(zmq_control_integration PROPERTIES TIMEOUT 60)
+
+# ZeroMQ 数据面集成测试：真实 PAIR socket、multipart 编解码、输入流顺序和事件终态。
+nexweave_test(zmq_data tests/integration/zmq_data_test.cpp integration)
+target_link_libraries(nexweave_zmq_data_test PRIVATE nexweave_transport)
+set_tests_properties(zmq_data_integration PROPERTIES TIMEOUT 60)
 
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。
 add_executable(nexweave_session_app apps/session_app/main.cpp)
