@@ -164,27 +164,6 @@ bool WriteSilentWav(const std::string& path) {
   return written == bytes.size() && closed == 0;
 }
 
-// 去掉运行清单里的两个日历时间字段，使"两次运行的清单是否一致"可以逐字节比较。
-//
-// 确定性针对的是"同一份配置、同一个版本跑出同样的语义结果"，不针对"两次执行发生在同一秒"。
-// 清单里的日历时间是实测值，本来就应当不同；把它一并比较只会让这条用例时而通过时而失败，
-// 从而失去意义。除这两个字段之外的全部字段（含三个哈希、命令与版本）仍要求逐字节一致。
-std::string ManifestWithoutCalendarTime(std::string manifest) {
-  for (const char* const key : {"start_time", "end_time"}) {
-    const std::string needle = std::string("\"") + key + "\":\"";
-    const std::size_t begin = manifest.find(needle);
-    if (begin == std::string::npos) {
-      continue;
-    }
-    const std::size_t value_begin = begin + needle.size();
-    const std::size_t value_end = manifest.find('"', value_begin);
-    if (value_end != std::string::npos) {
-      manifest.replace(value_begin, value_end - value_begin, "<time>");
-    }
-  }
-  return manifest;
-}
-
 // ---- 用例 ----
 
 // 保护不变量 1：场景标识是稳定契约。四个场景都必须能按名字叫出来、能解析回来、能给出非空
@@ -236,8 +215,8 @@ void TestRepeatedRunsAreByteIdentical() {
     CHECK(first.summary_json == second.summary_json);
     // 清单里的日历时间是实测值，规范化之后必须逐字节一致；其余字段（包括三个哈希与
     // 执行命令）仍然逐字节比较，因此确定性并没有被放宽成“什么都比”。
-    CHECK(ManifestWithoutCalendarTime(first.manifest_json) ==
-          ManifestWithoutCalendarTime(second.manifest_json));
+    CHECK(nexweave::test::without_calendar_time(first.manifest_json) ==
+          nexweave::test::without_calendar_time(second.manifest_json));
     CHECK(first.manifest_json.find("\"command_hash\"") == std::string::npos);
     // 三个关联哈希分工明确：清单承载配置与输入，命令哈希与它们并列放在起点事件上。
     CHECK(first.events_jsonl.find("command_hash") != std::string::npos);

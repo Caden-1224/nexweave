@@ -90,29 +90,10 @@ std::size_t CountName(const std::vector<MilestoneRecord>& records, const std::st
   return count;
 }
 
-// 按行拆分 JSONL，忽略结尾换行造成的空行，使每个元素都是一条可独立解码的记录。
-std::vector<std::string> Lines(const std::string& text) {
-  std::vector<std::string> lines;
-  std::size_t position = 0;
-  while (position < text.size()) {
-    const std::size_t newline = text.find('\n', position);
-    if (newline == std::string::npos) {
-      lines.push_back(text.substr(position));
-      break;
-    }
-    if (newline > position) {
-      lines.push_back(text.substr(position, newline - position));
-    }
-    position = newline + 1;
-  }
-  return lines;
-}
-
-// 取同名指标的出现次数与首个取值。用解码而不是子串搜索：字段顺序由 JSON 库决定，
-// 子串断言会在字段重排时静默失效。
+// 取同名指标的出现次数与首个取值；逐行解码的规则来自公共辅助，本函数只多数一次出现次数。
 std::size_t MetricSamples(const std::string& metrics, const std::string& name, double* first_value) {
   std::size_t count = 0;
-  for (const std::string& line : Lines(metrics)) {
+  for (const std::string& line : nexweave::test::jsonl_lines(metrics)) {
     const auto metric = decode_metric(line);
     if (metric.ok() && metric.value->name == name) {
       if (count == 0 && first_value != nullptr) {
@@ -199,7 +180,7 @@ void TestEventsKeepEveryOccurrenceAndMetricsUseTheFirst() {
   CHECK(MetricSamples(recorder.metrics_jsonl(), "mono_generation_started_us", &value) == 1);
   CHECK(value == 100.0);
   // 事件流保留两次出现，指标只留首次：两者不互相覆盖，也不互相替代。
-  CHECK(Lines(recorder.events_jsonl()).size() == records.size());
+  CHECK(nexweave::test::jsonl_lines(recorder.events_jsonl()).size() == records.size());
 }
 
 // 保护不变量 4：未测量不等于 0。首 token 没发生时，mono_first_token_us 既不出现 0，
@@ -320,7 +301,7 @@ void TestArtifactsRoundTripThroughTheObservabilityDecoders() {
   CHECK(manifest.value->start_time != "none");
   CHECK(manifest.value->end_time != "none");
 
-  const std::vector<std::string> event_lines = Lines(recorder.events_jsonl());
+  const std::vector<std::string> event_lines = nexweave::test::jsonl_lines(recorder.events_jsonl());
   CHECK(event_lines.size() == recorder.milestone_count());
   std::uint64_t previous_sequence = 0;
   bool first_event = true;
@@ -353,7 +334,7 @@ void TestArtifactsRoundTripThroughTheObservabilityDecoders() {
   CHECK(run_end.value->attributes.at("error_code") == "none");
   CHECK(run_end.value->attributes.at("audio_frames") == "1");
 
-  const std::vector<std::string> metric_lines = Lines(recorder.metrics_jsonl());
+  const std::vector<std::string> metric_lines = nexweave::test::jsonl_lines(recorder.metrics_jsonl());
   CHECK(!metric_lines.empty());
   bool saw_cancel_interval = false;
   for (const std::string& line : metric_lines) {

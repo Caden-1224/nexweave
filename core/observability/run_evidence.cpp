@@ -30,21 +30,61 @@ const char* const kCancelPhases[] = {
     milestone::kPlaybackCleared, milestone::kTerminalCancelled,
 };
 
-// 需要两个里程碑相减才能得到的单调指标：起点与终点写在表里，指标名只是它们的标签。
-// 集中成一张表而不是散落在渲染分支里，是为了让“这个数从哪两个时刻算出来”永远和指标名
-// 写在同一行。
+// 派生指标的取值方式。用枚举而不是靠指标名分支：枚举让编译器在漏掉一种取值时报错，
+// 而字符串比较只会在运行时静默地少算一条指标。
+enum class DerivedValue : std::uint8_t {
+  kMilestoneInterval,  // 终点里程碑的时间 − 起点里程碑的时间
+  kRunTotal,           // run_start → run_end，只在收尾之后产生
+  kMilestoneCount,     // 本次运行记录的里程碑条数
+  kAudioFrames,        // 写出音频汇的帧数
+  kAudioDurationMs,    // 帧数 × 帧长，按音频契约推导
+};
+
+// 派生指标：名称、单位、口径说明、取值方式，以及（对区间指标而言）起点与终点里程碑。
+// 四件事写在同一行，是为了让“这个数从哪两个时刻算出来、单位是什么、给人看的解释是什么”
+// 永远不可能互相漂移。
 struct DerivedMetric {
   const char* name;
   const char* unit;
+  const char* scope;
+  DerivedValue value;
   const char* start;
   const char* end;
 };
 
-const DerivedMetric kDerivedMonotonic[] = {
-    {"mono_overlap_lead_us", "us", milestone::kPlaybackStart, milestone::kGenerationDone},
-    {"mono_cancel_cleared_us", "us", milestone::kCancelAccepted, milestone::kPlaybackCleared},
-    {"mono_cancel_terminal_us", "us", milestone::kCancelAccepted, milestone::kTerminalCancelled},
+const DerivedMetric kDerivedMetrics[] = {
+    {"mono_overlap_lead_us", "us",
+     "playback_start → generation_done；为正表示生成结束前已经开始播放（重叠），为负表示"
+     "文本先定稿再开始播放（L0/L1 串行直答）",
+     DerivedValue::kMilestoneInterval, milestone::kPlaybackStart, milestone::kGenerationDone},
+    {"mono_cancel_cleared_us", "us", "cancel_accepted → playback_cleared",
+     DerivedValue::kMilestoneInterval, milestone::kCancelAccepted, milestone::kPlaybackCleared},
+    {"mono_cancel_terminal_us", "us", "cancel_accepted → terminal_cancelled",
+     DerivedValue::kMilestoneInterval, milestone::kCancelAccepted,
+     milestone::kTerminalCancelled},
+    {"mono_run_total_us", "us", "run_start → run_end", DerivedValue::kRunTotal,
+     milestone::kRunStart, milestone::kRunEnd},
+    {"step_total", "step", "本次运行记录的里程碑总数（确定性，可复现）",
+     DerivedValue::kMilestoneCount, nullptr, nullptr},
+    {"step_audio_frames", "frame", "本次运行写出音频汇的帧数，取自会话运行记录",
+     DerivedValue::kAudioFrames, nullptr, nullptr},
+    {"step_audio_duration_ms", "ms",
+     "帧数 × 帧长，按音频契约推导的设计值，不是实测播放时长",
+     DerivedValue::kAudioDurationMs, nullptr, nullptr},
 };
+
+// 某个里程碑名称首次出现的下标。多轮会话里同名里程碑会重复出现，而指标回答的是“这件事
+// 第一次发生在什么时候”，因此每一处需要“首次”的地方都走同一个判定，不各写一份。
+bool FirstIndex(const std::vector<MilestoneRecord>& records, std::string_view name,
+                std::size_t& index) {
+  for (std::size_t position = 0; position < records.size(); ++position) {
+    if (records[position].name == name) {
+      index = position;
+      return true;
+    }
+  }
+  return false;
+}
 
 bool starts_with(std::string_view text, std::string_view prefix) {
   return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
@@ -75,32 +115,18 @@ std::string Iso8601UtcNow() {
   return written == 0 ? std::string("none") : std::string(buffer);
 }
 
-// 指标的“起点 → 终点”口径说明。它只写进人类可读的摘要：metrics.jsonl 用
-// name/unit/value 三个字段表达事实，而口径是同一件事的解释，落在需要解释的地方。
-std::string MetricScope(std::string_view name) {
-  for (const DerivedMetric& derived : kDerivedMonotonic) {
+// 指标的口径说明：它只写进人类可读的摘要——metrics.jsonl 用 name/unit/value 三个字段
+// 表达事实，而口径是同一件事的解释，落在需要解释的地方。派生指标的口径来自上面那张表，
+// 其余按命名族给出统一的说法，因此新增一条派生指标不需要在两处各写一句解释。
+std::string ScopeFor(std::string_view name) {
+  for (const DerivedMetric& derived : kDerivedMetrics) {
     if (name == derived.name) {
-      std::string text(derived.start);
-      text += " → ";
-      text += derived.end;
-      if (name == "mono_overlap_lead_us") {
-        text += "；为正表示生成结束前已经开始播放（重叠），为负表示文本先定稿再开始播放"
-                "（L0/L1 串行直答）";
-      }
-      return text;
+      return derived.scope;
     }
   }
-  if (name == "mono_run_total_us") {
-    return "run_start → run_end";
-  }
-  if (name == "step_total") {
-    return "本次运行记录的里程碑总数（确定性，可复现）";
-  }
-  if (name == "step_audio_frames") {
-    return "本次运行写出音频汇的帧数，取自会话运行记录";
-  }
-  if (name == "step_audio_duration_ms") {
-    return "帧数 × 帧长，按音频契约推导的设计值，不是实测播放时长";
+  if (name == "mono_first_pcm_us") {
+    return "run_start → first_pcm：会话确认第一帧已被播放组件接受；设备侧写出"
+           "（playback_start）先于它，因此它不是首帧开始进入播放侧的时刻";
   }
   if (starts_with(name, "mono_") && ends_with(name, "_us")) {
     const std::string middle(name.substr(5, name.size() - 5 - 3));
@@ -111,6 +137,83 @@ std::string MetricScope(std::string_view name) {
     return middle + " 的调度步数（确定性，可复现）";
   }
   return "未定义";
+}
+
+// 一条待渲染的指标：名称、单位、取值、口径，以及它归属的里程碑（用于取 request/session/
+// 代际与事件时间戳）。owner 指向调用方传入的里程碑表，因此调用方必须让那张表活得比本结构久。
+struct MetricRow {
+  std::string name;
+  std::string unit;
+  double value = 0.0;
+  std::string scope;
+  const MilestoneRecord* owner = nullptr;
+};
+
+// 把里程碑表投影成指标表。已记录的里程碑按首次出现各产生一对指标（单调时间与调度步数），
+// 派生指标按上面那张表逐条计算。事件流、metrics.jsonl 与摘要的指标表都从同一批里程碑派生，
+// 而 metrics.jsonl 与摘要更进一步共用这一份投影，因此三者不可能给出不同的名字、单位或数值。
+std::vector<MetricRow> BuildMetricRows(const std::vector<MilestoneRecord>& records, bool frozen,
+                                       std::int64_t total_us, std::size_t audio_frames,
+                                       std::int64_t frame_ms) {
+  std::vector<MetricRow> rows;
+  if (records.empty()) {
+    // 里程碑表至少含 run_start（构造时写入）；空表说明记录器还没有起点，此时不产生任何
+    // 指标，比产生一堆没有归属的数值更诚实。
+    return rows;
+  }
+  const MilestoneRecord& anchor = records.front();
+  std::vector<std::string> emitted;
+  for (const MilestoneRecord& record : records) {
+    if (std::find(emitted.begin(), emitted.end(), record.name) != emitted.end()) {
+      continue;
+    }
+    emitted.push_back(record.name);
+    const std::string monotonic = "mono_" + record.name + "_us";
+    rows.push_back({monotonic, "us", static_cast<double>(record.mono_us),
+                    ScopeFor(monotonic), &record});
+    const std::string step = "step_" + record.name;
+    rows.push_back({step, "step", static_cast<double>(record.step), ScopeFor(step), &record});
+  }
+  for (const DerivedMetric& derived : kDerivedMetrics) {
+    std::size_t start_index = 0;
+    std::size_t end_index = 0;
+    const MilestoneRecord* owner = &anchor;
+    double value = 0.0;
+    switch (derived.value) {
+      case DerivedValue::kMilestoneInterval:
+        // 缺任一端就不产生这条指标：写 0 会让“没有发生”看起来像“耗时为零”。
+        if (!FirstIndex(records, derived.start, start_index) ||
+            !FirstIndex(records, derived.end, end_index)) {
+          continue;
+        }
+        value = static_cast<double>(records[end_index].mono_us - records[start_index].mono_us);
+        owner = &records[end_index];
+        break;
+      case DerivedValue::kRunTotal:
+        // 只在收尾之后产生：没有 finish() 就没有确定的运行终点，写 0 会被读成“瞬间完成”。
+        if (!frozen) {
+          continue;
+        }
+        value = static_cast<double>(total_us);
+        owner = &records.back();
+        break;
+      case DerivedValue::kMilestoneCount:
+        value = static_cast<double>(records.size());
+        break;
+      case DerivedValue::kAudioFrames:
+        value = static_cast<double>(audio_frames);
+        break;
+      case DerivedValue::kAudioDurationMs:
+        // 帧长非正说明调用方给出的音频契约不可用，此时推导值没有意义。
+        if (frame_ms <= 0) {
+          continue;
+        }
+        value = static_cast<double>(audio_frames) * static_cast<double>(frame_ms);
+        break;
+    }
+    rows.push_back({derived.name, derived.unit, value, derived.scope, owner});
+  }
+  return rows;
 }
 
 // Markdown 表格里的竖线与换行会破坏表格；证据里的文本多来自受控常量，但环境字段可能来自
@@ -134,8 +237,8 @@ std::string Code(const std::string& text) {
   return "`" + EscapeCell(text.empty() ? std::string("none") : text) + "`";
 }
 
-}  // namespace
-
+// 里程碑候选全集。摘要表按它逐项给出“已记录 / 未测量”，因此缺失的候选永远可见，
+// 读者不需要自己去比对本项目前有哪些里程碑。它只服务于摘要渲染，因此留在实现文件内。
 const char* const kAllMilestones[] = {
     milestone::kRunStart,          milestone::kGenerationStarted,
     milestone::kFirstToken,        milestone::kFirstPcm,
@@ -147,6 +250,8 @@ const char* const kAllMilestones[] = {
     milestone::kRunEnd,
 };
 const std::size_t kAllMilestoneCount = sizeof(kAllMilestones) / sizeof(kAllMilestones[0]);
+
+}  // namespace
 
 const char* marker_milestone_name(runtime::ActivityMarker marker) noexcept {
   switch (marker) {
@@ -262,6 +367,12 @@ void RunEvidenceRecorder::on_marker(runtime::ActivityMarker marker, std::uint64_
     // 快照，多一条事件就会让“谁在 finish 之后写的”变成一个无法回答的问题。
     return;
   }
+  // 代际水位只增不减：设备侧与生成侧的接缝接口不携带代际，它们随后到达的事实用这个
+  // 水位归属。取最大值而不是“最后一个”，是为了让一次迟到的低代际标记不会把后续事实
+  // 的归属拉回旧轮次。
+  if (generation > generation_) {
+    generation_ = generation;
+  }
   append_locked(name, generation, "session", clock_.now_us() - origin_us_);
 }
 
@@ -271,7 +382,9 @@ void RunEvidenceRecorder::on_token_delivered(const std::string& /*token*/) {
     return;
   }
   first_token_recorded_ = true;
-  append_locked(milestone::kFirstToken, 0, "generation", clock_.now_us() - origin_us_);
+  // 归到当前代际水位：生成侧接缝没有代际参数，但它描述的事实属于正在执行的那一轮。
+  append_locked(milestone::kFirstToken, generation_, "generation",
+                clock_.now_us() - origin_us_);
 }
 
 void RunEvidenceRecorder::on_generation_started() {}
@@ -292,7 +405,9 @@ void RunEvidenceRecorder::on_first_frame_written() {
     return;
   }
   first_frame_recorded_ = true;
-  append_locked(milestone::kPlaybackStart, 0, "device", clock_.now_us() - origin_us_);
+  // 同理归到当前代际水位：设备写出的是当前这一轮正在播的音频。
+  append_locked(milestone::kPlaybackStart, generation_, "device",
+                clock_.now_us() - origin_us_);
 }
 
 void RunEvidenceRecorder::finish(const RunOutcome& outcome) {
@@ -442,6 +557,7 @@ std::string RunEvidenceRecorder::events_jsonl() {
     if (record.name == milestone::kRunEnd) {
       event.attributes["exit_code"] = std::to_string(outcome.exit_code);
       event.attributes["error_code"] = outcome.error_code;
+      event.attributes["convergence"] = outcome.convergence;
       event.attributes["expectation_matched"] = outcome.expectation_matched ? "true" : "false";
       event.attributes["audio_frames"] = std::to_string(audio_frames);
     }
@@ -468,85 +584,26 @@ std::string RunEvidenceRecorder::metrics_jsonl() {
     total_us = end_us_;
     audio_frames = outcome_.audio_frames;
   }
-  const std::int64_t frame_ms = config_.frame_ms;
-  const auto first = [&records](std::string_view name, std::size_t& index) {
-    for (std::size_t position = 0; position < records.size(); ++position) {
-      if (records[position].name == name) {
-        index = position;
-        return true;
-      }
-    }
-    return false;
-  };
-  const auto emit = [](std::string& out, const MilestoneRecord& owner, const std::string& name,
-                       const std::string& unit, double value) {
+  const std::vector<MetricRow> rows =
+      BuildMetricRows(records, frozen, total_us, audio_frames, config_.frame_ms);
+  std::string lines;
+  for (const MetricRow& row : rows) {
     MetricRecord metric;
-    metric.request_id = owner.request_id;
-    metric.session_id = owner.session_id;
-    metric.generation = owner.generation;
+    metric.request_id = row.owner->request_id;
+    metric.session_id = row.owner->session_id;
+    metric.generation = row.owner->generation;
     metric.timestamp_ms =
-        static_cast<std::uint64_t>(owner.mono_us < 0 ? 0 : owner.mono_us / 1000);
-    metric.name = name;
-    metric.unit = unit;
-    metric.value = value;
+        static_cast<std::uint64_t>(row.owner->mono_us < 0 ? 0 : row.owner->mono_us / 1000);
+    metric.name = row.name;
+    metric.unit = row.unit;
+    metric.value = row.value;
     const auto encoded = encode_metric(metric);
     if (!encoded.ok()) {
-      return false;
-    }
-    out += *encoded.value;
-    out.push_back('\n');
-    return true;
-  };
-
-  std::string lines;
-  // 每个**首次出现**的里程碑产生一对指标：单调时间（实测）与调度步数（确定性）。逐条
-  // 对齐地产生，读者不需要在两张表之间做映射。同名里程碑在多轮会话里会重复出现，这里
-  // 只取第一次：指标回答的是"这件事第一次发生在什么时候"，逐次发生的事实由事件流保留。
-  std::vector<std::string> emitted;
-  for (const MilestoneRecord& record : records) {
-    if (std::find(emitted.begin(), emitted.end(), record.name) != emitted.end()) {
-      continue;
-    }
-    emitted.push_back(record.name);
-    if (!emit(lines, record, "mono_" + record.name + "_us", "us",
-              static_cast<double>(record.mono_us))) {
+      // 一条编码失败就放弃整份产物：留下前面若干行会让读者以为证据是完整的。
       return std::string();
     }
-    if (!emit(lines, record, "step_" + record.name, "step", static_cast<double>(record.step))) {
-      return std::string();
-    }
-  }
-  const MilestoneRecord& anchor = records.front();
-  for (const DerivedMetric& derived : kDerivedMonotonic) {
-    std::size_t start_index = 0;
-    std::size_t end_index = 0;
-    if (!first(derived.start, start_index) || !first(derived.end, end_index)) {
-      // 缺任一端就不产生这条指标：写 0 会让“没有发生”看起来像“耗时为零”。
-      continue;
-    }
-    const double value =
-        static_cast<double>(records[end_index].mono_us - records[start_index].mono_us);
-    if (!emit(lines, records[end_index], derived.name, derived.unit, value)) {
-      return std::string();
-    }
-  }
-  if (frozen && !emit(lines, records.back(), "mono_run_total_us", "us",
-                      static_cast<double>(total_us))) {
-    return std::string();
-  }
-  if (!emit(lines, anchor, "step_total", "step", static_cast<double>(records.size()))) {
-    return std::string();
-  }
-  if (!emit(lines, anchor, "step_audio_frames", "frame", static_cast<double>(audio_frames))) {
-    return std::string();
-  }
-  if (frame_ms > 0) {
-    // 推导值：帧数 × 帧长。它由音频契约（16 kHz/单声道/20 ms）决定，因此是设计约束下的
-    // 应播时长，不是实测播放时长。
-    const double duration_ms = static_cast<double>(audio_frames) * static_cast<double>(frame_ms);
-    if (!emit(lines, anchor, "step_audio_duration_ms", "ms", duration_ms)) {
-      return std::string();
-    }
+    lines += *encoded.value;
+    lines.push_back('\n');
   }
   return lines;
 }
@@ -567,16 +624,6 @@ std::string RunEvidenceRecorder::summary_markdown() {
     end_time = end_time_;
     end_us = end_us_;
   }
-  const auto first = [&records](std::string_view name, std::size_t& index) {
-    for (std::size_t position = 0; position < records.size(); ++position) {
-      if (records[position].name == name) {
-        index = position;
-        return true;
-      }
-    }
-    return false;
-  };
-
   std::string text;
   text += "# Mock 运行证据摘要\n\n";
   text += "本文件与同目录的 `run-manifest.json`、`events.jsonl`、`metrics.jsonl`、"
@@ -592,6 +639,7 @@ std::string RunEvidenceRecorder::summary_markdown() {
   text += "| 运行级错误 | " + Code(outcome.error_code) + " |\n";
   text +=
       "| 场景形态与声明一致 | " + Code(outcome.expectation_matched ? "true" : "false") + " |\n";
+  text += "| 会话收敛结论 | " + Code(outcome.convergence) + " |\n";
   text += "| 命令哈希 | " + Code(config_.command_hash) + " |\n";
   text += "| 配置哈希 | " + Code(config_.config_hash) + " |\n";
   text += "| 输入哈希 | " + Code(config_.input_hash) + " |\n";
@@ -609,7 +657,11 @@ std::string RunEvidenceRecorder::summary_markdown() {
 
   text += "## 里程碑\n\n";
   text += "步数是调度步数：本次运行内按提交顺序递增，与主机和墙钟无关，可逐字节复现。\n";
-  text += "单调时间自 `run_start` 起算，是进程内实测值，只对本次运行所在的主机与负载成立。\n\n";
+  text += "单调时间自 `run_start` 起算，是进程内实测值，只对本次运行所在的主机与负载成立。\n";
+  text += "本表的“步”与 `events.jsonl` 每行的 `sequence` 字段一一对应，因此摘要里的每一项\n";
+  text += "都可以回链到该事件的原始记录；未测量项没有对应事件，也就没有可回链的行。\n";
+  text += "同一帧上会先后出现设备侧写出（`playback_start`，来源 device）与会话侧确认\n";
+  text += "（`first_pcm`，来源 session）：后者晚于前者是构造性质，不是调度先后。\n\n";
   text += "| 步 | 里程碑 | 自 run_start 起的单调时间（us） | 来源 |\n";
   text += "|---:|---|---:|---|\n";
   for (const MilestoneRecord& record : records) {
@@ -620,7 +672,7 @@ std::string RunEvidenceRecorder::summary_markdown() {
   for (std::size_t index = 0; index < kAllMilestoneCount; ++index) {
     const char* const name = kAllMilestones[index];
     std::size_t position = 0;
-    if (first(name, position)) {
+    if (FirstIndex(records, name, position)) {
       continue;
     }
     std::string reason;
@@ -638,56 +690,26 @@ std::string RunEvidenceRecorder::summary_markdown() {
 
   text += "\n## 指标\n\n";
   text += "| 指标 | 值 | 单位 | 口径（起点 → 终点） |\n|---|---:|---|---|\n";
-  // 指标表与 metrics.jsonl 同源：这里按同样的规则（同名里程碑取首次出现）复算一遍并附
-  // 上口径说明，避免读者只拿到一堆没有起止定义的数值，也避免两张表给出不同的值。
-  std::vector<std::string> listed;
-  for (const MilestoneRecord& record : records) {
-    if (std::find(listed.begin(), listed.end(), record.name) != listed.end()) {
-      continue;
-    }
-    listed.push_back(record.name);
-    text += "| " + Code("mono_" + record.name + "_us") + " | " +
-            std::to_string(record.mono_us) + " | us | " +
-            EscapeCell(MetricScope("mono_" + record.name + "_us")) + " |\n";
-    text += "| " + Code("step_" + record.name) + " | " + std::to_string(record.step) +
-            " | step | " + EscapeCell(MetricScope("step_" + record.name)) + " |\n";
-  }
-  for (const DerivedMetric& derived : kDerivedMonotonic) {
-    std::size_t start_index = 0;
-    std::size_t end_index = 0;
-    if (!first(derived.start, start_index) || !first(derived.end, end_index)) {
-      continue;
-    }
-    const std::int64_t value = records[end_index].mono_us - records[start_index].mono_us;
-    text += "| " + Code(derived.name) + " | " + std::to_string(value) + " | " +
-            std::string(derived.unit) + " | " + EscapeCell(MetricScope(derived.name)) + " |\n";
-  }
-  if (frozen) {
-    text += "| " + Code("mono_run_total_us") + " | " + std::to_string(end_us) + " | us | " +
-            EscapeCell(MetricScope("mono_run_total_us")) + " |\n";
-  }
-  text += "| " + Code("step_total") + " | " + std::to_string(records.size()) + " | step | " +
-          EscapeCell(MetricScope("step_total")) + " |\n";
-  text += "| " + Code("step_audio_frames") + " | " + std::to_string(outcome.audio_frames) +
-          " | frame | " + EscapeCell(MetricScope("step_audio_frames")) + " |\n";
-  if (config_.frame_ms > 0) {
-    const double duration_ms =
-        static_cast<double>(outcome.audio_frames) * static_cast<double>(config_.frame_ms);
+  // 指标表与 metrics.jsonl 由同一份投影渲染：名称、单位与数值不可能在两张表之间漂移。
+  // 这里只多渲染一列给人看的口径说明。数值按整数格式化——本项目所有指标都是整数取值的
+  // 计数或微秒量，保留小数只会制造虚假精度。
+  for (const MetricRow& row : BuildMetricRows(records, frozen, end_us, outcome.audio_frames,
+                                             config_.frame_ms)) {
     char buffer[64];
-    std::snprintf(buffer, sizeof(buffer), "%.0f", duration_ms);
-    text += "| " + Code("step_audio_duration_ms") + " | " + std::string(buffer) + " | ms | " +
-            EscapeCell(MetricScope("step_audio_duration_ms")) + " |\n";
+    std::snprintf(buffer, sizeof(buffer), "%.0f", row.value);
+    text += "| " + Code(row.name) + " | " + std::string(buffer) + " | " +
+            EscapeCell(row.unit) + " | " + EscapeCell(row.scope) + " |\n";
   }
 
   text += "\n## 取消阶段\n\n";
   std::size_t accepted = 0;
-  if (!first(milestone::kCancelAccepted, accepted)) {
+  if (!FirstIndex(records, milestone::kCancelAccepted, accepted)) {
     text += "本次运行没有发生取消，因此没有可报告的取消阶段。\n";
   } else {
     text += "取消阶段按固定顺序提交，顺序不变量见 `core/runtime/interaction_contract.hpp`：\n\n";
     for (const char* const phase : kCancelPhases) {
       std::size_t index = 0;
-      if (first(phase, index)) {
+      if (FirstIndex(records, phase, index)) {
         text += "- " + Code(phase) + "：步 " + std::to_string(records[index].step) +
                 "，自 run_start 起 " + std::to_string(records[index].mono_us) + " us\n";
       } else {
@@ -696,16 +718,23 @@ std::string RunEvidenceRecorder::summary_markdown() {
     }
     std::size_t cleared = 0;
     std::size_t terminal = 0;
-    if (first(milestone::kPlaybackCleared, cleared)) {
+    if (FirstIndex(records, milestone::kPlaybackCleared, cleared)) {
       text += "\n受理到播放清理的单调间隔：`mono_cancel_cleared_us` = " +
               std::to_string(records[cleared].mono_us - records[accepted].mono_us) + " us。\n";
     }
-    if (first(milestone::kTerminalCancelled, terminal)) {
+    if (FirstIndex(records, milestone::kTerminalCancelled, terminal)) {
       text += "受理到取消终态的单调间隔：`mono_cancel_terminal_us` = " +
               std::to_string(records[terminal].mono_us - records[accepted].mono_us) + " us。\n";
     }
     text += "\n本版本的播放清理是同步且非阻塞的，同一线性化点上提交的阶段会得到相同的单调"
             "时间；时间差为 0 表示它们确实在同一时刻提交，而不是阶段丢失。\n";
+    if (outcome.convergence != "cancelled") {
+      // 这四阶段是**非成功收敛**共用的清理路径：失败也走同一条路。只有会话自己的结论说
+      // “取消”时，把它们读成一次取消才是对的。
+      text += "\n注意：本次运行的会话收敛结论是 " + Code(outcome.convergence) +
+              "，不是取消。上面这些阶段同样出现在失败路径上（会话在失败时借用同一条收敛"
+              "路径封锁旧输出并清理播放），因此它们的存在本身不表示发生过取消。\n";
+    }
   }
 
   text += "\n## 口径与限制\n\n";

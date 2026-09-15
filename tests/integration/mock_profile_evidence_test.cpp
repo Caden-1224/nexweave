@@ -1,7 +1,7 @@
-﻿// Mock 运行证据的集成夹具：验收"一次真实运行到底留下了哪些可核对的事实"。
+// Mock 运行证据的集成夹具：验收"一次真实运行到底留下了哪些可核对的事实"。
 //
 // 分工：mock_profile_test.cpp 验收场景选择、确定性与清理账目；本文件验收运行证据本身——
-// 五份产物是否齐备、里程碑与指标是否覆盖 ticket 要求的时刻、重叠与取消是否真的被证明、
+// 五份产物是否齐备、里程碑与指标是否覆盖验收要求的时刻、重叠与取消是否真的被证明、
 // 未测量的时间点是否被如实标注而不是写成 0。
 //
 // 保护的不变量（每条在断言旁注明）：
@@ -97,45 +97,10 @@ std::vector<std::string> Names(const std::vector<MilestoneRecord>& records) {
   return names;
 }
 
-// 按行拆分 JSONL，忽略结尾换行造成的空行。
-std::vector<std::string> Lines(const std::string& text) {
-  std::vector<std::string> lines;
-  std::size_t position = 0;
-  while (position < text.size()) {
-    const std::size_t newline = text.find('\n', position);
-    if (newline == std::string::npos) {
-      lines.push_back(text.substr(position));
-      break;
-    }
-    if (newline > position) {
-      lines.push_back(text.substr(position, newline - position));
-    }
-    position = newline + 1;
-  }
-  return lines;
-}
-
-// 指标流里某个名称的取值；找不到返回假。用解码而不是子串搜索：字段顺序由 JSON 库决定。
-bool MetricValue(const std::string& metrics, const std::string& name, double& value) {
-  for (const std::string& line : Lines(metrics)) {
-    const auto metric = nexweave::observability::decode_metric(line);
-    if (metric.ok() && metric.value->name == name) {
-      value = metric.value->value;
-      return true;
-    }
-  }
-  return false;
-}
-
-bool HasMetric(const std::string& metrics, const std::string& name) {
-  double ignored = 0.0;
-  return MetricValue(metrics, name, ignored);
-}
-
 // 只保留 step_ 族指标，用于比较两次运行的"可复现部分"。mono_ 族是实测值，本来就不该相同。
 std::string StepMetrics(const std::string& metrics) {
   std::string selected;
-  for (const std::string& line : Lines(metrics)) {
+  for (const std::string& line : nexweave::test::jsonl_lines(metrics)) {
     const auto metric = nexweave::observability::decode_metric(line);
     if (metric.ok() && metric.value->name.rfind("step_", 0) == 0) {
       selected += std::to_string(metric.value->value) + " " + metric.value->name + "\n";
@@ -193,7 +158,7 @@ void TestEachScenarioProducesCompleteEvidence() {
       CHECK(Find(records, "playback_done") != nullptr);
       CHECK(Find(records, "terminal_succeeded") != nullptr);
       CHECK(!result.overlap_proven);
-      CHECK(!HasMetric(result.metrics_jsonl, "mono_first_token_us"));
+      CHECK(!nexweave::test::has_metric(result.metrics_jsonl, "mono_first_token_us"));
     } else if (scenario == MockProfileScenario::kSlowConsumer) {
       // L2：审核后走生成路径，文本定稿晚于播放开始。
       CHECK(Find(records, "first_token") != nullptr);
@@ -215,15 +180,56 @@ void TestEachScenarioProducesCompleteEvidence() {
       CHECK(Find(records, "terminal_succeeded") == nullptr);
       CHECK(!result.observed.session_completed);
     } else {
-      // 故障：输入在开始任何轮次之前不可用，因此连代际都没有开启。
+      // 故障：输入在开始任何轮次之前不可用，因此连代际都没有开启。它同时是"空输入"
+      // 这一类失败形态的证据：只剩运行边界两条里程碑，其余候选全部未测量，指标里也没有
+      // 任何会话级指标——缺失是被写出来的，而不是被当成 0。
       CHECK_MESSAGE(Find(records, "generation_started") == nullptr,
                     label + " 不应该产生任何会话阶段");
-      CHECK_MESSAGE(!HasMetric(result.metrics_jsonl, "mono_first_pcm_us"),
+      CHECK_MESSAGE(records.size() == 2, label + " 只应保留运行边界两条里程碑");
+      CHECK_MESSAGE(!nexweave::test::has_metric(result.metrics_jsonl, "mono_first_pcm_us"),
                     label + " 不应产生首帧指标");
+      CHECK_MESSAGE(!nexweave::test::has_metric(result.metrics_jsonl, "mono_first_token_us"),
+                    label + " 不应产生首 token 指标");
       CHECK_MESSAGE(summary.find("未测量") != std::string::npos, label + " 应当标注未测量项");
+      double milestone_total = 0.0;
+      CHECK(nexweave::test::metric_value(result.metrics_jsonl, "step_total", milestone_total));
+      CHECK_MESSAGE(milestone_total == 2.0, label + " 的里程碑总数应当是运行边界两条");
     }
     std::filesystem::remove_all(dir);
   }
+}
+
+// 保护摘要的可回链性：摘要里程碑表的每一行都必须能在 events.jsonl 里找到同一步号、同一
+// 名称的事件，而事件流的 sequence 又与提交顺序一一对应。只把"摘要回链原始事件"写在文档
+// 里，改动摘要渲染时不会有任何东西失败；这条用例把那条对应关系变成可执行的断言。
+void TestSummaryRowsLinkBackToRawEvents() {
+  const std::string dir = EvidenceDir("link");
+  std::filesystem::remove_all(dir);
+  const MockProfileResult result =
+      run_mock_profile(ConfigFor(MockProfileScenario::kCancel, dir));
+
+  std::string events_text;
+  std::string summary;
+  CHECK(ReadFile(dir + "/events.jsonl", events_text));
+  CHECK(ReadFile(dir + "/summary.md", summary));
+
+  std::uint64_t expected_sequence = 0;
+  std::size_t linked = 0;
+  for (const std::string& line : nexweave::test::jsonl_lines(events_text)) {
+    const auto event = nexweave::observability::decode_event(line);
+    CHECK(event.ok());
+    CHECK(event.value->sequence == expected_sequence);
+    const std::string row = "| " + std::to_string(event.value->sequence) + " | `" +
+                            event.value->name + "` |";
+    CHECK_MESSAGE(summary.find(row) != std::string::npos,
+                  std::string("摘要缺少可回链的里程碑行：") + row);
+    ++expected_sequence;
+    ++linked;
+  }
+  CHECK(linked >= 2);
+  // 未测量项没有对应事件，因此摘要必须显式写出"未测量"而不是留一个空洞。
+  CHECK(summary.find("未测量：") != std::string::npos);
+  std::filesystem::remove_all(dir);
 }
 
 // 保护不变量 3：重叠由调度步数证明。判据是"设备侧播放开始"的步数严格早于"文本定稿"，
@@ -241,7 +247,7 @@ void TestOverlapIsProvenByStepOrderAndPositiveLead() {
   CHECK(result.overlap_proven);
 
   double lead = 0.0;
-  CHECK(MetricValue(result.metrics_jsonl, "mono_overlap_lead_us", lead));
+  CHECK(nexweave::test::metric_value(result.metrics_jsonl, "mono_overlap_lead_us", lead));
   CHECK(lead > 0.0);
 
   std::string summary;
@@ -263,7 +269,7 @@ void TestCancellationKeepsOnlyTheAudioWrittenBeforeTheStop() {
 
   CHECK(result.cancel_frames == 1);
   double frames = 0.0;
-  CHECK(MetricValue(result.metrics_jsonl, "step_audio_frames", frames));
+  CHECK(nexweave::test::metric_value(result.metrics_jsonl, "step_audio_frames", frames));
   CHECK(frames == 1.0);
 
   std::string summary;
@@ -278,7 +284,7 @@ void TestCancellationKeepsOnlyTheAudioWrittenBeforeTheStop() {
   }
   CHECK(summary.find("阶段缺失") == std::string::npos);
   // 冻结之后的迟到回调不得改写快照：run_end 必须是最后一条事件。
-  const std::vector<std::string> events = Lines(result.events_jsonl);
+  const std::vector<std::string> events = nexweave::test::jsonl_lines(result.events_jsonl);
   CHECK(!events.empty());
   CHECK(events.back().find("\"name\":\"run_end\"") != std::string::npos);
   std::filesystem::remove_all(dir);
@@ -293,12 +299,12 @@ void TestUnmeasuredMilestonesAreLabelledInsteadOfZero() {
   CHECK(ReadFile(dir + "/summary.md", summary));
 
   // L1 直答没有经过生成后端，首 token 因此是"路径不同"，必须写明而不是留一个空洞。
-  CHECK(!HasMetric(normal.metrics_jsonl, "mono_first_token_us"));
+  CHECK(!nexweave::test::has_metric(normal.metrics_jsonl, "mono_first_token_us"));
   CHECK(summary.find("`first_token`") != std::string::npos);
   CHECK(summary.find("未测量：") != std::string::npos);
   CHECK(summary.find("没有从生成后端收到 token") != std::string::npos);
   // 没有发生的取消不会产生任何取消指标。
-  CHECK(!HasMetric(normal.metrics_jsonl, "mono_cancel_accepted_us"));
+  CHECK(!nexweave::test::has_metric(normal.metrics_jsonl, "mono_cancel_accepted_us"));
   CHECK(summary.find("本次运行没有发生取消") != std::string::npos);
   std::filesystem::remove_all(dir);
 }
@@ -323,22 +329,8 @@ void TestRepeatedRunsReportTheSameSchedule() {
   CHECK(StepMetrics(first.metrics_jsonl) == StepMetrics(second.metrics_jsonl));
 
   // 清单里的日历时间是实测值，因此规范化之后才比较；其余字段（含三个哈希与命令）必须一致。
-  const auto strip = [](std::string manifest) {
-    for (const char* const key : {"start_time", "end_time"}) {
-      const std::string needle = std::string("\"") + key + "\":\"";
-      const std::size_t begin = manifest.find(needle);
-      if (begin == std::string::npos) {
-        continue;
-      }
-      const std::size_t value_begin = begin + needle.size();
-      const std::size_t value_end = manifest.find('"', value_begin);
-      if (value_end != std::string::npos) {
-        manifest.replace(value_begin, value_end - value_begin, "<time>");
-      }
-    }
-    return manifest;
-  };
-  CHECK(strip(first.manifest_json) == strip(second.manifest_json));
+  CHECK(nexweave::test::without_calendar_time(first.manifest_json) ==
+        nexweave::test::without_calendar_time(second.manifest_json));
   std::filesystem::remove_all(dir);
 }
 
@@ -387,6 +379,7 @@ void TestRetainedPolicyWithoutDirectoryIsRejected() {
 
 int main() {
   TestEachScenarioProducesCompleteEvidence();
+  TestSummaryRowsLinkBackToRawEvents();
   TestOverlapIsProvenByStepOrderAndPositiveLead();
   TestCancellationKeepsOnlyTheAudioWrittenBeforeTheStop();
   TestUnmeasuredMilestonesAreLabelledInsteadOfZero();

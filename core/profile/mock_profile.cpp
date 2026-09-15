@@ -545,6 +545,25 @@ std::string ErrorCodeName(ErrorCode code) {
   return "unknown";
 }
 
+// 会话级收敛结论的稳定文本名。它必须取自**会话自己的运行记录**，而不是控制面的答复：
+// 本版本的控制面取消只置位运行级停止标志，在途轮次仍会跑完；用控制面的答复当结论，会把
+// 一次“受理了停止但会话照常完成”的运行写成取消。多轮会话取最后一轮——本次运行以哪一轮
+// 收尾，就报告哪一轮的结论。
+const char* ConvergenceName(const nexweave::runtime::SessionAppRunResult& run) {
+  if (run.turns.empty()) {
+    // 在开启任何轮次之前就收敛（例如输入不可用）：没有可判定的轮次，如实写 none。
+    return "none";
+  }
+  const nexweave::runtime::SessionTurnResult& last = run.turns.back();
+  if (last.cancelled) {
+    return "cancelled";
+  }
+  if (last.completed) {
+    return "succeeded";
+  }
+  return last.error.ok() ? "none" : "failed";
+}
+
 // 计入一条已经解码的数据事件。计数的单一来源在这里，因此“交付了几条”与“记录了几条”不会
 // 出现两份实现。事件类型只区分文本与终态：v1 的请求入口不交付逐帧 PCM（它只交付逐轮文本与
 // 终态），因此这里没有 PCM 分支——为一个不会出现的类型维护计数只会产生永远为 0 的字段。
@@ -1082,6 +1101,8 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
   SteadyMonotonicClock monotonic_clock;
   RunEvidenceRecorder evidence(evidence_config, monotonic_clock);
   result.artifact_policy_name = to_string(config.artifact_policy);
+  // 会话级收敛结论的暂存处：它在会话收敛之后由运行记录填入，收尾时交给证据记录器。
+  const char* convergence = "none";
 
   // 配置校验在任何资源建立之前完成：失败时结果里没有连接、没有线程、没有文件，调用方拿到
   // 的是一份“什么都没发生”的账目，而不是一次跑了一半的运行。
@@ -1317,6 +1338,7 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
       // 记录可能为空（一次都没收敛），此时帧数保持 0，与"确实没出声"一致。
       const auto record = factory.last_run();
       if (record != nullptr) {
+        convergence = ConvergenceName(record->result);
         for (const auto& turn : record->result.turns) {
           result.rendered_frames += turn.pcm_frames.size();
         }
@@ -1356,6 +1378,8 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
   outcome.expectation_matched = result.expectation_matched;
   // 音频帧数取自会话自己的运行记录，而不是线上事件：v1 的请求入口只交付逐轮文本与终态。
   outcome.audio_frames = result.rendered_frames;
+  // 收敛结论来自会话的运行记录；控制面是否受理过停止由汇总与协议报文回答，两者分开记录。
+  outcome.convergence = convergence;
   evidence.finish(outcome);
   result.milestones = evidence.milestones();
   result.events_jsonl = evidence.events_jsonl();

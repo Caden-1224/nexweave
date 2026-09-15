@@ -57,7 +57,9 @@ constexpr char kRunEnd[] = "run_end";
 constexpr char kGenerationStarted[] = "generation_started";
 // 生成侧：第一个 token 交付给接收方。只有经过生成后端的路径才会出现。
 constexpr char kFirstToken[] = "first_token";
-// 会话侧：第一帧 PCM 成功交付给播放组件。它是“PCM 从合成侧进入播放侧”的线性化点。
+// 会话侧：会话**确认**第一帧已经被播放组件接受（写入成功之后它才提交“播放已开始”）。
+// 它不是“帧开始进入播放侧”的时刻：写入发生在播放组件内部，因此设备侧写出
+// （kPlaybackStart）在本次实现里先于它。这条先后是构造性质，不是调度巧合。
 constexpr char kFirstPcm[] = "first_pcm";
 // 设备侧：第一帧被播放组件真正写到音频汇。它与 kFirstPcm 是两个不同所有者的边界，
 // 因此是两条记录：只有音频汇知道帧是否真的写出去了。
@@ -74,12 +76,6 @@ constexpr char kPlaybackCleared[] = "playback_cleared";
 constexpr char kTerminalSucceeded[] = "terminal_succeeded";
 constexpr char kTerminalCancelled[] = "terminal_cancelled";
 }  // namespace milestone
-
-// 里程碑的候选全集。汇总表按它逐项给出“已记录 / 未测量”，因此缺失的候选永远可见，
-// 不需要读者自己去比对本项目前有哪些里程碑。
-extern const char* const kAllMilestones[];
-// 候选全集的元素个数。
-extern const std::size_t kAllMilestoneCount;
 
 // 活动标记到里程碑名的映射。返回值是 milestone 命名空间里某个常量的地址，永不为空；
 // 未覆盖的枚举值返回空串，调用方必须如实跳过而不是替它编一个名字——伪造的里程碑比缺失
@@ -159,6 +155,13 @@ struct RunOutcome {
   // 本次运行交给播放组件并由其写出音频汇的帧数。它来自会话运行记录，而不是线上事件：
   // v1 的请求入口只交付逐轮文本与终态，逐帧 PCM 下行属于后续传输任务。
   std::size_t audio_frames = 0;
+  // 这一轮的**会话级**收敛结论：succeeded / cancelled / failed / none。
+  //
+  // 为什么它必须由调用方给出、且取自会话自己的运行记录：控制面受理停止与“会话真的被
+  // 取消”是两件不同的事实——本版本的控制面取消只置位运行级停止标志，在途轮次仍会跑完。
+  // 若用控制面的答复当结论，摘要会把一次“受理了停止但会话照常完成”的运行写成取消。
+  // none 表示本次运行在开启任何轮次之前就收敛，没有可判定的轮次。
+  std::string convergence = "none";
 };
 
 // 一条里程碑记录：事件、指标与摘要的唯一数据来源。
@@ -245,12 +248,6 @@ class RunEvidenceRecorder final : public runtime::IMarkerObserver,
   // 生成后端是否报告过 token。为假时 first_token 的缺失属于路径不同（L0/L1 直答）。
   bool generation_tokens_observed();
 
-  // 清单字段的只读取值，供上层汇总复用同一份事实而不必再解析 JSON。
-  const std::string& run_id() const noexcept { return config_.run_id; }
-  const std::string& config_hash() const noexcept { return config_.config_hash; }
-  const std::string& input_hash() const noexcept { return config_.input_hash; }
-  const std::string& command_hash() const noexcept { return config_.command_hash; }
-
  private:
   // 追加一条里程碑：分配步数、入表。调用方必须已经持有 mutex_。name 必须来自
   // milestone 命名空间（常量的地址），因此本函数不复制名字的存储责任。
@@ -273,6 +270,10 @@ class RunEvidenceRecorder final : public runtime::IMarkerObserver,
   mutable std::mutex mutex_;
   std::vector<MilestoneRecord> milestones_;
   std::uint64_t next_step_ = 0;
+  // 当前回答代际水位。会话标记带代际，设备侧与生成侧的接缝不带，因此由标记教会记录器，
+  // 使同一事件流里的三类事实归到同一个代际上。运行级事实（run_start/run_end）刻意保持
+  // 0：它们不属于任何一次回答，代际过滤对它们没有意义。
+  std::uint64_t generation_ = 0;
   bool finished_ = false;
   bool first_token_recorded_ = false;
   bool first_frame_recorded_ = false;

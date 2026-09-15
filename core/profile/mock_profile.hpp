@@ -94,10 +94,10 @@ const char* mock_profile_scenario_slug(MockProfileScenario scenario) noexcept;
 // 运行产物（运行清单、事件流、指标流、协议报文与摘要）的留存策略。
 //
 // 两种取值对应两件不同的事，不能合并成一个“要不要写文件”的布尔：
-//   kTransient：写完即删。它是任务 25 验收“一次运行返回后没有本进程残留”的手段——
-//               只有先真的写出文件再删掉，清理路径才被真正执行过。
-//   kRetained： 写完保留。它是任务 26 验收“运行证据可留档”的手段：证据的价值在于
-//               事后可读，删掉就等于没有证据。
+//   kTransient：写完即删。它验证的是“一次运行返回后没有本进程残留”——只有先真的写出
+//               文件再删掉，清理路径才被真正执行过。
+//   kRetained： 写完保留。它验证的是“运行证据可留档”：证据的价值在于事后可读，删掉
+//               就等于没有证据。
 // 两种策略写同样的产物，区别只在返回之前是否删除它们。数值不参与线协议，但与其他
 // 枚举一样只能往后追加，因为汇总与证据按名称关联历史结果。
 enum class MockProfileArtifactPolicy : std::uint8_t {
@@ -122,7 +122,7 @@ struct MockProfileConfig {
   std::string output_dir;
   // 产物的留存策略。只在 output_dir 非空时有意义：没有输出目录就没有产物可谈，
   // 因此“要求保留却又不给目录”是一条配置错误，而不是一次静默的空保留。
-  // 默认 kTransient，保持任务 25 的“返回即无残留”语义不变；需要留档时显式改成
+  // 默认 kTransient，保持“返回即无残留”的语义不变；需要留档时显式改成
   // kRetained（命令行用 --evidence-dir）。
   MockProfileArtifactPolicy artifact_policy = MockProfileArtifactPolicy::kTransient;
 
@@ -275,7 +275,7 @@ struct MockProfileResult {
   // 投影，用于把一次运行关联回具体的源码状态与配置。
   std::string manifest_json;
 
-  // ---- 运行证据（任务 26）----
+  // ---- 运行证据 ----
   //
   // 下面这些字段与输出目录里的产物同源。它们描述的是本次**会话运行**的结论；产物的
   // 写入与删除属于采集侧，其结果只记在 ledger 与汇总里——证据文件无法记录“自己没能

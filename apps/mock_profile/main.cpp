@@ -50,7 +50,7 @@ void PrintUsage() {
          "                          run-manifest.json、events.jsonl、metrics.jsonl、\n"
          "                          protocol.jsonl、summary.md\n"
          "  --cancel-after-pcm <n>  取消场景：等播放写出第 n 帧之后受理停止；\n"
-         "                          0 表示不等输出、立即受理（默认 1）\n"
+         "                          n 必须大于 0（默认 1），要表达“用户立刻喊停”用 1\n"
          "  --drain-budget <n>      慢消费场景：每次最多取走的字节数（默认 8，必须为正）\n"
          "  --quiet                 不打印横幅与逐行报文，只输出汇总行\n"
          "  --events                额外输出逐行报文（数据面事件流）\n"
