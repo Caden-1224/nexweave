@@ -225,7 +225,7 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | 控制消息与数据事件 | 已实现基础版 | JSON 编解码、元数据与二进制 PCM 校验；网络服务未实现 |
 | Fake 音频输入输出 | 已实现 | 模拟帧输入、输出、取消和轮次行为 |
 | Fake 流式 ASR | 已实现 | 脚本驱动的 partial/final/done、取消与重开 |
-| 运行清单、事件与指标 | 已实现基础版 | 值对象；完整应用的证据采集尚未接通 |
+| 运行清单、事件与指标 | 已实现 | 值对象、编解码与运行证据生产者；一次 Mock 运行实际产出清单、事件、指标与摘要（见下方 Mock 运行证据行） |
 | Fake RAG L0-L3 路由 | 已实现 | 固定检索夹具、分级决策与取消封锁 |
 | Fake 流式 LLM | 已实现 | 确定性 token 流、取消与回调失败封锁 |
 | Fake 流式 TTS | 已实现 | 逐帧 PCM、确定性波形与并发取消 |
@@ -233,7 +233,8 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | 常驻音频输入与语音分段 | 已实现基础版 | 跨轮次保持的单一输入拥有者、确定性活动脚本、前置缓冲与容量上限、播报期间新语音打断旧回答；真实 VAD、跨进程取消待后续任务 |
 | 进程内 Supervisor 生命周期 | 已实现基础版 | 设备级单活跃会话、忙碌拒绝、取消受理与清理完成的分别报告、清理未完成时槽位不可复用；子进程生命周期待后续任务 |
 | 进程内 Gateway 请求入口 | 已实现基础版 | NDJSON 分帧、四类控制操作、受理响应与执行终态分离、请求幂等、有界发送与慢客户端关闭、断连取消策略；真实 TCP/ZeroMQ 传输、PCM 逐帧下行与端到端背压待后续任务 |
-| Mock profile 确定性入口 | 已实现基础版 | 单进程组装工厂、监督器与请求入口，四个可显式选择的场景（正常、慢消费、取消、故障）、固定输入逐字节可复现、退出码语义、运行结束清理自证；运行目录与完整 run-manifest 采集待后续任务 |
+| Mock profile 确定性入口 | 已实现 | 单进程组装工厂、监督器与请求入口，四个可显式选择的场景（正常、慢消费、取消、故障）、固定输入逐字节可复现、退出码语义、运行结束清理自证 |
+| Mock 运行证据 | 已实现 | 一次运行产生五份产物（run-manifest.json、events.jsonl、metrics.jsonl、protocol.jsonl、summary.md）；单调时间族与调度步数族分开标注，未测量项如实标注；`--evidence-dir` 留档，`--out-dir` 仍验证“返回即无残留” |
 | Gateway 传输与 ZeroMQ | 规划中 | 真实 socket 接入、增量传输、背压和子进程生命周期 |
 | 本地知识库与真实检索 | 规划中 | 知识数据加载、词项检索和路由校准 |
 | RK3576 模型与音频前端 | 规划中 | RKNN、RKLLM、MeloTTS、ALSA、AEC 和 VAD |
@@ -373,7 +374,7 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 | [core/gateway](https://github.com/Caden-1224/nexweave/tree/main/core/gateway) | NDJSON 增量分帧、控制请求路由、幂等记录与有界发送 |
 | [core/profile](https://github.com/Caden-1224/nexweave/tree/main/core/profile) | Mock profile 组装、四个确定性场景、运行账目与产物留档 |
 | [core/backend](https://github.com/Caden-1224/nexweave/tree/main/core/backend) | Fake 音频、Fake 流式 ASR、Fake RAG、Fake LLM 与 Fake TTS |
-| [core/observability](https://github.com/Caden-1224/nexweave/tree/main/core/observability) | 运行清单、事件与指标值对象 |
+| [core/observability](https://github.com/Caden-1224/nexweave/tree/main/core/observability) | 运行清单、事件与指标的值对象与编解码，以及把它们从一次运行里采集出来的证据记录器 |
 | [tests](https://github.com/Caden-1224/nexweave/tree/main/tests) | 单元、契约及构建门禁测试 |
 | [scripts](https://github.com/Caden-1224/nexweave/tree/main/scripts) | 构建与测试入口 |
 
@@ -392,7 +393,7 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 - [x] 进程内 Supervisor 与单活跃会话生命周期
 - [x] 进程内 Gateway 请求入口、请求幂等与有界发送
 - [x] Mock profile 确定性入口与四个可复现场景
-- [ ] Mock 运行证据与运行目录（run-manifest、events、metrics 留档）
+- [x] Mock 运行证据与运行目录（run-manifest、events、metrics 留档）
 - [ ] Gateway 传输、增量传输与有界多进程链路
 - [ ] 本地知识库、真实检索与路由校准
 - [ ] RK3576 模型、全双工音频前端与语音打断
