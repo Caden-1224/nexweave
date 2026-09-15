@@ -546,6 +546,11 @@ void SessionApp::set_generation_observer(capability::IGenerationObserver* observ
   session_->set_generation_observer(observer);
 }
 
+void SessionApp::set_marker_observer(IMarkerObserver* observer) noexcept {
+  marker_observer_ = observer;
+  session_->set_marker_observer(observer);
+}
+
 void SessionApp::request_stop() noexcept {
   stop_requested_.store(true);
 }
@@ -669,6 +674,9 @@ SessionAppRunResult SessionApp::run(SessionAppObserver* observer) {
   // 转发本对象注册的观察者。未注册观察者时这一路完全不存在，生成与取消语义不变；
   // 构造时补登一次，使“先建应用再注册观察者”的顺序也成立。
   session_->set_generation_observer(generation_observer_);
+  // 活动标记观察者同样在每次运行开始时重新应用：会话对象虽然只建立一次，但“先建应用
+  // 再挂接观察者”是允许的顺序，重放一次才能保证两种顺序得到同样的记录。
+  session_->set_marker_observer(marker_observer_);
 
   // 输入建立失败与轮次失败分开报告：此时还没有任何轮次，因此它是运行级错误。
   const auto started = producer_->start();

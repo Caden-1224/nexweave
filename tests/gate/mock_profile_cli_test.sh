@@ -17,6 +17,8 @@
 #      （quiesced=true、已创建线程数等于已 join 线程数、仍打开的连接数为 0）。
 #   5. 慢消费由有界发送缓冲触发连接关闭，而不是靠等待；关闭原因如实报告为 slow_client。
 #   6. 默认构建的 mock profile 二进制不链接任何 NPU SDK 或声卡库。
+#   7. 留档运行（--evidence-dir）保留五份产物，内容包含版本、配置、输入与命令，
+#      并且记录取消各阶段；调度步数族指标在同一配置下逐字节可复现，而实测时间不参与。
 #
 # 夹具：本脚本只在系统临时目录下创建自己的输出目录，由 trap 在退出时删除；不修改源码，
 # 不后台启动进程。所有断言读的是被测进程自己的输出。
@@ -98,6 +100,11 @@ expect_rc 1 "取消打断点为 0 应当被拒绝（它无法给出稳定结果�
 run "$APP" --scenario slow --drain-budget 0
 expect_rc 1 "慢消费取字节预算为 0 应当被拒绝"
 
+# 两个产物目录开关写的是同一批文件，区别只在返回前是否删除；同时给出会让"这次运行
+# 到底想验证清理还是想留档"不可解释，因此按参数错误拒绝。
+run "$APP" --scenario normal --out-dir "$work/ambiguous-a" --evidence-dir "$work/ambiguous-b"
+expect_rc 1 "同时给出 --out-dir 与 --evidence-dir 应当被拒绝"
+
 run "$APP" --help
 expect_rc 0 "--help 是正常结束"
 
@@ -160,11 +167,57 @@ fi
 out="$work/artifacts"
 run "$APP" --scenario normal --out-dir "$out"
 expect_rc 0 "带输出目录的运行应当按契约完成"
-expect_match "产物数量如实记账" '"artifacts_written":3' "$work/last.log"
+expect_match "产物数量如实记账" '"artifacts_written":5' "$work/last.log"
 expect_match "产物已删除" '"artifacts_removed":true' "$work/last.log"
+expect_match "删除策略下不报告保留" '"artifacts_retained":false' "$work/last.log"
 if [ -n "$(ls -A "$out" 2>/dev/null)" ]; then
   fail "输出目录在命令结束后应当是空的（实际残留：$(ls -A "$out" | tr '\n' ' ')）"
 fi
+
+# ---- 4b. 留档运行：五份产物、版本与取消阶段 ---------------------------------------
+#
+# step_ 族指标只由调度步数决定，因此同一配置重复运行必须逐字节一致；mono_ 族是实测
+# 时间，本来就会变，所以这里显式把它排除在比较之外。
+step_metrics() {
+  grep '"name":"step_' "$1" | sed 's/"timestamp_ms":[0-9]*/"timestamp_ms":X/'
+}
+
+ev="$work/evidence-a"
+run "$APP" --scenario cancel --evidence-dir "$ev"
+expect_rc 0 "留档运行应当按契约完成"
+expect_match "留档运行如实记账产物数量" '"artifacts_written":5' "$work/last.log"
+expect_match "留档运行的产物被有意保留" '"artifacts_retained":true' "$work/last.log"
+expect_match "留档运行的产物没有被删除" '"artifacts_removed":false' "$work/last.log"
+expect_match "留档运行仍然交还全部资源" '"quiesced":true' "$work/last.log"
+expect_match "横幅给出证据目录" "evidence_dir: $ev" "$work/last.log"
+for artifact in run-manifest.json events.jsonl metrics.jsonl protocol.jsonl summary.md; do
+  if [ ! -s "$ev/$artifact" ]; then
+    fail "留档运行缺少产物 $artifact"
+  fi
+done
+expect_match "清单记录源码提交" '"git_commit":"' "$ev/run-manifest.json"
+expect_match "清单记录编译器" '"compiler":"' "$ev/run-manifest.json"
+expect_match "清单记录 CMake 版本" '"cmake":"' "$ev/run-manifest.json"
+expect_match "清单记录执行命令" '"command":"nexweave_mock_profile' "$ev/run-manifest.json"
+expect_match "清单记录配置哈希" '"config_hash":"fnv1a64:' "$ev/run-manifest.json"
+expect_match "清单记录输入哈希" '"input_hash":"fnv1a64:' "$ev/run-manifest.json"
+expect_match "起点事件记录命令哈希" 'command_hash' "$ev/events.jsonl"
+for phase in cancel_accepted old_output_blocked execution_exited playback_cleared terminal_cancelled; do
+  expect_match "事件流记录取消阶段 $phase" "\"name\":\"$phase\"" "$ev/events.jsonl"
+done
+expect_match "摘要给出里程碑表" '## 里程碑' "$ev/summary.md"
+expect_match "摘要给出指标口径" '口径（起点 → 终点）' "$ev/summary.md"
+expect_match "摘要标注未测量项" '未测量：' "$ev/summary.md"
+expect_match "摘要说明 Fake 结论的边界" '不是' "$ev/summary.md"
+
+ev2="$work/evidence-b"
+run "$APP" --scenario cancel --evidence-dir "$ev2"
+expect_rc 0 "留档运行的第二次执行也应当按契约完成"
+if ! diff -q <(step_metrics "$ev/metrics.jsonl") <(step_metrics "$ev2/metrics.jsonl") >/dev/null; then
+  fail "同一配置两次运行的调度步数族指标应当逐字节一致"
+fi
+# 事件流含实测时间，因此不要求逐字节相同：可复现的部分（步数与名称）已由上面那条
+# 断言覆盖，而把实测值也纳入比较只会得到一条时而通过时而失败的断言。
 
 # ---- 5. 显式诊断输出：横幅与退出码一致 -------------------------------------------
 run "$APP" --scenario normal

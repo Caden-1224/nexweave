@@ -194,6 +194,13 @@ class SessionApp final {
   // 观测时挂接被忽略，生成与取消语义不变。观察者必须活到本对象析构。
   void set_generation_observer(capability::IGenerationObserver* observer) noexcept;
 
+  // 挂接活动标记观察者（借用指针，可为 nullptr）。本对象把它转交给会话层，使生成开始、
+  // 首帧交付、三类完成与取消各阶段在提交时被外部记录；它只观察，不参与任何编排决策。
+  // 生命周期：观察者必须活到本对象析构，可在任意时刻挂接或摘除。会话对象在构造时就
+  // 已经固定，因此这里的挂接在下次 run() 之前完成即可；run() 会再应用一次，使“先建
+  // 会话再挂接”的顺序同样成立。
+  void set_marker_observer(IMarkerObserver* observer) noexcept;
+
  private:
   // 输入生产者接缝：每次调用交出“下一轮要处理的音频”，耗尽后结束运行。
   // 三种模式各有一个实现，同一时刻只有一个实例存在，因此“唯一生产者”是构造性质而不是
@@ -248,6 +255,9 @@ class SessionApp final {
   ResidentAudioInput* resident_ = nullptr;
   capability::ILlm* llm_ = nullptr;
   capability::IGenerationObserver* generation_observer_ = nullptr;
+  // 可选的活动标记观察者（借用，可为 nullptr）。与生成观察者同理，每次 run() 都会重新
+  // 应用到会话层，避免某次运行因为路径不同而丢掉记录。
+  IMarkerObserver* marker_observer_ = nullptr;
   // 会话对象：构造时建立，识别后端固定为本对象持有的文本注入器（它再转发给注入的识别
   // 对象）。固定文本只在每次运行时写进注入器，因此会话不需要「按模式换后端」这种会造成
   // 悬空引用的设计。

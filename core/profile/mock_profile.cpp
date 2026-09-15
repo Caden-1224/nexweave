@@ -22,12 +22,14 @@
 // 过，但那样“等不到”这件事就再也不会被发现。
 #include "mock_profile.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -36,14 +38,18 @@
 
 #include <nlohmann/json.hpp>
 
+#include "nexweave_version_from_cmake.h"
+
 #include "../backend/fake_asr.hpp"
 #include "../backend/fake_audio.hpp"
 #include "../backend/fake_llm.hpp"
 #include "../backend/fake_rag.hpp"
 #include "../backend/fake_tts.hpp"
+#include "../domain/audio_frame.hpp"
 #include "../domain/error.hpp"
 #include "../gateway/gateway.hpp"
 #include "../observability/observability.hpp"
+#include "../observability/run_evidence.hpp"
 #include "../protocol/control_rpc.hpp"
 #include "../protocol/data_event.hpp"
 #include "../runtime/session_runtime.hpp"
@@ -68,9 +74,17 @@ using nexweave::gateway::Gateway;
 using nexweave::gateway::GatewayCloseReason;
 using nexweave::gateway::GatewayConfig;
 using nexweave::gateway::kInvalidConnectionId;
+using nexweave::observability::IPlaybackBoundaryObserver;
+using nexweave::observability::MilestoneRecord;
+using nexweave::observability::RunEnvironment;
+using nexweave::observability::RunEvidenceConfig;
+using nexweave::observability::RunEvidenceRecorder;
+using nexweave::observability::RunOutcome;
+using nexweave::observability::SteadyMonotonicClock;
 using nexweave::protocol::ControlRequest;
 using nexweave::protocol::ControlResponse;
 using nexweave::protocol::DataEventType;
+using nexweave::runtime::ISessionCancelTarget;
 using nexweave::runtime::LogicalClockPlayback;
 using nexweave::runtime::ManualPlaybackClock;
 using nexweave::runtime::SessionAppConfig;
@@ -221,14 +235,18 @@ class PauseGate {
   }
 
   // 会话线程每写出帧后调用一次：写出帧数达到闸门位置时置位并阻塞到放行。
-  void reach(std::size_t written_frames) {
+  // 返回 true 仅当本次调用确实在闸门位置被拦下并已放行——也就是"这一帧就是闸门指定
+  // 的那一帧"。调用方据此把后续动作绑定在配置的打断点上，而不是绑定在放行之后的第一
+  // 帧上（两者在打断点大于 1 时不是同一帧）。返回值只是对已发生事实的报告，不改变状态。
+  bool reach(std::size_t written_frames) {
     std::unique_lock<std::mutex> lock(mutex_);
     if (released_ || written_frames < stop_after_frame_) {
-      return;
+      return false;
     }
     hit_ = true;
     condition_.notify_all();
     condition_.wait(lock, [this] { return released_; });
+    return true;
   }
 
   // 调用方等待"闸门已经到达"。返回 false 表示预算内没有到达（会话可能已经收敛）。
@@ -258,9 +276,35 @@ class PauseGate {
 //
 // 为什么包在汇上而不是包在播放组件上：汇是"已经写出设备"这一事实的边界，闸门因此与
 // "帧确实交付过"对齐，而不是与"帧被播放组件接收"对齐。
+//
+// 设备侧播放边界也在这里报告：会话只知道"我把第一帧交给了播放组件"，只有汇知道
+// "帧真的写出去了"。两条事实的线性化点不同，合并它们会掩盖"交付成功但写入失败"。
 class PauseSink final : public capability::IAudioSink {
  public:
   PauseSink(FakeAudioSink& inner, PauseGate& gate) : inner_(inner), gate_(gate) {}
+
+  // 挂接设备侧边界观察者（借用指针，可为 nullptr）。它只在**第一帧**成功写出之后
+  // 被通知一次；重复挂接以最后一次为准，不分配、不阻塞。
+  void set_boundary_observer(IPlaybackBoundaryObserver* observer) { boundary_observer_ = observer; }
+
+  // 设定设备时钟：每成功写出一帧就把逻辑时间推进一个帧长，表示这一帧已经播完。
+  // 真实设备的播放进度由硬件时钟推动；确定性夹具没有真实时间，只能由"帧已经写出"
+  // 这一事实推动。缺了这一步，会话永远停在"已写出、尚未播完"，每一轮都会以播放未
+  // 完成失败收敛——那会让"合成结束"与"播放结束"两个时刻在证据里永远缺失。
+  // 传入 nullptr 表示不推进时钟（用于只关心写出行为的夹具）。
+  void set_device_clock(nexweave::runtime::IPlaybackClock* clock, std::int64_t frame_ms) {
+    device_clock_ = clock;
+    frame_ms_ = frame_ms;
+  }
+
+  // 接收拥有者交来的取消入口（借用；空函数对象表示入口失效）。它由拥有者在建立会话
+  // 时写入、在会话结束时清空，两次都发生在工作线程启动之前或会话结束之后，因此这里
+  // 不需要加锁：写入与"会话线程上的读取"之间由线程的建立/join 建立先后关系。
+  void set_turn_cancel_entry(std::function<void()> entry) { turn_cancel_ = std::move(entry); }
+
+  // 布置设备侧停止指令：在闸门放行之后、由会话线程请求取消当前轮次。
+  // 必须在会话开始之前布置（与 arm 同一处），使"这次运行会不会喊停"成为构造性质。
+  void arm_turn_cancel(bool armed) { cancel_after_gate_ = armed; }
 
   void arm(std::size_t stop_after_frame) { gate_.arm(stop_after_frame); }
   bool wait_until_hit(std::chrono::milliseconds budget) { return gate_.wait_until_hit(budget); }
@@ -268,9 +312,28 @@ class PauseSink final : public capability::IAudioSink {
 
   nexweave::domain::OperationResult open() override { return inner_.open(); }
   nexweave::domain::OperationResult write(const nexweave::domain::AudioFrame& frame) override {
+    // 先判断这一帧是不是首帧，再写入：写入之后计数已经加一，那时无法区分"这是第一帧"
+    // 与"这至少是第二帧"。
+    const bool first_frame = inner_.frames().empty();
     const nexweave::domain::OperationResult written = inner_.write(frame);
     if (written.ok()) {
-      gate_.reach(inner_.frames().size());
+      // 先推进设备时间再通知边界与闸门：帧写出的那一刻这一帧就开始占用设备时间，
+      // 顺序反过来会让"已经播完的帧数"在闸门阻塞期间与设备时间对不上。
+      if (device_clock_ != nullptr && frame_ms_ > 0) {
+        device_clock_->advance(frame_ms_);
+      }
+      if (first_frame && boundary_observer_ != nullptr) {
+        boundary_observer_->on_first_frame_written();
+      }
+      // 闸门放行之后再发出设备侧停止指令：本函数的调用栈属于会话线程，因此这正是
+      // "播放组件在自己的投递回调里请求取消"这一合法重入点。放在放行之后而不是之前，
+      // 是为了让"受理停止那一刻已经写出多少帧"完全由闸门位置决定。一次性置位保证
+      // 只会请求一次；即使重复请求，会话层的取消也是幂等的。
+      const bool at_gate = gate_.reach(inner_.frames().size());
+      if (at_gate && cancel_after_gate_ && !turn_cancel_issued_ && turn_cancel_) {
+        turn_cancel_issued_ = true;
+        turn_cancel_();
+      }
     }
     return written;
   }
@@ -280,10 +343,18 @@ class PauseSink final : public capability::IAudioSink {
  private:
   FakeAudioSink& inner_;
   PauseGate& gate_;
+  IPlaybackBoundaryObserver* boundary_observer_ = nullptr;
+  nexweave::runtime::IPlaybackClock* device_clock_ = nullptr;
+  std::int64_t frame_ms_ = 0;
+  // 设备侧停止指令的入口与开关。入口由拥有者交接，开关由调用方在会话开始前布置，
+  // 两者都只在会话线程上被读取，因此不需要加锁；turn_cancel_issued_ 保证只请求一次。
+  std::function<void()> turn_cancel_;
+  bool cancel_after_gate_ = false;
+  bool turn_cancel_issued_ = false;
 };
 // 进程内能力夹具。它拥有全部能力对象，并通过引用把它们交给会话工厂；成员声明顺序即构造
 // 顺序，也就是依赖顺序（被借用的对象先于借用者建立）。
-class MockProfileFixture {
+class MockProfileFixture final : public ISessionCancelTarget {
  public:
   MockProfileFixture()
       : rag_(BuiltinKnowledge()),
@@ -299,6 +370,10 @@ class MockProfileFixture {
     // 实现缺陷。用断言而不是静默继续，否则缺陷会被伪装成"某一轮设备失败"。
     assert(opened.ok());
     (void)opened;
+    // 把模拟设备的时钟推进交给音频汇：成员此时已全部构造完成，因此取地址是安全的。
+    // 帧长取自领域层的音频契约，不在这里另写一个 20。
+    pause_sink_.set_device_clock(
+        &clock_, static_cast<std::int64_t>(nexweave::domain::kAudioFrameDurationMs));
   }
 
   MockProfileFixture(const MockProfileFixture&) = delete;
@@ -322,6 +397,20 @@ class MockProfileFixture {
   }
   void release_pause() { pause_sink_.release(); }
 
+  // 把设备侧播放边界观察者转交给音频汇包装：本层其余部分不需要知道它的存在。
+  void set_playback_boundary_observer(IPlaybackBoundaryObserver* observer) {
+    pause_sink_.set_boundary_observer(observer);
+  }
+
+  // 布置"会话在闸门放行之后被设备喊停"。（只有取消场景会打开它。）
+  void arm_turn_cancel(bool armed) { pause_sink_.arm_turn_cancel(armed); }
+
+  // 接收拥有者交来的取消入口。会话还没建立时收到空函数对象（会话结束），此时设备
+  // 已经不会再写帧，因此直接转发即可。
+  void set_turn_cancel_entry(std::function<void()> entry) override {
+    pause_sink_.set_turn_cancel_entry(std::move(entry));
+  }
+
  private:
   // 文本模式不使用常驻输入，因此这里不建立 ResidentAudioInput：模拟常驻输入与语音分段由
   // session_app 与常驻输入测试覆盖，本层不重复一遍。
@@ -332,8 +421,9 @@ class MockProfileFixture {
   FakeRagRouter router_;
   FakeTts tts_;
   FakeLlm llm_;
-  // 逻辑时钟不自增：播放是否“已经播完”由它决定，而本层不依赖真实时间。会话的收尾条件不
-  // 包含播放完成，因此固定时钟不改变收敛性，只让“合成结束”与“播放结束”保持可区分。
+  // 逻辑时钟由音频汇按帧推进（见 PauseSink::set_device_clock）：它不读真实时间，因此
+  // 每次运行的时序完全一致；同时它又是会话判定"本轮是否播完"的唯一依据，缺了推进就
+  // 没有一轮能成功收敛。
   // 声明顺序即构造顺序：闸门与汇必须先于包装它们的 PauseSink，PauseSink 与时钟必须先于
   // 播放组件（播放组件借用它们）。析构顺序相反，因此会话收敛之后这些对象都还在。
   PauseGate gate_;
@@ -355,6 +445,10 @@ std::string CanonicalConfig(const MockProfileConfig& config) {
   text += std::to_string(config.cancel_after_pcm_events);
   text += "\ndrain_budget_bytes=";
   text += std::to_string(EffectiveDrainBudget(config.scenario, config.drain_budget_bytes));
+  // 产物策略决定这次运行留下什么，因此它是行为的一部分而不是展示细节：不写进指纹，
+  // 两次产物不同的运行会得到同一个配置哈希。
+  text += "\nartifacts=";
+  text += to_string(config.artifact_policy);
   text += "\n";
   return text;
 }
@@ -391,6 +485,38 @@ std::string ContentHash(const std::string& text) {
 
 std::string Fingerprint(const std::string& text) {
   return std::string("fnv1a64:") + ContentHash(text);
+}
+
+// 构建工具链的稳定文本名。用整数宏拼装而不是照抄 __VERSION__：后者带大量构建配置
+// 细节，同一版编译器在不同打包方式下会产生不同字符串，而证据关心的是“哪一版编译器”。
+std::string BuildCompilerName() {
+#if defined(__clang__)
+  return "clang " + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__) +
+         "." + std::to_string(__clang_patchlevel__);
+#elif defined(__GNUC__)
+  return "gcc " + std::to_string(__GNUC__) + "." + std::to_string(__GNUC_MINOR__) + "." +
+         std::to_string(__GNUC_PATCHLEVEL__);
+#else
+  return "unknown";
+#endif
+}
+
+// 本次运行的机器与版本事实。没有硬件项时写 "none" 而不是编一个看起来像证据的值：
+// 这份清单的作用是让人判断“这个结论是在什么环境下得到的”，编造字段会直接破坏它。
+// 取不到 Git 提交（从源码压缩包构建）时同样如实写 unknown，也不让构建失败。
+RunEnvironment BuildEnvironment(const std::string& scenario_name) {
+  RunEnvironment environment;
+  const std::string commit = NEXWEAVE_BUILD_GIT_COMMIT;
+  const std::string cmake_version = NEXWEAVE_BUILD_CMAKE_VERSION;
+  environment.git_commit = commit.empty() ? std::string("unknown") : commit;
+  environment.compiler = BuildCompilerName();
+  environment.cmake = cmake_version.empty() ? std::string("unknown") : cmake_version;
+  environment.runtime = std::string("nexweave-mock-profile/") + scenario_name;
+  // 本层只组装进程内确定性夹具：没有 NPU、没有模型文件、没有声卡，也没有传输库。
+  environment.driver = "none";
+  environment.model = "fake";
+  environment.device = "none";
+  return environment;
 }
 
 // 错误码的稳定文本名，供汇总与证据使用。本地实现而不扩张领域层的公共接口：领域层只导出
@@ -631,11 +757,20 @@ ControlRequest MakeRequest(MockProfileScenario scenario, const std::string& requ
   request.deadline = Milliseconds{deadline_ms == 0 ? 1 : deadline_ms};
   return request;
 }
-// 输出产物的文件名。它们写在配置给出的目录下；目录本身由调用方持有，因此运行结束只删除
-// 文件，不删除目录——删除别人的目录不是本层的权限范围。
-constexpr char kEventsFileName[] = "events.jsonl";
-constexpr char kSummaryFileName[] = "summary.json";
+// 输出产物的文件名。它们写在配置给出的目录下；目录本身由调用方持有，因此运行结束只处理
+// 文件，不处理目录——删除别人的目录不是本层的权限范围。
+//
+// 五份产物的分工：清单记录“用什么版本、什么配置、什么命令跑的”，事件流是里程碑的
+// 逐条原文，指标流是它们的时间与步数投影，摘要把这些投影成给人读的表格，协议报文
+// 保留客户端视角的原始交互记录（v1 只有逐轮文本与终态，没有逐帧 PCM 下行）。
 constexpr char kManifestFileName[] = "run-manifest.json";
+constexpr char kEventsFileName[] = "events.jsonl";
+constexpr char kMetricsFileName[] = "metrics.jsonl";
+constexpr char kProtocolFileName[] = "protocol.jsonl";
+constexpr char kSummaryFileName[] = "summary.md";
+// 一次运行应当产生的产物个数。少于它即表示产物不完整，必须按运行级失败报告：
+// 缺一份却报告成功，会让读者以为证据齐备。
+constexpr std::size_t kArtifactCount = 5;
 
 // 写文件并返回是否成功。失败不抛异常：它是一次运行级失败，应当出现在结果里而不是变成崩溃。
 bool WriteFile(const std::string& path, const std::string& content) {
@@ -670,7 +805,12 @@ std::string BuildCommandLine(const MockProfileConfig& config, const std::string&
   command += " --cancel-after-pcm " + std::to_string(config.cancel_after_pcm_events);
   command += " --drain-budget " + std::to_string(config.drain_budget_bytes);
   if (!config.output_dir.empty()) {
-    command += " --out-dir " + config.output_dir;
+    // 命令行入口按策略回显不同的开关：只写 --out-dir 会让人以为产物不会被保留，
+    // 于是照抄清单里的命令跑出来是另一种留存行为。
+    command += config.artifact_policy == MockProfileArtifactPolicy::kRetained
+                   ? " --evidence-dir "
+                   : " --out-dir ";
+    command += config.output_dir;
   }
   return command;
 }
@@ -702,26 +842,38 @@ bool EnsureDirectory(const std::string& directory) {
 }
 
 // 把本次运行的产物写入输出目录。返回成功写入的文件数。
+//
+// 为什么证据文本为空就整体按失败处理：空文件在目录里看起来“写成功了”，而读者打开
+// 之后什么也看不到——那比没有文件更容易被误读成“这次运行没有可观察事实”。
 std::size_t WriteArtifacts(const MockProfileConfig& config, const MockProfileResult& result) {
   if (config.output_dir.empty()) {
+    return 0;
+  }
+  if (result.manifest_json.empty() || result.events_jsonl.empty() ||
+      result.metrics_jsonl.empty() || result.summary_markdown.empty()) {
     return 0;
   }
   if (!EnsureDirectory(config.output_dir)) {
     return 0;
   }
-  std::string events;
+  // 协议报文由入口交出的原始行拼成：每行已经带好 response/event 前缀，本层不再改写，
+  // 保留客户端视角的原始顺序。
+  std::string protocol;
   for (const std::string& record : result.records) {
-    events += record;
-    events.push_back('\n');
+    protocol += record;
+    protocol.push_back('\n');
   }
   std::size_t written = 0;
-  written += WriteFile(JoinPath(config.output_dir, kEventsFileName), events) ? 1 : 0;
   written +=
-      WriteFile(JoinPath(config.output_dir, kSummaryFileName), result.summary_json + "\n") ? 1 : 0;
-  written += WriteFile(JoinPath(config.output_dir, kManifestFileName),
-                       result.manifest_json + "\n")
-                 ? 1
-                 : 0;
+      WriteFile(JoinPath(config.output_dir, kManifestFileName), result.manifest_json + "\n") ? 1
+                                                                                            : 0;
+  written += WriteFile(JoinPath(config.output_dir, kEventsFileName), result.events_jsonl) ? 1 : 0;
+  written +=
+      WriteFile(JoinPath(config.output_dir, kMetricsFileName), result.metrics_jsonl) ? 1 : 0;
+  written +=
+      WriteFile(JoinPath(config.output_dir, kProtocolFileName), protocol) ? 1 : 0;
+  written +=
+      WriteFile(JoinPath(config.output_dir, kSummaryFileName), result.summary_markdown) ? 1 : 0;
   return written;
 }
 
@@ -731,9 +883,11 @@ bool RemoveArtifacts(const MockProfileConfig& config) {
     return true;
   }
   bool clean = true;
-  clean = RemoveFile(JoinPath(config.output_dir, kEventsFileName)) && clean;
-  clean = RemoveFile(JoinPath(config.output_dir, kSummaryFileName)) && clean;
   clean = RemoveFile(JoinPath(config.output_dir, kManifestFileName)) && clean;
+  clean = RemoveFile(JoinPath(config.output_dir, kEventsFileName)) && clean;
+  clean = RemoveFile(JoinPath(config.output_dir, kMetricsFileName)) && clean;
+  clean = RemoveFile(JoinPath(config.output_dir, kProtocolFileName)) && clean;
+  clean = RemoveFile(JoinPath(config.output_dir, kSummaryFileName)) && clean;
   return clean;
 }
 
@@ -781,6 +935,16 @@ const char* to_string(MockProfileScenario scenario) noexcept {
       return "cancel";
     case MockProfileScenario::kFault:
       return "fault";
+  }
+  return "";
+}
+
+const char* to_string(MockProfileArtifactPolicy policy) noexcept {
+  switch (policy) {
+    case MockProfileArtifactPolicy::kTransient:
+      return "transient";
+    case MockProfileArtifactPolicy::kRetained:
+      return "retained";
   }
   return "";
 }
@@ -865,6 +1029,18 @@ OperationResult validate_mock_profile_config(const MockProfileConfig& config) {
     return OperationResult::failure(ErrorCode::kInvalidInput,
                                     "只有慢消费场景可以使用 drain_budget_bytes");
   }
+  // 策略值必须是自己认得的枚举值：越界值来自强制转换或反序列化错误，落进 else 分支会
+  // 悄悄按临时策略运行，把本该留档的证据删掉——那正好与调用方的意图相反。
+  if (config.artifact_policy != MockProfileArtifactPolicy::kTransient &&
+      config.artifact_policy != MockProfileArtifactPolicy::kRetained) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "未知的产物留存策略");
+  }
+  // 没有输出目录就没有产物可留：把"要求保留"降级成"什么都不留"是一次静默失败，
+  // 调用方会以为证据已经落盘，因此这里按配置错误拒绝。
+  if (config.artifact_policy == MockProfileArtifactPolicy::kRetained &&
+      config.output_dir.empty()) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "保留产物必须给出输出目录");
+  }
   return OperationResult::success();
 }
 MockProfileResult run_mock_profile(const MockProfileConfig& config) {
@@ -883,6 +1059,29 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
 
   const std::string config_text = CanonicalConfig(config);
   const std::string input_text = CanonicalInput(config);
+
+  // 运行证据记录器先于任何资源建立：运行起点必须早于第一个连接与线程，否则“run_start →
+  // 首帧”的差值会把建立开销算进链路耗时，而那段开销与场景无关。
+  RunEvidenceConfig evidence_config;
+  evidence_config.run_id = std::string("mock-") + result.scenario_name;
+  evidence_config.profile = "mock";
+  // 清单里记的命令必须与命令行入口真正回显的命令是同一条：整个命令行只在这里构造一次，
+  // 命令行入口按同一规则拼装，两处不会各写一份而将来分歧。
+  evidence_config.command = BuildCommandLine(config, result.scenario_name);
+  // 命令哈希与配置/输入哈希取自同一处实现：把命令原文与它的指纹放在一起，读者才能判断
+  // “清单里记的命令”和“指纹对应的命令”是不是同一条。
+  evidence_config.command_hash = Fingerprint(evidence_config.command);
+  evidence_config.config_hash = Fingerprint(config_text);
+  evidence_config.input_hash = Fingerprint(input_text);
+  evidence_config.request_id = ScenarioRequestId(config.scenario);
+  evidence_config.session_id = ScenarioSessionId(config.scenario);
+  evidence_config.environment = BuildEnvironment(result.scenario_name);
+  // 帧长取自领域层的音频契约，不在这里再写一个 20：抄第二遍就等于埋下“推导用的帧长与
+  // 真实帧长不一致”的分歧点。
+  evidence_config.frame_ms = static_cast<std::int64_t>(nexweave::domain::kAudioFrameDurationMs);
+  SteadyMonotonicClock monotonic_clock;
+  RunEvidenceRecorder evidence(evidence_config, monotonic_clock);
+  result.artifact_policy_name = to_string(config.artifact_policy);
 
   // 配置校验在任何资源建立之前完成：失败时结果里没有连接、没有线程、没有文件，调用方拿到
   // 的是一份“什么都没发生”的账目，而不是一次跑了一半的运行。
@@ -916,6 +1115,16 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
     gateway_config.exit_wait_budget = kSettleBudget;
     Gateway gateway(supervisor, factory, gateway_config);
 
+    // 观察者接缝在建立会话之前装好：标记观察者要看到最先发生的里程碑，生成观察者要看到
+    // 第一个 token，两者都必须在会话开始执行之前就位，否则最初的事实会永久缺失。
+    factory.set_generation_observer(&evidence);
+    factory.set_marker_observer(&evidence);
+    // 取消入口也必须在此之前注册：拥有者在建立会话时立刻把它交出来，晚一步注册就会
+    // 让这一次会话的停止指令没有投递目标。
+    factory.set_cancel_target(&fixture);
+    // 设备侧边界由音频汇包装报告：它知道“帧真的写出去了”，会话只知道“帧交给播放组件了”。
+    fixture.set_playback_boundary_observer(&evidence);
+
     const ConnectionId connection = gateway.open_connection();
     if (connection == kInvalidConnectionId) {
       result.error = Error{ErrorCode::kBackendFailure, "请求入口拒绝建立连接"};
@@ -940,6 +1149,10 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
       // 那正是本场景要消除的不确定性。
       if (config.scenario == MockProfileScenario::kCancel) {
         fixture.arm_pause(config.cancel_after_pcm_events);
+        // 取消场景的停止指令由设备发出：控制面取消只让这次会话该退出，在途轮次仍会
+        // 跑完，因此只有设备侧的取消才能让会话真的停下并提交取消各阶段。布置同样必须
+        // 在提交创建之前完成，理由与闸门相同：会话跑得比任何轮询都快。
+        fixture.arm_turn_cancel(true);
       }
 
       // 1) 受理一次创建。受理响应与执行终态是两件事，因此这里只提交、不等会话。
@@ -960,8 +1173,9 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
         // 查询响应持续填满，等它空下来就等于放弃这个场景。上界只是防止"响应永远不成帧"
         // 时挂起，不参与正常路径。
         for (std::size_t round = 0; round < 1024 && result.response_count == 0; ++round) {
-          DrainOnce(gateway, connection, EffectiveDrainBudget(config.scenario, config.drain_budget_bytes), buffer, result.records,
-                    result);
+          DrainOnce(gateway, connection,
+                    EffectiveDrainBudget(config.scenario, config.drain_budget_bytes), buffer,
+                    result.records, result);
           if (!result.error.ok()) {
             break;
           }
@@ -979,8 +1193,9 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
           const auto pause_deadline = std::chrono::steady_clock::now() + kSettleBudget;
           bool paused = false;
           for (;;) {
-            DrainOnce(gateway, connection, EffectiveDrainBudget(config.scenario, config.drain_budget_bytes), buffer, result.records,
-                      result);
+            DrainOnce(gateway, connection,
+                      EffectiveDrainBudget(config.scenario, config.drain_budget_bytes), buffer,
+                      result.records, result);
             paused = fixture.wait_for_pause(Milliseconds{1});
             if (paused || !result.error.ok()) {
               break;
@@ -1031,8 +1246,9 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
           const auto settle_deadline = std::chrono::steady_clock::now() + kSettleBudget;
           std::size_t query_index = 0;
           while (gateway.connection_stats(connection).open) {
-            DrainOnce(gateway, connection, EffectiveDrainBudget(config.scenario, config.drain_budget_bytes), buffer, result.records,
-                      result);
+            DrainOnce(gateway, connection,
+                      EffectiveDrainBudget(config.scenario, config.drain_budget_bytes), buffer,
+                      result.records, result);
             if (!result.error.ok() || std::chrono::steady_clock::now() >= settle_deadline) {
               break;
             }
@@ -1084,7 +1300,9 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
       // 关闭之前再取一次字节：终态事件可能在等待或退出阶段才被投递，若不取走就关闭，
       // 它会随连接一起消失——而"会话以什么终态收敛"正是这条命令要交付的东西。入口不会
       // 清空已关闭连接的待发字节，所以这一步是必须的，不是保险。
-      DrainOnce(gateway, connection, EffectiveDrainBudget(config.scenario, config.drain_budget_bytes), buffer, result.records, result);
+      DrainOnce(gateway, connection,
+                EffectiveDrainBudget(config.scenario, config.drain_budget_bytes), buffer,
+                result.records, result);
       const auto stats_before = gateway.connection_stats(connection);
       result.close_reason = nexweave::gateway::to_string(stats_before.close_reason);
       result.observed.connection_closed_by_server =
@@ -1128,6 +1346,29 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
   const MockProfileExpectation expected = mock_profile_expectation(config.scenario);
   result.expectation_matched = CompareExpectation(expected, result.observed, result.mismatch);
   result.exit_code = (result.error.ok() && result.expectation_matched) ? 0 : 1;
+
+  // 运行证据收尾：结论在退出码确定之后给出，因此 run_end 携带的是这次运行最终的退出码与
+  // 错误码，而不是一个在收尾途中就被写死的旧值。产物写入/删除的结果不在这里——它属于
+  // 采集侧，写进被采集的内容里就成了“文件记录自己写失败”的循环。
+  RunOutcome outcome;
+  outcome.exit_code = result.exit_code;
+  outcome.error_code = result.error.ok() ? "none" : ErrorCodeName(result.error.code);
+  outcome.expectation_matched = result.expectation_matched;
+  // 音频帧数取自会话自己的运行记录，而不是线上事件：v1 的请求入口只交付逐轮文本与终态。
+  outcome.audio_frames = result.rendered_frames;
+  evidence.finish(outcome);
+  result.milestones = evidence.milestones();
+  result.events_jsonl = evidence.events_jsonl();
+  result.metrics_jsonl = evidence.metrics_jsonl();
+  result.summary_markdown = evidence.summary_markdown();
+  result.overlap_proven = evidence.overlap_proven();
+  result.metric_count =
+      static_cast<std::size_t>(std::count(result.metrics_jsonl.begin(), result.metrics_jsonl.end(),
+                                          '\n'));
+  // 运行清单由证据记录器渲染：版本、配置、输入、命令与日历时间来自同一份运行事实，
+  // 本层不再自己拼第二份，避免两处字段集合将来分歧。
+  result.manifest_json = evidence.manifest_json();
+
   // 汇总与清单在建产物之前生成：它们是产物的内容来源，反过来不行。
   nlohmann::json summary;
   summary["scenario"] = result.scenario_name;
@@ -1160,58 +1401,49 @@ MockProfileResult run_mock_profile(const MockProfileConfig& config) {
   summary["artifacts_written"] = result.ledger.artifacts_written;
   summary["artifacts_removed"] = result.ledger.artifacts_removed;
   summary["quiesced"] = result.ledger.quiesced();
+  // 证据的确定性投影：条数、策略与因果结论都能逐字节复现，因此可以进汇总；实测时间只进
+  // metrics.jsonl 与摘要，不进这里，否则确定性门禁会被实测值破坏。
+  summary["artifacts_policy"] = result.artifact_policy_name;
+  summary["milestones"] = result.milestones.size();
+  summary["metrics"] = result.metric_count;
+  summary["overlap_proven"] = result.overlap_proven;
   result.summary_json = summary.dump();
 
-  // 运行清单复用可观测层已经定义的结构，而不是另造一份：字段集合与后续证据任务一致，
-  // 因此这里填过的字段不需要在别处再翻译一次。填不出来的字段留空或写 none——编造一个
-  // 看起来像证据的值，比留空更糟。
-  nexweave::observability::RunManifest manifest;
-  manifest.run_id = std::string("mock-") + result.scenario_name;
-  manifest.git_commit = "none";
-  manifest.compiler = "none";
-  manifest.cmake = "none";
-  manifest.runtime = std::string("nexweave-mock-profile/") + result.scenario_name;
-  manifest.driver = "none";
-  manifest.model = "fake";
-  manifest.config_hash = Fingerprint(config_text);
-  manifest.input_hash = Fingerprint(input_text);
-  manifest.device = "none";
-  manifest.profile = "mock";
-  // 执行命令必须足以复现这一次运行：只写场景名会漏掉真正改变行为的旋钮与身份，于是
-  // 清单里记的命令跑出来是另一次运行。整个命令行在核心逻辑里构造一次，命令行入口按同一
-  // 规则回显，两处不会各写一份而将来分歧。
-  manifest.command = BuildCommandLine(config, result.scenario_name);
-  // 时间戳不参与确定性输出：同一配置必须得到逐字节一致的清单，因此这里不使用"当前时间"，
-  // 而是明确的占位值。真实开始/结束时间由后续的运行证据任务在写盘时采集，本层不猜。
-  manifest.start_time = "none";
-  manifest.end_time = "none";
-  const auto encoded_manifest = nexweave::observability::encode_manifest(manifest);
-  result.manifest_json =
-      encoded_manifest.ok() ? *encoded_manifest.value : std::string("{\"error\":\"manifest\"}");
-
-  // 产物：先写、再删。写入失败按运行级失败报告；删除失败说明“没有残留”不成立，同样升级为
-  // 运行级失败——一个留下文件的运行不能被当成干净运行。
+  // 产物：先写，再按策略处理。写入失败按运行级失败报告；采用保留策略时产物是交付物，
+  // 采用临时策略时它们必须被删除——留下文件的临时运行不能被当成干净运行。
   result.ledger.artifacts_written = WriteArtifacts(config, result);
-  if (!config.output_dir.empty() && result.ledger.artifacts_written < 3 && result.error.ok()) {
+  if (!config.output_dir.empty() && result.ledger.artifacts_written < kArtifactCount &&
+      result.error.ok()) {
     result.error = Error{ErrorCode::kDeviceFailure, "输出产物写入失败"};
     result.exit_code = 1;
   }
-  result.ledger.artifacts_removed = RemoveArtifacts(config);
-  if (!result.ledger.artifacts_removed && result.error.ok()) {
-    result.error = Error{ErrorCode::kDeviceFailure, "输出产物未能删除"};
-    result.exit_code = 1;
+  const bool retained_policy = !config.output_dir.empty() &&
+                               config.artifact_policy == MockProfileArtifactPolicy::kRetained;
+  if (retained_policy) {
+    // 保留策略下文件仍在目录里，但那是本次运行的交付物，不是未交还的资源；账目因此记
+    // “有意保留”而不是“删不掉”。写入不完整时保留标志保持假，quiesced() 会如实报未交还。
+    result.ledger.artifacts_retained = result.ledger.artifacts_written == kArtifactCount;
+    result.ledger.artifacts_removed = false;
+  } else {
+    result.ledger.artifacts_removed = RemoveArtifacts(config);
+    if (!result.ledger.artifacts_removed && result.error.ok()) {
+      result.error = Error{ErrorCode::kDeviceFailure, "输出产物未能删除"};
+      result.exit_code = 1;
+    }
   }
   if (!result.ledger.quiesced() && result.error.ok()) {
     result.error = Error{ErrorCode::kDeviceFailure, "运行结束后仍有未交还的资源"};
     result.exit_code = 1;
   }
-  // 资源账目最终确定之后重新生成一次汇总：否则 artifacts_removed 与 quiesced 会停留在写入
-  // 之前的取值，把一次有残留的运行报告成干净的——那正是这份账目要防止的事。
+  // 资源账目最终确定之后重新生成一次汇总：否则 artifacts_removed / artifacts_retained 与
+  // quiesced 会停留在写入之前的取值，把一次有残留的运行报告成干净的——那正是这份账目要
+  // 防止的事。运行证据不在这里重渲染：它的 run_end 描述的是会话运行的结论。
   summary["exit_code"] = result.exit_code;
   summary["error"] = result.error.ok() ? "none" : "failed";
   summary["error_code"] = result.error.ok() ? "none" : ErrorCodeName(result.error.code);
   summary["artifacts_written"] = result.ledger.artifacts_written;
   summary["artifacts_removed"] = result.ledger.artifacts_removed;
+  summary["artifacts_retained"] = result.ledger.artifacts_retained;
   summary["quiesced"] = result.ledger.quiesced();
   result.summary_json = summary.dump();
   return result;

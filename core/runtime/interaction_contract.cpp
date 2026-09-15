@@ -70,6 +70,22 @@ domain::Result<std::vector<PaddedAudioFrame>> pad_audio_samples(
   return domain::Result<std::vector<PaddedAudioFrame>>::success(std::move(output));
 }
 
+// 提交标记的唯一入口：轨迹、末标记与观察者通知三件事只在这里发生。
+// 顺序理由：先把状态改完再通知。观察者若在回调里（非法规地）回头读夹具，看到的必须是
+// 已经包含本次标记的状态；反过来先通知再改状态，会让回调观察到"标记还没发生"的假象。
+// 观察者是借用指针且约定不抛异常，因此这里不需要异常保护；空指针时不产生任何额外分支。
+void InteractionContractFixture::commit(ActivityMarker marker) {
+  last_marker_ = marker;
+  trace_.push_back(marker);
+  if (marker_observer_ != nullptr) {
+    marker_observer_->on_marker(marker, generation_);
+  }
+}
+
+void InteractionContractFixture::set_marker_observer(IMarkerObserver* observer) noexcept {
+  marker_observer_ = observer;
+}
+
 domain::OperationResult InteractionContractFixture::start_stream(
     const std::string& stream_id) {
   if (stream_id.empty() || stream_started_) {
@@ -110,8 +126,8 @@ domain::Result<std::uint64_t> InteractionContractFixture::begin_generation() {
     return domain::Result<std::uint64_t>::failure(domain::ErrorCode::kInvalidInput);
   }
   if (generation_started_ && !terminal_) {
-    trace_.push_back(ActivityMarker::kOldOutputBlocked);
-    last_marker_ = ActivityMarker::kOldOutputBlocked;
+    // 旧输出封锁先于新代际的起点提交：它描述的是"上一轮的结果已经不可能再被提交"。
+    commit(ActivityMarker::kOldOutputBlocked);
   }
   ++generation_;
   generation_started_ = true;
@@ -121,8 +137,7 @@ domain::Result<std::uint64_t> InteractionContractFixture::begin_generation() {
   playback_done_ = false;
   cancelled_ = false;
   terminal_ = false;
-  trace_.push_back(ActivityMarker::kGenerationStarted);
-  last_marker_ = ActivityMarker::kGenerationStarted;
+  commit(ActivityMarker::kGenerationStarted);
   return domain::Result<std::uint64_t>::success(generation_);
 }
 
@@ -132,8 +147,7 @@ domain::OperationResult InteractionContractFixture::start_playback(
     return domain::OperationResult::failure(domain::ErrorCode::kCancelled);
   }
   playback_started_ = true;
-  trace_.push_back(ActivityMarker::kPlaybackStarted);
-  last_marker_ = ActivityMarker::kPlaybackStarted;
+  commit(ActivityMarker::kPlaybackStarted);
   return domain::OperationResult::success();
 }
 
@@ -143,8 +157,7 @@ domain::OperationResult InteractionContractFixture::mark_generation_done(
     return domain::OperationResult::failure(domain::ErrorCode::kCancelled);
   }
   generation_done_ = true;
-  trace_.push_back(ActivityMarker::kGenerationDone);
-  last_marker_ = ActivityMarker::kGenerationDone;
+  commit(ActivityMarker::kGenerationDone);
   return domain::OperationResult::success();
 }
 
@@ -154,8 +167,7 @@ domain::OperationResult InteractionContractFixture::mark_synthesis_done(
     return domain::OperationResult::failure(domain::ErrorCode::kCancelled);
   }
   synthesis_done_ = true;
-  trace_.push_back(ActivityMarker::kSynthesisDone);
-  last_marker_ = ActivityMarker::kSynthesisDone;
+  commit(ActivityMarker::kSynthesisDone);
   return domain::OperationResult::success();
 }
 
@@ -168,12 +180,12 @@ domain::OperationResult InteractionContractFixture::mark_playback_done(
     return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput);
   }
   playback_done_ = true;
-  trace_.push_back(ActivityMarker::kPlaybackDone);
-  last_marker_ = ActivityMarker::kPlaybackDone;
+  commit(ActivityMarker::kPlaybackDone);
   if (generation_done_ && synthesis_done_) {
     terminal_ = true;
-    trace_.push_back(ActivityMarker::kTerminalSucceeded);
-    last_marker_ = ActivityMarker::kTerminalSucceeded;
+    // 成功终态是本地标记提交的结果，不是一次独立的调用：把它和上面那个标记之间的状态
+    // 更新放在同一处，终端就不会在缺少三个 done 的情况下被提交。
+    commit(ActivityMarker::kTerminalSucceeded);
   }
   return domain::OperationResult::success();
 }
@@ -187,13 +199,15 @@ domain::OperationResult InteractionContractFixture::cancel(
     return domain::OperationResult::success();
   }
   cancelled_ = true;
-  trace_.push_back(ActivityMarker::kCancelAccepted);
-  trace_.push_back(ActivityMarker::kOldOutputBlocked);
-  trace_.push_back(ActivityMarker::kExecutionExited);
-  trace_.push_back(ActivityMarker::kPlaybackCleared);
-  trace_.push_back(ActivityMarker::kTerminalCancelled);
-  last_marker_ = ActivityMarker::kTerminalCancelled;
+  // 五个阶段在同一个线性化点上提交：受理、封锁旧输出、执行退出、播放清理、取消终态。
+  // 本夹具的清理是同步的（没有等待），因此它们的观测时刻相同；真实设备需要有限等待时，
+  // 阶段之间的时间差才会出现，而顺序不变量保持不变。
+  commit(ActivityMarker::kCancelAccepted);
+  commit(ActivityMarker::kOldOutputBlocked);
+  commit(ActivityMarker::kExecutionExited);
+  commit(ActivityMarker::kPlaybackCleared);
   terminal_ = true;
+  commit(ActivityMarker::kTerminalCancelled);
   return domain::OperationResult::success();
 }
 

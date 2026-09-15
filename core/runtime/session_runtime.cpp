@@ -80,32 +80,37 @@ class RelayGenerationProbe final : public capability::IGenerationProbe {
                        capability::IGenerationObserver* observer) noexcept
       : inner_(inner), observer_(observer) {}
 
+  // 四个回调统一采用“先观察、后处理”的顺序：观察者记录的是后端刚刚发生的事实，会话随后
+  // 才处理它（分句、合成、交付播放）。顺序反过来会让“首 token 时刻”被记在处理完成之后——
+  // 在确定性夹具里那时首帧早已播出，而一条名为首 token 的指标必须真的是它自己的含义。
+  // 观察者只记录、不参与编排，因此这个顺序不改变任何业务行为；它也不是异常安全的依赖，
+  // 观察者按约定不抛异常。
   void on_generation_started() override {
-    inner_.on_generation_started();
     if (observer_ != nullptr) {
       observer_->on_generation_started();
     }
+    inner_.on_generation_started();
   }
 
   void on_token_delivered(const std::string& token) override {
-    inner_.on_token_delivered(token);
     if (observer_ != nullptr) {
       observer_->on_token_delivered(token);
     }
+    inner_.on_token_delivered(token);
   }
 
   void on_generation_completed() override {
-    inner_.on_generation_completed();
     if (observer_ != nullptr) {
       observer_->on_generation_completed();
     }
+    inner_.on_generation_completed();
   }
 
   void on_generation_failed(const std::string& message) override {
-    inner_.on_generation_failed(message);
     if (observer_ != nullptr) {
       observer_->on_generation_failed(message);
     }
+    inner_.on_generation_failed(message);
   }
 
  private:
@@ -1071,6 +1076,12 @@ void SessionRuntime::set_barge_in_monitor(IBargeInMonitor* monitor) noexcept {
 
 void SessionRuntime::set_generation_observer(capability::IGenerationObserver* observer) noexcept {
   generation_observer_ = observer;
+}
+
+void SessionRuntime::set_marker_observer(IMarkerObserver* observer) noexcept {
+  marker_observer_ = observer;
+  // 夹具是会话的成员，因此这一次挂接对本会话的后续全部轮次都有效，不需要每轮重挂。
+  contract_.set_marker_observer(observer);
 }
 
 void SessionRuntime::drain_barge_in_notices() {

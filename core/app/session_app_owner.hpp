@@ -40,6 +40,7 @@
 // 常驻输入对象。这是 SessionApp 自身的限制，本适配器如实传递，不在这里重试或重置它。
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -77,6 +78,31 @@ class ISessionRunSource {
   // 返回最近一次收敛会话的快照；还没有任何会话收敛过时返回空指针。
   // 实现不得阻塞、不得等待在途会话，也不得在返回前复制逐帧音频。
   virtual std::shared_ptr<const SessionAppRunRecord> last_run() const = 0;
+};
+
+// 会话取消入口的延迟绑定目标（借用指针）。
+//
+// 它解决什么问题
+// --------------
+// 取消的唯一合法重入点是「播放或能力组件在自己的投递回调里」（见 SessionRuntime 的取消
+// 语义），而设备对象必须先于会话存在——播放组件借用它，因此设备在构造时拿不到会话。
+// 本接口把这个交接点显式化：拥有者在会话建立之后把「请求取消当前轮次」放进来，设备在
+// 写帧的回调里调用它，于是取消仍然发生在会话线程上、仍然走同一条统一取消路径。
+//
+// 时序与所有权：set_turn_cancel_entry 只在拥有者构造（控制线程，工作线程启动之前）与
+// 会话结束（工作线程，拥有者析构）时各调用一次，传入空的函数对象表示入口失效。
+// 调用方**只能在实际运行会话的那条线程上**调用入口——这正是会话声明的合法重入点；
+// 从别的线程调用不在契约内，因为那会让能力对象的 cancel() 与 synthesize() 并发。
+//
+// 为什么用 std::function 而不是裸指针：入口的接收方（设备）与提供方（拥有者）互不
+// 认识对方的类型，函数对象是唯一不需要两侧互相包含头文件的交接形式。交接次数固定为
+// 每次会话两次，因此它的分配开销只发生在建立与结束各一次。
+class ISessionCancelTarget {
+ public:
+  virtual ~ISessionCancelTarget() = default;
+  // 绑定或解绑本次会话的取消入口。实现必须允许与设备侧调用并发（解绑可能发生在
+  // 一次迟到的回调之后），因此内部需要同步；空函数对象表示入口失效。
+  virtual void set_turn_cancel_entry(std::function<void()> entry) = 0;
 };
 
 // 会话拥有者工厂：按同一份应用配置为每次会话构造一个**全新**的 SessionApp。
@@ -118,6 +144,20 @@ class SessionAppOwnerFactory final : public ISessionOwnerFactory, public ISessio
   // 因此这条控制路径的开销与会话产出了多少 PCM 无关。
   std::shared_ptr<const SessionAppRunRecord> last_run() const override;
 
+  // 注册取消入口的接收方（借用指针，可为 nullptr）。必须在建立会话之前设置：拥有者
+  // 在构造新会话时就把入口交出去，因此交接严格早于工作线程启动。接收方必须比本工厂
+  // 活得久；它不参与任何其他判定。
+  void set_cancel_target(ISessionCancelTarget* target) noexcept;
+
+  // 为之后建立的每个会话挂接生成进度观察者（借用指针，可为 nullptr）。它必须在建立
+  // 会话之前设置：拥有者在构造时就把观察者装到新会话上，因此工作线程看到的始终是已经
+  // 固定下来的指针，不存在“注册到一半就开始执行”的窗口。观察者必须比本工厂活得久。
+  void set_generation_observer(capability::IGenerationObserver* observer) noexcept;
+
+  // 为之后建立的每个会话挂接活动标记观察者（借用指针，可为 nullptr）。时机与生命周期
+  // 要求同生成观察者；两者互相独立，可以只挂其中一个。
+  void set_marker_observer(IMarkerObserver* observer) noexcept;
+
  private:
   // 一次会话的拥有者。定义在实现文件里：它只有生命周期入口，不构成对外契约。
   class Owner;
@@ -133,6 +173,14 @@ class SessionAppOwnerFactory final : public ISessionOwnerFactory, public ISessio
   IAudioPlayback& playback_;
   ResidentAudioInput* resident_ = nullptr;
   capability::ILlm* llm_ = nullptr;
+  // 取消入口的接收方（借用）。它在建立会话时被读取一次，因此不需要加锁：建立发生在
+  // 控制线程上，且严格早于工作线程启动。
+  ISessionCancelTarget* cancel_target_ = nullptr;
+  // 两个观察者接缝都是借用指针：工厂不拥有它们，也不在析构时释放；它们只在建立会话
+  // 的那一刻被读取一次，因此不需要加锁——建立会话发生在控制线程上，且严格早于工作
+  // 线程启动。
+  capability::IGenerationObserver* generation_observer_ = nullptr;
+  IMarkerObserver* marker_observer_ = nullptr;
 
   mutable std::mutex mutex_;
   // 最近一次收敛记录。用共享指针承载，使 last_run() 只需在锁内取一份引用，不必持锁复制

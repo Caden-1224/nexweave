@@ -375,6 +375,14 @@ class SessionRuntime final {
   // 回调在生成线程上同步执行，实现必须非阻塞、不抛异常。
   void set_generation_observer(capability::IGenerationObserver* observer) noexcept;
 
+  // 挂接活动标记观察者（借用指针，可为 nullptr）。本类把它交给内部的交互契约夹具，于是
+  // “生成开始、首帧交付、三类完成、取消各阶段”在提交标记的同时被外部记录；观察者只被
+  // 通知，不能否决任何提交条件，标记的语义与顺序不因挂接而改变。
+  // 生命周期：观察者必须活到本对象析构，可在任意时刻挂接或摘除。
+  // 线程与阻塞：回调在提交标记的线程（即 run() 所在线程）上同步执行，实现必须非阻塞、
+  // 不抛异常、不得重入本对象。未挂接时不产生任何额外分支。
+  void set_marker_observer(IMarkerObserver* observer) noexcept;
+
   // 状态机只读访问：供测试与运行证据核对阶段轨迹和当前代际。
   const SessionStateMachine& state_machine() const noexcept;
   // 活动标记快照，顺序即提交顺序。
@@ -491,6 +499,9 @@ class SessionRuntime final {
   // 可选的生成进度观察者（借用，可为 nullptr）。每轮重新挂到支持该接缝的后端上，
   // 因此它可以在本对象构造之后再注册。
   capability::IGenerationObserver* generation_observer_ = nullptr;
+  // 可选的活动标记观察者（借用，可为 nullptr）。它被直接装到交互契约夹具上，因此挂接
+  // 之后立即生效，不需要等到下一轮；夹具的生命周期与本对象相同。
+  IMarkerObserver* marker_observer_ = nullptr;
   // 本轮是否由新语音触发取消，以及该语音的归属；每轮开始时清空。
   bool speech_interrupt_ = false;
   SpeechStartNotice speech_interrupt_notice_;

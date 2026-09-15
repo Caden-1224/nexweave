@@ -26,6 +26,19 @@ target_compile_options(nexweave_warnings INTERFACE
 )
 
 set(NEXWEAVE_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+# 构建时采集 Git 提交：运行证据里的“版本”必须能追溯到具体源码状态。取不到时写成
+# unknown 而不是让配置失败——从源码压缩包构建是受支持的方式，那条路径上没有 .git。
+execute_process(
+  COMMAND git rev-parse HEAD
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT_VARIABLE NEXWEAVE_GIT_COMMIT
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+  RESULT_VARIABLE NEXWEAVE_GIT_RESULT
+)
+if(NOT NEXWEAVE_GIT_RESULT EQUAL 0 OR NEXWEAVE_GIT_COMMIT STREQUAL "")
+  set(NEXWEAVE_GIT_COMMIT "unknown")
+endif()
 configure_file(cmake/nexweave_version_from_cmake.h.in
   ${NEXWEAVE_GENERATED_DIR}/nexweave_version_from_cmake.h @ONLY)
 
@@ -38,6 +51,7 @@ add_library(nexweave_core_domain STATIC
   core/protocol/control_rpc.cpp
   core/protocol/data_event.cpp
   core/observability/observability.cpp
+  core/observability/run_evidence.cpp
   core/backend/fake_audio.cpp
   core/backend/fake_asr.cpp
   core/backend/fake_rag.cpp
@@ -114,6 +128,8 @@ nexweave_test(session_state_machine tests/unit/session_state_machine_test.cpp un
 nexweave_test(control_rpc tests/unit/control_rpc_test.cpp unit)
 nexweave_test(data_event tests/unit/data_event_test.cpp unit)
 nexweave_test(observability tests/unit/observability_test.cpp unit)
+# 运行证据记录器：用注入的手动时钟验收步数分配、首次出现语义与未测量标注。
+nexweave_test(run_evidence tests/unit/run_evidence_test.cpp unit)
 nexweave_test(fake_audio tests/unit/fake_audio_test.cpp unit)
 nexweave_test(fake_asr tests/unit/fake_asr_test.cpp unit)
 nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
@@ -162,6 +178,15 @@ target_include_directories(nexweave_mock_profile_test PRIVATE
 # 场景包含真实线程交错（会话在监督器工作线程上执行）；等满即说明实现有缺陷，
 # 超时让它在 60 秒内变成明确失败而不是挂起。
 set_tests_properties(mock_profile_integration PROPERTIES TIMEOUT 60)
+# 运行证据：四条进程内路径的场景各跑一次真实 Mock 运行，验收五份产物、里程碑与取消阶段。
+nexweave_test(mock_profile_evidence tests/integration/mock_profile_evidence_test.cpp integration)
+target_sources(nexweave_mock_profile_evidence_test PRIVATE core/profile/mock_profile.cpp)
+target_link_libraries(nexweave_mock_profile_evidence_test PRIVATE nexweave_gateway)
+target_include_directories(nexweave_mock_profile_evidence_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/profile
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/observability)
+# 场景包含真实线程交错（会话在监督器工作线程上执行，取消由设备回调发起）。
+set_tests_properties(mock_profile_evidence_integration PROPERTIES TIMEOUT 60)
 nexweave_test(gateway_entry tests/integration/gateway_entry_test.cpp integration)
 # 入口测试同时需要入口层、会话应用与核心层：它验收的是把真实会话接到外部请求入口之后的
 # 行为，并包含真实线程交错（会话在工作线程上执行而控制请求在调用线程上处理）。

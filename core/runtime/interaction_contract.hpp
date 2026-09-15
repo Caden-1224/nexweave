@@ -61,12 +61,36 @@ enum class ActivityMarker : std::uint8_t {
   kTerminalCancelled
 };
 
+// 活动标记的观察者：夹具每提交一个标记就回调一次，使“阶段在什么时候发生”可以被外部
+// 记录，而不必让夹具自己读时钟。
+//
+// 为什么把时钟留在观察者一侧：夹具的确定性来自“不读时钟、不依赖真实时间”，而运行证据需要
+// 的恰恰是真实时间。把计时责任推给观察者，两条诉求就不会互相妥协：不挂观察者时夹具的行为
+// 与开销与既有实现完全一致；挂上之后，时间戳由观察者用自己的时钟盖章。
+//
+// 回调约定：在提交标记的调用线程上**同步**执行，顺序即提交顺序，同一标记不会回调两次。
+// 一次调用可能提交多个标记（例如取消一次提交五个阶段），此时观察者会连续收到多个回调，
+// 它们属于同一个线性化点。实现必须非阻塞、不抛异常、不得重入夹具，也不得假设回调之间的
+// 时间差就是阶段耗时。
+class IMarkerObserver {
+ public:
+  virtual ~IMarkerObserver() = default;
+
+  // 一个活动标记已经提交。generation 是该标记所属的回答代际，一次取消的各阶段共用它。
+  virtual void on_marker(ActivityMarker marker, std::uint64_t generation) = 0;
+};
+
 // 确定性 fixture 的状态。所有调用串行；每次成功操作追加一个标记，取消后旧 generation
 // 的完成标记被拒绝。terminal 只出现一次，且成功必须等待 generation/synthesis/playback done。
 class InteractionContractFixture final {
  public:
   // 初始状态无 stream、generation 和终态；对象不创建外部资源。
   InteractionContractFixture() = default;
+
+  // 挂接标记观察者（借用指针，可为 nullptr）。观察者必须比本对象活得久；可以在任意时刻
+  // 挂接或摘除，摘除之后不再收到回调。本方法不分配、不阻塞、不读时钟，重复挂接以最后
+  // 一次为准。挂接不改变任何标记的提交条件：观察者只被通知，不能否决策略。
+  void set_marker_observer(IMarkerObserver* observer) noexcept;
 
   // 常驻采集只建立一次 stream；stream_id 非空且不能重复，成功后 sequence 从 0 开始。
   domain::OperationResult start_stream(const std::string& stream_id);
@@ -94,6 +118,10 @@ class InteractionContractFixture final {
   std::uint64_t generation() const noexcept;
 
  private:
+  // 提交一个标记：更新"最后一个标记"、追加到轨迹，并通知观察者。三个动作必须成对发生，
+  // 因此集中在这里；分散写会让"标记进了轨迹却没有通知观察者"这种漏报无法通过阅读发现。
+  void commit(ActivityMarker marker);
+
   std::string stream_id_;
   std::uint64_t next_sequence_ = 0;
   bool stream_started_ = false;
@@ -108,6 +136,8 @@ class InteractionContractFixture final {
   bool terminal_ = false;
   ActivityMarker last_marker_ = ActivityMarker::kGenerationStarted;
   std::vector<ActivityMarker> trace_;
+  // 标记观察者（借用）。为空表示"只记轨迹，不对外通知"，此时提交路径不产生额外分支。
+  IMarkerObserver* marker_observer_ = nullptr;
 };
 
 }  // namespace nexweave::runtime

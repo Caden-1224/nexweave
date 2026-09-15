@@ -16,6 +16,24 @@ class SessionAppOwnerFactory::Owner final : public ISessionOwner {
     app_ = std::make_unique<SessionApp>(factory_.config_, factory_.asr_, factory_.retriever_,
                                         factory_.router_, factory_.tts_, factory_.playback_,
                                         factory_.resident_, factory_.llm_);
+    // 观察者在本构造函数里一次装好：此后 app_ 不再变化，工作线程与 request_stop() 看到
+    // 的是同一个已固定的会话，不会读到尚未挂接完成的观察者。
+    app_->set_generation_observer(factory_.generation_observer_);
+    app_->set_marker_observer(factory_.marker_observer_);
+    // 把「请求取消当前轮次」交给注册过的接收方。捕获 app_ 的裸指针是安全的：入口
+    // 只在工作线程上、由设备回调在会话运行期间调用，而本对象的析构会在会话结束之后
+    // 先把入口清空，因此不会留下指向已析构会话的调用路径。
+    if (factory_.cancel_target_ != nullptr) {
+      factory_.cancel_target_->set_turn_cancel_entry([this]() { app_->cancel_turn(); });
+    }
+  }
+
+  ~Owner() override {
+    // 会话已经结束：先摘掉入口再销毁会话，使设备即使拿到旧入口也打不到已析构的对象。
+    // 顺序不能反过来——那样在两次调用之间会存在一段可被设备回调命中的悬空窗口。
+    if (factory_.cancel_target_ != nullptr) {
+      factory_.cancel_target_->set_turn_cancel_entry(nullptr);
+    }
   }
 
   // 建立：校验应用配置。配置非法时返回 kInvalidInput，使“参数不对”变成一次明确的建立失败，
@@ -68,6 +86,19 @@ SessionAppOwnerFactory::SessionAppOwnerFactory(SessionAppConfig config, capabili
       llm_(llm) {}
 
 SessionAppOwnerFactory::~SessionAppOwnerFactory() = default;
+
+void SessionAppOwnerFactory::set_generation_observer(
+    capability::IGenerationObserver* observer) noexcept {
+  generation_observer_ = observer;
+}
+
+void SessionAppOwnerFactory::set_marker_observer(IMarkerObserver* observer) noexcept {
+  marker_observer_ = observer;
+}
+
+void SessionAppOwnerFactory::set_cancel_target(ISessionCancelTarget* target) noexcept {
+  cancel_target_ = target;
+}
 
 std::shared_ptr<ISessionOwner> SessionAppOwnerFactory::create(const SupervisorSessionSpec& spec,
                                                               domain::Error& error) {

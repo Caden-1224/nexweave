@@ -59,6 +59,7 @@
 #include <vector>
 
 #include "../domain/error.hpp"
+#include "../observability/run_evidence.hpp"
 
 namespace nexweave::app {
 
@@ -90,6 +91,24 @@ bool parse_mock_profile_scenario(std::string_view name, MockProfileScenario& sce
 // 身份完全一致；显式传入 stream_id 时以调用方的值为准。
 const char* mock_profile_scenario_slug(MockProfileScenario scenario) noexcept;
 
+// 运行产物（运行清单、事件流、指标流、协议报文与摘要）的留存策略。
+//
+// 两种取值对应两件不同的事，不能合并成一个“要不要写文件”的布尔：
+//   kTransient：写完即删。它是任务 25 验收“一次运行返回后没有本进程残留”的手段——
+//               只有先真的写出文件再删掉，清理路径才被真正执行过。
+//   kRetained： 写完保留。它是任务 26 验收“运行证据可留档”的手段：证据的价值在于
+//               事后可读，删掉就等于没有证据。
+// 两种策略写同样的产物，区别只在返回之前是否删除它们。数值不参与线协议，但与其他
+// 枚举一样只能往后追加，因为汇总与证据按名称关联历史结果。
+enum class MockProfileArtifactPolicy : std::uint8_t {
+  kTransient = 0,
+  kRetained = 1,
+};
+
+// 产物策略的稳定标识，用于汇总与命令行回显。未知值返回空串（与本项目其他 to_string
+// 重载一致），不抛异常、不分配。
+const char* to_string(MockProfileArtifactPolicy policy) noexcept;
+
 // 一次 Mock profile 运行的配置。全部字段都是显式策略：默认值即“进程内 Fake 组合”，
 // 任何需要真实硬件或网络的组合都不属于本层。
 struct MockProfileConfig {
@@ -98,9 +117,14 @@ struct MockProfileConfig {
   // 串到另一条流上。校验失败返回 kInvalidInput，且不建立任何会话。
   std::string stream_id = "mock-normal";
   // 可选的输出目录。为空表示不写任何文件，只在内存里给出结果（测试与进程内调用用）。
-  // 非空时：目录不存在则创建，运行结束时目录内本次运行产生的文件被删除。目录本身保留，
-  // 因为调用方可能同时持有它。
+  // 非空时：目录不存在则创建，运行结束时按 artifact_policy 决定删除还是保留本次运行
+  // 产生的文件。目录本身始终保留，因为调用方可能同时持有它。
   std::string output_dir;
+  // 产物的留存策略。只在 output_dir 非空时有意义：没有输出目录就没有产物可谈，
+  // 因此“要求保留却又不给目录”是一条配置错误，而不是一次静默的空保留。
+  // 默认 kTransient，保持任务 25 的“返回即无残留”语义不变；需要留档时显式改成
+  // kRetained（命令行用 --evidence-dir）。
+  MockProfileArtifactPolicy artifact_policy = MockProfileArtifactPolicy::kTransient;
 
   // ---- 场景旋钮：把「打断发生在哪一步」从场景定义里拆出来 ----
   //
@@ -184,15 +208,21 @@ struct MockProfileLedger {
   std::uint64_t connections_open = 0;
   // 输出目录里本次运行产生的文件数（未配置输出目录时为 0）。
   std::size_t artifacts_written = 0;
-  // 输出文件是否已经在返回之前全部删除。未配置输出目录时为真（没有可残留的东西）。
+  // 输出文件是否已经在返回之前全部删除。未配置输出目录时为真（没有可残留的东西）；
+  // 采用 kRetained 策略时为假——那不是残留，而是本次运行的交付物。
   bool artifacts_removed = true;
+  // 输出文件是否按 kRetained 策略有意留在输出目录里。它与 artifacts_removed 是互斥的
+  // 两种归宿：同时为真说明账目自相矛盾。
+  bool artifacts_retained = false;
   // 配置阶段是否合法。为假时其余字段描述的是“一次被拒绝的运行”。
   bool config_valid = true;
 
   // 资源是否全部交还。它是本层对“返回即无残留”的唯一判定，供调用方与门禁直接使用。
+  // 产物有两类合法归宿：被删除（没有残留）或被有意保留（交付物）。把两者混成一个
+  // 条件，会让“保留了证据”被报告成“资源没交还”，而那正是本层要区分开的两件事。
   bool quiesced() const noexcept {
     return threads_detached == 0 && threads_joined == threads_created &&
-           connections_open == 0 && artifacts_removed;
+           connections_open == 0 && (artifacts_removed || artifacts_retained);
   }
 };
 
@@ -236,9 +266,36 @@ struct MockProfileResult {
   int exit_code = 0;
 
   // 机器可读的汇总。确定性：字段顺序固定、不含时间戳、不含绝对路径。
+  //
+  // 它与运行证据的分工：汇总描述“这一次运行按契约跑成了什么样”，因此必须逐字节可
+  // 复现（门禁直接比较两次运行的输出）；运行证据里的单调时间是实测值，本来就不可能
+  // 逐字节相同。把实测值塞进汇总，会让确定性门禁与实测记录互相破坏。
   std::string summary_json;
-  // 运行清单。与上面同一份事实，用于关联配置与输入；具体字段的填写责任见文件头注释。
+  // 运行清单：版本、配置、输入、命令与日历时间。与 summary_json 是同一批事实的不同
+  // 投影，用于把一次运行关联回具体的源码状态与配置。
   std::string manifest_json;
+
+  // ---- 运行证据（任务 26）----
+  //
+  // 下面这些字段与输出目录里的产物同源。它们描述的是本次**会话运行**的结论；产物的
+  // 写入与删除属于采集侧，其结果只记在 ledger 与汇总里——证据文件无法记录“自己没能
+  // 被写出来”，把采集侧结论塞进被采集的内容里只会形成循环。
+  //
+  // 里程碑事件流：每行一个可观测层事件 JSON，行尾带换行。
+  std::string events_jsonl;
+  // 指标流：每行一个带量纲的指标 JSON，行尾带换行。
+  std::string metrics_jsonl;
+  // 人类可读摘要（Markdown）：里程碑表、指标表与口径说明。
+  std::string summary_markdown;
+  // 里程碑快照，按提交步数升序。测试直接按它核对因果顺序，不必解析 JSON 文本。
+  std::vector<observability::MilestoneRecord> milestones;
+  // 本次采用产物策略的稳定标识（回显用）。
+  std::string artifact_policy_name;
+  // 指标条数。
+  std::size_t metric_count = 0;
+  // 因果顺序上“播放已经开始，而生成尚未结束”。确定性夹具整轮不到一毫秒，时间差可能
+  // 小于时钟分辨率，因此这条结论由调度步数判定，与主机无关。
+  bool overlap_proven = false;
 };
 
 // 运行一个 Mock profile 场景。
@@ -249,6 +306,10 @@ struct MockProfileResult {
 //
 // 失败语义：不抛出业务异常。可恢复的失败（配置非法、场景形态不符、取消未被受理）以
 // error/mismatch 与 exit_code 表达；只有标准库分配失败会向上传播。
+//
+// 运行证据：返回前已经确定运行结论，并把里程碑事件流、指标流与摘要渲染成文本（见
+// MockProfileResult 的证据字段）。output_dir 非空时它们按 artifact_policy 写入或
+// 写入后删除，写入数记在 ledger.artifacts_written。
 //
 // 阻塞与截止时间：本函数会等待会话收敛与监督器清理，等待上界由监督器配置（默认每个 5 秒）
 // 决定，因此不会无限阻塞。它在等待期间只做有界轮询与连接读取，不睡眠固定时长。

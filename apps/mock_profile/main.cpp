@@ -5,7 +5,8 @@
 // 不做清理判定：这些都在 core/app/mock_profile.* 里，命令行只负责参数与呈现。
 //
 // 为什么输出到 stdout 而不是只写文件：门禁与演示都需要“跑完就能看到结果”。文件是给需要
-// 留档的调用方准备的（--out-dir），因此即使不写文件，这条命令也自带完整证据。
+// 留档的调用方准备的，并且分两种用途：--out-dir 写完即删（验证清理路径确实被执行），
+// --evidence-dir 写完保留（验证证据确实可留档）。
 //
 // 退出码：0 表示本次运行按契约收敛（含取消，以及故障场景按预期失败）；1 表示配置错误、形态
 // 不符、产物未能清理或资源未交还。区分标准是“这一次运行是否按契约完成”，不是“会话是否成功
@@ -22,6 +23,7 @@
 
 namespace {
 
+using nexweave::app::MockProfileArtifactPolicy;
 using nexweave::app::MockProfileConfig;
 using nexweave::app::MockProfileResult;
 using nexweave::app::MockProfileScenario;
@@ -42,8 +44,11 @@ void PrintUsage() {
          "\n"
          "选项：\n"
          "  --stream-id <id>        会话与输入流标识（默认按场景派生）\n"
-         "  --out-dir <dir>         把本次运行的报文、汇总与运行清单写到该目录，\n"
-         "                          运行结束前删除；目录不存在时创建\n"
+         "  --out-dir <dir>         把本次运行的五份产物写到该目录，运行结束前删除：\n"
+         "                          它验证的是“返回后没有本进程残留”；目录不存在时创建\n"
+         "  --evidence-dir <dir>    写同样的五份产物但保留下来作为运行证据：\n"
+         "                          run-manifest.json、events.jsonl、metrics.jsonl、\n"
+         "                          protocol.jsonl、summary.md\n"
          "  --cancel-after-pcm <n>  取消场景：等播放写出第 n 帧之后受理停止；\n"
          "                          0 表示不等输出、立即受理（默认 1）\n"
          "  --drain-budget <n>      慢消费场景：每次最多取走的字节数（默认 8，必须为正）\n"
@@ -78,6 +83,11 @@ struct Options {
   std::string scenario;
   std::string stream_id;
   std::string out_dir;
+  // 产物在运行结束前是否删除。--out-dir 与 --evidence-dir 写的是同样的产物，区别只在
+  // 这一位；两者同时出现会让“这次运行到底想验证清理还是想留档”不可解释，因此按参数
+  // 错误拒绝，而不是让后写的那个悄悄覆盖前一个。
+  bool retain = false;
+  bool dir_given = false;
   // 旋钮的"没写"与"写了 0"必须分开：取消旋钮的 0 是有意义的值（不等输出就喊停），
   // 慢消费的 0 则是非法值。因此这里用一个超出合法范围的哨兵表示"调用方没有指定"，
   // 真正的默认值按场景给出——场景不同，合适的默认值本来也不同。
@@ -118,8 +128,14 @@ ParseOutcome ParseOptions(int argc, char** argv, Options& options) {
     } else if (flag == "--scenario") {
       options.scenario = value();
       take();
-    } else if (flag == "--out-dir") {
+    } else if (flag == "--out-dir" || flag == "--evidence-dir") {
+      if (options.dir_given) {
+        std::cerr << "--out-dir 与 --evidence-dir 只能给一个" << std::endl;
+        return ParseOutcome::kInvalid;
+      }
       options.out_dir = value();
+      options.retain = flag == "--evidence-dir";
+      options.dir_given = true;
       take();
     } else if (flag == "--stream-id") {
       options.stream_id = value();
@@ -176,6 +192,9 @@ int main(int argc, char** argv) {
     return 1;
   }
   config.output_dir = options.out_dir;
+  if (options.retain) {
+    config.artifact_policy = MockProfileArtifactPolicy::kRetained;
+  }
   if (options.stream_id_given) {
     config.stream_id = options.stream_id;
   } else {
@@ -196,6 +215,11 @@ int main(int argc, char** argv) {
     std::cout << "mock_profile: scenario=" << result.scenario_name
               << " stream=" << config.stream_id
               << " exit_code=" << result.exit_code << std::endl;
+    if (config.artifact_policy == MockProfileArtifactPolicy::kRetained) {
+      // 留档运行要能一眼看出证据写到了哪：这条命令的价值就是“跑完就有可读的证据”，
+      // 让调用方自己去猜目录不算交付。
+      std::cout << "evidence_dir: " << config.output_dir << std::endl;
+    }
   }
   if (options.events) {
     for (const std::string& record : result.records) {

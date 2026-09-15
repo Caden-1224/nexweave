@@ -6,3 +6,11 @@
 
 // 由 CMake 生成的完整版本字符串，形如 "0.1.0"。
 #define NEXWEAVE_VERSION_STRING_FROM_CMAKE "@PROJECT_VERSION@"
+
+// 构建时采集的源码提交。运行证据要能回答“这份结论对应哪一版源码”，因此它必须由
+// 构建系统给出，而不是运行时去猜。取不到时（例如从源码压缩包构建）写成 unknown。
+#define NEXWEAVE_BUILD_GIT_COMMIT "@NEXWEAVE_GIT_COMMIT@"
+
+// 构建时使用的 CMake 版本。它是工具链证据的一部分：同一份源码在不同 CMake 版本下
+// 可能得到不同的生成结果，记下它才能判断两次构建是否可比。
+#define NEXWEAVE_BUILD_CMAKE_VERSION "@CMAKE_VERSION@"
