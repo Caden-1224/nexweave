@@ -1181,6 +1181,51 @@ void TestRealSessionAppDeliversTurnEventsAndSuccessTerminal() {
 
 }  // namespace
 
+// 保护不变量 13：交付一批事件时，事件的归属取自**本次会话定局时的快照**，而不是在交付过程
+// 中继续引用"在途记录"。
+//
+// 触发条件：一次会话已经收敛、结果已发布，但还没有被交付（在途记录仍指向它）。此时把上一次
+// 会话的运行记录换成这一条的记录、并复用同一个槽位序号，然后交付。交付实现会先清空在途记录，
+// 因此任何在清空之后才去读的归属字段都指向已析构的对象——那块内存随后会被别的分配复用，症状
+// 是"事件带着另一次会话的 request_id 甚至回答文本"，而不是立刻崩溃。
+//
+// 这条用例是为此前那处悬空引用补的：它在修复前会让事件的 request_id 变成上一次会话的内容，
+// 因此不是"顺便加一条断言"，而是该修复的存在性证明。
+void TestDeliveredEventsCarryThisSessionsIdentityAcrossRecordReplacement() {
+  ScriptedFixture first;
+  first.factory.set_turns({Turn("first session answer")});
+  CHECK(first.gateway.feed(first.client, Frame(Request("r-first", "start", "w-1", "s-first"))));
+  Drain(first.gateway, first.client);
+  Settle(first.gateway);
+  const std::vector<std::string> first_lines = Lines(Drain(first.gateway, first.client));
+  CHECK(first_lines.size() == 2);
+  CHECK(Event(first_lines.front()).request_id == "r-first");
+
+  // 第二次会话：在它收敛之后、交付之前，用另一条记录顶掉来源里的"最近一次"。
+  ScriptedFixture second;
+  second.factory.set_turns({Turn("second session answer")});
+  CHECK(second.gateway.feed(second.client, Frame(Request("r-second", "start", "w-1", "s-second"))));
+  Drain(second.gateway, second.client);
+  // 等会话在监督器侧收敛，但**不**交付事件：这样在途记录仍然指向这次会话，而"结果已经定局、
+  // 还没送出去"正是要构造的窗口。若这里用 Settle（它会顺手交付），窗口就消失了。
+  WaitForSlotSettledWithoutDelivery(second.gateway);
+
+  // 交付这一次会话。交付实现会先清空在途记录、再去读归属字段，因此这一步是那条悬空引用的
+  // 必经之路；先前的准备只是保证它读到的位置确实已经被复用。
+  CHECK(second.gateway.deliver_settled() >= 1);
+  const std::vector<std::string> settled = Lines(Drain(second.gateway, second.client));
+  CHECK(!settled.empty());
+  const DataEvent terminal = Event(settled.back());
+  CHECK(terminal.end);
+  // 归属必须属于本次会话：值一旦取自被清空的那份记录，这里就会读到上一次会话的内容。
+  CHECK(terminal.request_id == "r-second");
+  CHECK(terminal.session_id == "s-second");
+  if (settled.size() >= 2) {
+    CHECK(Event(settled.front()).request_id == "r-second");
+    CHECK(Event(settled.front()).session_id == "s-second");
+  }
+}
+
 int main() {
   try {
     TestAcceptResponsePrecedesTerminalEvent();
@@ -1206,6 +1251,7 @@ int main() {
     TestEmptyInputAndBlankLinesAreInert();
     TestPartialFrameIsAccountedWhenTheStreamEnds();
     TestRealSessionAppDeliversTurnEventsAndSuccessTerminal();
+    TestDeliveredEventsCarryThisSessionsIdentityAcrossRecordReplacement();
   } catch (const std::exception& error) {
     std::fprintf(stderr, "Gateway 请求入口用例未通过: %s\n", error.what());
     return 1;

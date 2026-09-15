@@ -536,25 +536,32 @@ std::size_t Gateway::deliver_settled() {
 
 std::size_t Gateway::emit_session_events(const InFlightSession& session) {
   const runtime::SupervisorStatus snapshot = supervisor_.status();
-  // 先清空在途再交付：投递过程不再依赖它，因此重复交付不会重复发出同一批事件。
+  // 先把本次会话的归属信息**按值**取下来，再清空在途记录。
+  //
+  // 顺序理由：调用方传进来的是 *inflight_ 的引用，而紧接着的一步就是清空 inflight_。
+  // 清空之后那个引用立即悬空——它指向的对象已经析构，其内部的字符串缓冲会被后续分配复用。
+  // 因此必须先复制出要用的字段，再释放原对象；反过来写不会立刻崩溃，只会让交付出去的
+  // request_id / session_id 变成一块已经被复用的内存，症状是"事件莫名其妙编码失败"。
+  // 复制之后本次交付只依赖这份快照，所以"清空在途"仍然保证重复交付不会重复发事件。
+  const InFlightSession delivered = session;
   inflight_.reset();
 
   const std::shared_ptr<const runtime::SessionAppRunRecord> record = run_source_.last_run();
   // 事件归属按会话序号核对。序号不一致说明本次会话还没有发布记录（例如建立阶段就失败了），
   // 此时一条事件都不能发——把上一次会话的文本当成本次输出，正是旧结果污染新会话的来源。
   const bool matches =
-      record != nullptr && record->spec.session_sequence == session.session_sequence;
+      record != nullptr && record->spec.session_sequence == delivered.session_sequence;
 
   std::size_t emitted = 0;
   // 事件序号在**本次会话内**从 1 开始编号，不延续上一次会话：交付顺序即发生顺序，而“第几条”
   // 只在一次会话内才有意义。lambda 直接读取这个计数器，因此不需要再加一个同义的参数。
   std::uint64_t sequence = 0;
   const auto emit = [&](protocol::DataEvent event) {
-    event.request_id = session.request_id;
-    event.session_id = session.session_id;
+    event.request_id = delivered.request_id;
+    event.session_id = delivered.session_id;
     event.generation = kSessionGeneration;
     event.sequence = sequence;
-    return enqueue_event_for(session.owner, event);
+    return enqueue_event_for(delivered.owner, event);
   };
 
   if (matches) {
@@ -581,7 +588,7 @@ std::size_t Gateway::emit_session_events(const InFlightSession& session) {
     }
   }
 
-  const domain::Error terminal = terminal_error(snapshot, session.cancelled_before);
+  const domain::Error terminal = terminal_error(snapshot, delivered.cancelled_before);
   ++sequence;
   protocol::DataEvent final_event;
   if (terminal.ok()) {
@@ -596,7 +603,7 @@ std::size_t Gateway::emit_session_events(const InFlightSession& session) {
   emitted += emit(std::move(final_event));
 
   // 会话已经定局：把这次会话的受理响应标记为已完成，使后续同 id 请求重放它而不是重新执行。
-  const auto started = requests_.find(session.request_id);
+  const auto started = requests_.find(delivered.request_id);
   if (started != requests_.end()) {
     started->second.completed = true;
   }
