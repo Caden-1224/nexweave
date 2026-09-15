@@ -150,6 +150,18 @@ nexweave_test(protocol_boundaries tests/unit/protocol_boundaries_test.cpp unit)
 nexweave_test(ndjson_framer tests/unit/ndjson_framer_test.cpp unit)
 # 解帧是纯值逻辑，但实现位于入口库内，因此测试同时链接入口层，避免出现“只有测试里能用”的副本。
 target_link_libraries(nexweave_ndjson_framer_test PRIVATE nexweave_gateway)
+# profile 层把能力夹具、会话应用、监督器与请求入口组装成"一条命令跑一个场景"。它同时依赖
+# 应用层与请求入口层，因此放在 core/profile 而不是 core/app——否则"应用层不依赖请求入口层"
+# 这条分层约束会被一次文件摆放反过来，后续任何人都可能顺着 include 路径把它变成真依赖。
+nexweave_test(mock_profile tests/integration/mock_profile_test.cpp integration)
+target_sources(nexweave_mock_profile_test PRIVATE core/profile/mock_profile.cpp)
+target_link_libraries(nexweave_mock_profile_test PRIVATE nexweave_gateway)
+target_include_directories(nexweave_mock_profile_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/profile
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/observability)
+# 场景包含真实线程交错（会话在监督器工作线程上执行）；等满即说明实现有缺陷，
+# 超时让它在 60 秒内变成明确失败而不是挂起。
+set_tests_properties(mock_profile_integration PROPERTIES TIMEOUT 60)
 nexweave_test(gateway_entry tests/integration/gateway_entry_test.cpp integration)
 # 入口测试同时需要入口层、会话应用与核心层：它验收的是把真实会话接到外部请求入口之后的
 # 行为，并包含真实线程交错（会话在工作线程上执行而控制请求在调用线程上处理）。
@@ -166,6 +178,18 @@ target_include_directories(nexweave_session_app PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
   ${CMAKE_CURRENT_SOURCE_DIR}/core/observability)
 
+# Mock profile 命令行入口：一条命令跑一个可复现场景，并自带证据与清理账目。
+add_executable(nexweave_mock_profile
+  apps/mock_profile/main.cpp
+  core/profile/mock_profile.cpp)
+target_link_libraries(nexweave_mock_profile PRIVATE
+  nexweave_gateway nexweave_warnings nlohmann_json::nlohmann_json)
+target_include_directories(nexweave_mock_profile PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/profile
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/observability)
+
 # 命令行门禁：验收参数错误、三种输入模式可运行、确定性一致与信号退出。
 # 它只调用已经构建好的可执行文件，不修改源码，也不后台启动进程。
 add_test(NAME session_app_cli
@@ -174,6 +198,13 @@ add_test(NAME session_app_cli
 set_tests_properties(session_app_cli PROPERTIES LABELS "gate" TIMEOUT 60)
 
 # 门禁测试只在构建目录创建独立夹具，源码从不被改动；失败也以 trap 清理临时资源。
+# Mock profile 门禁：验收四个场景可显式选择、退出码语义、产物无残留与无硬件依赖。
+# 它只调用已经构建好的可执行文件，不修改源码，也不后台启动进程。
+add_test(NAME mock_profile_cli
+  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/gate/mock_profile_cli_test.sh
+          $<TARGET_FILE:nexweave_mock_profile>)
+set_tests_properties(mock_profile_cli PROPERTIES LABELS "gate" TIMEOUT 60)
+
 add_test(NAME gate_scripts_failure COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/gate/gate_test.sh)
 add_test(NAME gate_rebuild COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/gate/rebuild_test.sh
   ${CMAKE_CURRENT_BINARY_DIR})
