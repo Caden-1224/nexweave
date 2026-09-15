@@ -1,0 +1,11 @@
+# 校准集：用于确定 BM25 阈值，不用于最终验收结论。
+{"query":"停止播放","expected_level":"l0","note":"精确控制词优先于检索"}
+{"query":"音频合同的采样率和帧长是什么","expected_level":"l1","note":"高重叠事实问题，走直答"}
+{"query":"取消后旧代际数据怎么处理","expected_level":"l1","note":"高重叠取消语义问题，走直答"}
+{"query":"RAG 路由分为哪几层","expected_level":"l1","note":"高重叠分级问题，走直答"}
+{"query":"Gateway 负责什么","expected_level":"l2","note":"中等重叠，携带上下文"}
+{"query":"后端适配器做什么","expected_level":"l2","note":"中等重叠，携带上下文"}
+{"query":"Fake 后端用在哪里","expected_level":"l2","note":"中等重叠，携带上下文"}
+{"query":"今天天气怎么样","expected_level":"l3","note":"低分噪声，不注入知识"}
+{"query":"讲个笑话","expected_level":"l3","note":"低分噪声，不注入知识"}
+{"query":"帮我写一首诗","expected_level":"l3","note":"低分噪声，不注入知识"}

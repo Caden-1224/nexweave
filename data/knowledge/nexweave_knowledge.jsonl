@@ -1,0 +1,13 @@
+# NexWeave 本地离线知识库 v1。每行一个 JSON 对象，字段 id 与 text 都必填且非空。
+{"id":"nx-audio","text":"NexWeave 音频合同使用 16 kHz 单声道 S16_LE，每帧 20 毫秒共 320 个采样"}
+{"id":"nx-cancel","text":"取消或重新开始会递增 generation，旧代际的迟到 token 和 PCM 必须被丢弃"}
+{"id":"nx-supervisor","text":"Supervisor 在单台设备上只管理一个活跃会话，槽位在清理完成后才释放"}
+{"id":"nx-rag","text":"RAG 路由分为 L0 到 L3 四层，L0 是控制意图，L1 是直接回答，L2 携带检索上下文，L3 是普通对话"}
+{"id":"nx-gateway","text":"Gateway 接收外部控制请求，负责字节流分帧、请求幂等和有界事件交付"}
+{"id":"nx-backend","text":"后端适配器把模型或设备能力转换为 NexWeave 统一契约，核心模块不依赖厂商 SDK"}
+{"id":"nx-fake","text":"Fake 后端只用于确定性回归，不访问网络、声卡或模型运行时"}
+{"id":"nx-resident","text":"常驻采集跨多轮存在，回答结束或取消不会关闭它，只有输入结束或显式停止才终止"}
+{"id":"nx-interrupt","text":"设备播报期间出现新的用户语音会作废旧回答尚未播出的输出，并保留新语音的开头"}
+{"id":"nx-evidence","text":"运行证据把命令、配置、输入、环境和提交关联起来，使一次运行可以复现和审查"}
+{"id":"nx-mock","text":"Mock profile 用确定性后端跑正常、慢消费、取消和故障四类场景"}
+{"id":"nx-audio-sink","text":"音频汇收到合法完整帧后即可复用输入，取消只丢弃尚未播放的排队数据"}

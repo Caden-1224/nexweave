@@ -1,0 +1,11 @@
+# 验收集：与校准集问句不同，用于确认阈值没有只记住校准问句。
+{"query":"取消","expected_level":"l0","note":"精确控制词"}
+{"query":"设备播报时新语音怎么办","expected_level":"l1","note":"高重叠事实问题，走直答"}
+{"query":"Mock profile 有哪些场景","expected_level":"l1","note":"高重叠事实问题，走直答"}
+{"query":"槽位什么时候释放","expected_level":"l1","note":"高重叠事实问题，走直答"}
+{"query":"常驻采集是什么","expected_level":"l2","note":"中等重叠，携带上下文"}
+{"query":"Gateway 的职责","expected_level":"l2","note":"中等重叠，携带上下文"}
+{"query":"Fake 后端做什么","expected_level":"l2","note":"中等重叠，携带上下文"}
+{"query":"取消后旧数据怎么处理","expected_level":"l2","note":"含控制词但不精确匹配，按知识检索并携带上下文"}
+{"query":"你好","expected_level":"l3","note":"无命中，普通对话"}
+{"query":"今天天气怎么样","expected_level":"l3","note":"低分噪声，不注入知识"}

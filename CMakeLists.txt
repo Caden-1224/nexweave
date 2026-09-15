@@ -55,6 +55,7 @@ add_library(nexweave_core_domain STATIC
   core/backend/fake_audio.cpp
   core/backend/fake_asr.cpp
   core/backend/fake_rag.cpp
+  core/backend/bm25_rag.cpp
   core/backend/fake_llm.cpp
   core/backend/fake_tts.cpp
   core/runtime/interaction_contract.cpp
@@ -133,11 +134,16 @@ nexweave_test(run_evidence tests/unit/run_evidence_test.cpp unit)
 nexweave_test(fake_audio tests/unit/fake_audio_test.cpp unit)
 nexweave_test(fake_asr tests/unit/fake_asr_test.cpp unit)
 nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
+nexweave_test(bm25_rag tests/unit/bm25_rag_test.cpp unit)
 nexweave_test(fake_llm tests/unit/fake_llm_test.cpp unit)
 nexweave_test(fake_tts tests/unit/fake_tts_test.cpp unit)
 nexweave_test(playback_clock tests/unit/playback_clock_test.cpp unit)
 nexweave_test(interaction_contract tests/unit/interaction_contract_test.cpp unit)
 nexweave_test(session_l0_l1 tests/integration/session_l0_l1_test.cpp integration)
+# 真实检索路由校准确认：加载固定知识库与校准/验收集，阈值和上下文预算都来自显式配置。
+nexweave_test(rag_calibration tests/integration/rag_routing_calibration_test.cpp integration)
+target_compile_definitions(nexweave_rag_calibration_test PRIVATE
+  NEXWEAVE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 nexweave_test(session_l2_l3 tests/integration/session_l2_l3_test.cpp integration)
 nexweave_test(session_cancel tests/integration/session_cancel_test.cpp integration)
 nexweave_test(speech_segmentation tests/unit/speech_segmentation_test.cpp unit)

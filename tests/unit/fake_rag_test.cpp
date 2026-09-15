@@ -103,8 +103,61 @@ void TestEqualScoresBreakTiesByLexicographicId() {
   CHECK((*limited.value)[1].id == "m");
 }
 
+
+// 保护不变量：路由器只把能完整装入显式上下文预算的命中交给 L2；一条都装不下时改走
+// L3 且不携带命中，不能把空上下文或越界上下文交给模型。L0 使用可配置的精确控制词，
+// 包含控制词的完整知识问题不会被误判为控制意图。
+void TestConfigurableControlAndContextBudget() {
+  backend::FakeRag rag({{"long", "query plus a lot of bytes", 0.6},
+                        {"short", "query ok", 0.6}});
+
+  backend::FakeRagRouter::Config fitting;
+  fitting.direct_answer_threshold = 0.9;
+  fitting.context_threshold = 0.5;
+  fitting.top_k = 2;
+  fitting.max_context_bytes = 10;
+  fitting.l0_keywords = {"halt"};
+  backend::FakeRagRouter fitting_router(rag, fitting);
+  const auto fitted = fitting_router.route("query");
+  CHECK(fitted.ok());
+  CHECK(fitted.value->level == backend::RagRouteLevel::kL2);
+  CHECK(fitted.value->hits.size() == 1);
+  CHECK(fitted.value->hits.front().id == "short");
+  CHECK(fitted.value->hits.front().text.size() <= fitting.max_context_bytes);
+  CHECK(fitting_router.route("halt").value->level == backend::RagRouteLevel::kL0);
+  CHECK(fitting_router.route("取消后旧数据怎么处理").value->level !=
+        backend::RagRouteLevel::kL0);
+
+  backend::FakeRagRouter::Config too_small = fitting;
+  too_small.max_context_bytes = 1;
+  backend::FakeRagRouter too_small_router(rag, too_small);
+  const auto no_context = too_small_router.route("query");
+  CHECK(no_context.ok());
+  CHECK(no_context.value->level == backend::RagRouteLevel::kL3);
+  CHECK(no_context.value->hits.empty());
+  CHECK(no_context.value->reason.find("context byte budget") != std::string::npos);
+
+  bool invalid_budget = false;
+  try {
+    backend::FakeRagRouter invalid(rag, backend::FakeRagRouter::Config{0.9, 0.5, 1, 0});
+  } catch (const std::invalid_argument&) {
+    invalid_budget = true;
+  }
+  CHECK(invalid_budget);
+
+  bool invalid_keyword = false;
+  try {
+    backend::FakeRagRouter invalid(rag,
+                                   backend::FakeRagRouter::Config{0.9, 0.5, 1, 8, {"  "}});
+  } catch (const std::invalid_argument&) {
+    invalid_keyword = true;
+  }
+  CHECK(invalid_keyword);
+}
+
 int main() {
   TestRetrievalAndThresholdRoutes();
   TestEqualScoresBreakTiesByLexicographicId();
   TestFailuresBoundariesAndReplay();
+  TestConfigurableControlAndContextBudget();
 }

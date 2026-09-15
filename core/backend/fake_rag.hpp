@@ -1,6 +1,8 @@
-// 确定性 Fake RAG（Retrieval-Augmented Generation，检索增强生成）及 L0-L3 路由。
-// 只拥有内存夹具，不创建线程、文件、socket 或模型句柄；用于 WSL/Mock 回归。
-// 分数是夹具排序量，不是概率；真实知识库和校准由后续适配器负责。
+// 确定性 RAG（Retrieval-Augmented Generation，检索增强生成）夹具与 L0-L3 路由。
+//
+// FakeRag 只拥有内存排序量，不读知识库文件；Bm25Rag 等真实 IRag 后端通过相同接口接入。
+// 路由对后端没有“Fake”假设：它只解释 IRag 返回的分值和顺序，因此 Session 不需要知道
+// 检索来自固定夹具还是本地词项索引。
 #pragma once
 
 #include <cstddef>
@@ -22,6 +24,7 @@ enum class RagRouteLevel {
 
 // 路由结果拥有检索文本副本和解释字段。L0 的 control_action 非空，L1 的
 // direct_answer 使用首个命中；L2/L3 由上层决定是否把 hits 交给 LLM。
+// hits 的顺序就是后端决定的证据顺序；路由只会在 L2 按上下文预算裁剪它，不重排。
 struct RagRouteDecision {
   RagRouteLevel level = RagRouteLevel::kL3;
   std::vector<capability::RetrievedChunk> hits;
@@ -55,6 +58,15 @@ class FakeRagRouter final {
     double context_threshold = 0.50;
     // 必须 >0；每次 route 传给 IRag，避免无限制返回夹具。
     std::size_t top_k = 3;
+    // L2 注入 LLM 的命中文本 UTF-8 字节预算，必须 >0。预算只统计 hit.text，不包含
+    // 上层提示词版式；路由器按分数顺序装入能完整容纳的命中，装不下就不把该条交给模型，
+    // 从而避免空上下文或越界上下文。该值必须与知识库和阈值一起校准。
+    std::size_t max_context_bytes = 2048;
+    // L0 控制词。规范化后的 query 必须与规范化后的控制词完全相等才触发，避免
+    // “取消后旧数据怎么处理”这类包含控制词但属于知识问题的查询被误判为控制意图。
+    // 每个控制词规范化后不得为空。
+    std::vector<std::string> l0_keywords = {"停止", "停止播放", "取消",
+                                            "stop", "cancel", "quit"};
   };
 
   // 使用默认阈值构造；retriever 生命周期由调用方保证，异常只来自对象构造失败。
