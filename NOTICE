@@ -14,8 +14,18 @@ nlohmann-json（JSON for Modern C++）
 当前验证包的完整版权/许可证清单位于 third_party/nlohmann-json/debian-copyright。
 发布含该依赖的二进制或复制其代码时，应随发行材料保留相应声明；升级依赖时同步核对。
 
+ZeroMQ（libzmq）与 cppzmq
+用途：控制面 REQ/REP 传输适配器。
+来源：https://github.com/zeromq/libzmq、https://github.com/zeromq/cppzmq
+构建要求：libzmq3-dev；本次验证使用 Ubuntu 包 4.3.4-2，其中 zmq.h 为 4.3.4，
+zmq.hpp（cppzmq）为 4.8.1。
+许可证：libzmq 为 LGPL-3.0+ 并带特别例外；cppzmq 为 MIT。
+本仓库不捆绑其动态库或头文件，由系统包解析依赖。
+当前验证包的完整版权/许可证清单位于 third_party/libzmq/debian-copyright。
+发布含该依赖的二进制或复制其代码时，应随发行材料保留相应声明；升级依赖时同步核对。
+
 发布边界
 --------
 后续引入的通信、模型、音频设备适配器及传递依赖，应登记具体版本、来源、用途和许可证，
-保留其原始声明。尚未接入的 ZeroMQ、ALSA、RKNN、RKLLM、sherpa-onnx、MeloTTS
+保留其原始声明。尚未接入的 ALSA、RKNN、RKLLM、sherpa-onnx、MeloTTS
 不属于当前已验证依赖。不提交模型、厂商 SDK、动态库、凭据或现场原始录音。

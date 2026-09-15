@@ -33,7 +33,7 @@ NexWeave 面向华为昇腾 AI 计算平台、鲲鹏处理器平台、瑞芯微 
 | WSL / 通用 Linux 开发环境 | 构建核心模块和执行确定性测试 | 已验证当前开发配置 |
 | 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | 硬件适配尚未完成 |
 
-> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期，以及进程内 Gateway 的控制请求入口与有界发送。真实网络传输、真实模型和板端语音交互尚未交付。
+> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期，以及进程内 Gateway 的控制请求入口与有界发送、ZeroMQ REQ/REP 控制传输。真实数据面传输、真实模型和板端语音交互尚未交付。
 
 <a id="background"></a>
 
@@ -102,7 +102,7 @@ flowchart TB
 | 控制面 | 创建、查询、取消、退出及受理响应 | 版本化 JSON RPC、ZeroMQ 适配 | deadline、幂等、结构化错误，推理期间仍可响应 |
 | 数据面 | 输入音频、识别文本、token、PCM 和结束事件 | JSON 元数据 + 二进制 PCM multipart | 流归属、顺序、长度、有界缓冲与关闭语义 |
 
-当前已实现消息与事件的基础编解码、校验和值语义，以及进程内 Gateway 的 NDJSON 分帧与控制请求入口：半包、粘包、超长消息、断连取消和慢客户端关闭都已按上表约定实现；真实 TCP、ZeroMQ 传输与二进制 PCM 下行尚未实现。具体 socket 模式应服务于控制响应和流式行为，不将某种同步收发方式固定为所有后端的执行方式。
+当前已实现消息与事件的基础编解码、校验和值语义，进程内 Gateway 的 NDJSON 分帧与控制请求入口，以及 ZeroMQ REQ/REP 控制传输适配：半包、粘包、超长消息、断连取消和慢客户端关闭都已按上表约定实现；真实 TCP、ZeroMQ 数据面与二进制 PCM 下行尚未实现。具体 socket 模式应服务于控制响应和流式行为，不将某种同步收发方式固定为所有后端的执行方式。
 
 ### 标识与结果归属
 
@@ -232,11 +232,11 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | Session 语音路径 | 已实现基础版 | L0/L1 音频到识别与直答；L2/L3 走 LLM 并按句流式合成，首段播放早于生成结束；端到端取消已实现（旧结果不再提交） |
 | 常驻音频输入与语音分段 | 已实现基础版 | 跨轮次保持的单一输入拥有者、确定性活动脚本、前置缓冲与容量上限、播报期间新语音打断旧回答；真实 VAD、跨进程取消待后续任务 |
 | 进程内 Supervisor 生命周期 | 已实现基础版 | 设备级单活跃会话、忙碌拒绝、取消受理与清理完成的分别报告、清理未完成时槽位不可复用；子进程生命周期待后续任务 |
-| 进程内 Gateway 请求入口 | 已实现基础版 | NDJSON 分帧、四类控制操作、受理响应与执行终态分离、请求幂等、有界发送与慢客户端关闭、断连取消策略；真实 TCP/ZeroMQ 传输、PCM 逐帧下行与端到端背压待后续任务 |
+| 进程内 Gateway 请求入口 | 已实现基础版 | NDJSON 分帧、四类控制操作、受理响应与执行终态分离、请求幂等、有界发送与慢客户端关闭、断连取消策略；真实 TCP 传输、PCM 逐帧下行与端到端背压待后续任务 |
 | Mock profile 确定性入口 | 已实现 | 单进程组装工厂、监督器与请求入口，四个可显式选择的场景（正常、慢消费、取消、故障）、固定输入逐字节可复现、退出码语义、运行结束清理自证 |
 | Mock 运行证据 | 已实现 | 一次运行产生五份产物（run-manifest.json、events.jsonl、metrics.jsonl、protocol.jsonl、summary.md）；单调时间族与调度步数族分开标注，未测量项如实标注；`--evidence-dir` 留档，`--out-dir` 仍验证“返回即无残留” |
-| Gateway 传输与 ZeroMQ | 规划中 | 真实 socket 接入、增量传输、背压和子进程生命周期 |
-| 本地知识库与真实检索 | 规划中 | 知识数据加载、词项检索和路由校准 |
+| Gateway 传输与 ZeroMQ | 控制面已实现基础版 | ZeroMQ REQ/REP 控制传输、请求 deadline、幂等与结构化响应；数据面增量传输、背压和子进程生命周期待后续任务 |
+| 本地知识库与真实检索 | 已实现基础版 | 固定 JSONL 知识库、BM25 词项检索、L0-L3 阈值与上下文字节预算校准；板端真实知识库部署待后续任务 |
 | RK3576 模型与音频前端 | 规划中 | RKNN、RKLLM、MeloTTS、ALSA、AEC 和 VAD |
 | 板端故障与稳定性验证 | 待前置能力完成 | 真实闭环、打断、恢复和资源实验 |
 
@@ -248,7 +248,7 @@ Session 的 L0/L1 路径同样只编排注入的确定性能力：它把输入�
 
 Supervisor 回答的是设备级问题，而不是某一轮怎么处理：现在能不能再开会话、用户喊停之后有没有停干净、上一次会话留下的资源能不能给下一次用。它持有唯一的活跃槽位，把会话的建立、执行与清理交给一个拥有者，并且只有在拥有者确认资源已交还之后才把槽位放出去——清理失败或等待超时的槽位会永久标记为不可用，而不是“再试一次也许就好了”。占用期间的新建请求返回可重试的忙碌错误，不排队也不替换；语音打断走会话内部的代际切换，不通过并发创建实现。取消的受理与清理的完成是两个独立事实：受理只保证旧结果不再提交，不代表设备已经安静。进程内拥有者把单进程会话应用接到这条接缝上；多进程的子进程生命周期属于后续任务。
 
-Gateway 是外部客户端与设备运行时之间唯一的一层：它接收按行分隔的 JSON 控制请求，把创建、查询、取消和退出路由到 Supervisor，并把会话结果转成数据面事件。字节流与消息不是一回事，因此分帧单独成层——半包留在缓冲里、粘包按行拆开、没有换行的超长输入在超过声明上限时被丢弃并在下一个换行处重新同步，缓冲因此不会随连接的存活时间增长。受理与终态在这里也是两件事：创建请求的响应只说明“会话被受理了”，这一次会话最终成功、失败还是被取消由随后 `end=true` 的终态事件回答；取消响应报告的是受理与清理快照，而不是“设备已经静默”。发送方向同样有界：控制响应与数据事件各有一条有界队列，控制响应优先取走，任一队列达到上限即关闭连接并记录原因，而不是静默丢弃已经产生的输出。无法归属到请求的非法输入没有可寻址的答复对象，因此记录原因并关闭连接；能取出合法 request_id 的非法输入得到结构化错误且连接保持可用。连接断开只取消它自己发起的那次会话，终态没有接收者时计入丢弃账目。真实 socket、PCM 逐帧下行与端到端背压属于后续传输任务。
+Gateway 是外部客户端与设备运行时之间唯一的一层：它接收按行分隔的 JSON 控制请求，把创建、查询、取消和退出路由到 Supervisor，并把会话结果转成数据面事件。字节流与消息不是一回事，因此分帧单独成层——半包留在缓冲里、粘包按行拆开、没有换行的超长输入在超过声明上限时被丢弃并在下一个换行处重新同步，缓冲因此不会随连接的存活时间增长。受理与终态在这里也是两件事：创建请求的响应只说明“会话被受理了”，这一次会话最终成功、失败还是被取消由随后 `end=true` 的终态事件回答；取消响应报告的是受理与清理快照，而不是“设备已经静默”。发送方向同样有界：控制响应与数据事件各有一条有界队列，控制响应优先取走，任一队列达到上限即关闭连接并记录原因，而不是静默丢弃已经产生的输出。无法归属到请求的非法输入没有可寻址的答复对象，因此记录原因并关闭连接；能取出合法 request_id 的非法输入得到结构化错误且连接保持可用。连接断开只取消它自己发起的那次会话，终态没有接收者时计入丢弃账目。ZeroMQ 控制传输已把这条请求入口接到真实 socket；PCM 逐帧下行、数据面传输与端到端背压属于后续传输任务。
 
 Mock profile 把上面四层组装成一条可复现的命令：`nexweave_mock_profile --scenario <名字>`。场景决定形态，旋钮决定时序，两者分开之后同一条不变量可以在不同打断点上回归。四个场景各守一类收敛方式：正常路径要按发生顺序交付事件并最终成功；慢消费要由**有界发送缓冲**触发连接关闭，而不是让缓冲随输出增长；取消要打断一个**确实在途**的会话，退出码仍为 0 而终态明确是取消；故障要证明输入不可用时以明确错误收敛、清理照常完成。确定性不靠“跑得巧”：场景里没有时钟、没有睡眠、没有随机数；取消用一道闸门把“会话正在执行”从时序巧合变成确定状态，闸门在提交创建**之前**布置，等待期间同时驱动请求入口。运行结束前释放全部线程、连接与产物，并由账目自证（创建的线程数等于已回收数、仍打开的连接数为 0、产物已删除）。退出码回答的是“这条命令有没有按本次验收目标跑完”，因此取消与预期内的故障都是 0；会话成没成由事件流里的终态回答——把两者压进同一个数字，就无法区分“按预期失败”和“根本没跑起来”。
 
@@ -256,11 +256,11 @@ Mock profile 把上面四层组装成一条可复现的命令：`nexweave_mock_p
 
 ## 快速开始
 
-推荐 Ubuntu 22.04 或 WSL Ubuntu 22.04。当前构建需要 C++17 编译器、CMake ≥ 3.16、Make、Bash 和 nlohmann-json ≥ 3.10，无需模型、NPU SDK 或声卡。
+推荐 Ubuntu 22.04 或 WSL Ubuntu 22.04。当前构建需要 C++17 编译器、CMake ≥ 3.16、Make、Bash、nlohmann-json ≥ 3.10 和 libzmq3-dev，无需模型、NPU SDK 或声卡。
 
 ```bash
 sudo apt update
-sudo apt install -y git build-essential cmake nlohmann-json3-dev
+sudo apt install -y git build-essential cmake nlohmann-json3-dev libzmq3-dev
 
 git clone https://github.com/Caden-1224/nexweave.git
 cd nexweave
@@ -268,7 +268,7 @@ cd nexweave
 ./scripts/test.sh
 ```
 
-测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件、单进程应用 `nexweave_session_app` 与 Mock profile 入口 `nexweave_mock_profile`。两个命令行门禁分别覆盖：参数错误与三种输入模式、确定性一致与信号退出（`session_app_cli`）；四个场景的退出码与关键字段、重复运行逐字节一致、产物清空与不链接硬件库（`mock_profile_cli`）。真实传输与板端入口尚未交付。
+测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件、单进程应用 `nexweave_session_app`、Mock profile 入口 `nexweave_mock_profile` 与 ZeroMQ 控制传输集成测试。两个命令行门禁分别覆盖：参数错误与三种输入模式、确定性一致与信号退出（`session_app_cli`）；四个场景的退出码与关键字段、重复运行逐字节一致、产物清空与不链接硬件库（`mock_profile_cli`）。数据面真实传输与板端入口尚未交付。
 
 跑一次 Mock profile：
 
@@ -299,7 +299,7 @@ ctest --test-dir build/strict --output-on-failure
 ctest --test-dir build/strict -L contract --output-on-failure
 ```
 
-`BUILD_DIR` 和 `BUILD_TYPE` 同时适用于构建与测试脚本。自定义依赖安装可通过 `nlohmann_json_DIR` 或 `CMAKE_PREFIX_PATH` 指定；缺失依赖时 CMake 会报告安装提示。
+`BUILD_DIR` 和 `BUILD_TYPE` 同时适用于构建与测试脚本。自定义依赖安装可通过 `nlohmann_json_DIR`、`CMAKE_PREFIX_PATH` 或 ZeroMQ 的 `NEXWEAVE_ZMQ_INCLUDE_DIR`、`NEXWEAVE_CPPZMQ_INCLUDE_DIR`、`NEXWEAVE_ZMQ_LIBRARY` 指定；缺失依赖时 CMake 会报告安装提示。
 
 </details>
 
@@ -359,7 +359,7 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 |---|---|---|
 | 语言与构建 | C++17、CMake、CTest、Bash | 同一构建基础扩展硬件目标 |
 | 消息与记录 | nlohmann-json、领域值与校验 | 网络事件传输和完整采集链路 |
-| 通信 | 控制/数据协议基础 | TCP/NDJSON、ZeroMQ |
+| 通信 | 控制协议基础、ZeroMQ REQ/REP 控制适配 | TCP/NDJSON、ZeroMQ 数据面 |
 | 推理 | Fake ASR 与能力接口 | RKNN Zipformer、RKLLM、MeloTTS |
 | 音频 | 固定格式帧、Fake 输入输出 | ALSA、WebRTC AEC/降噪、Silero VAD |
 
@@ -372,8 +372,9 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 | [core/runtime](https://github.com/Caden-1224/nexweave/tree/main/core/runtime) | 会话监督器与单活跃槽位、Session 状态迁移与代际检查、L0-L3 会话编排与流式分句、交互契约扩展、常驻音频输入与语音分段 |
 | [core/protocol](https://github.com/Caden-1224/nexweave/tree/main/core/protocol) | 控制消息、数据事件与序列化校验 |
 | [core/gateway](https://github.com/Caden-1224/nexweave/tree/main/core/gateway) | NDJSON 增量分帧、控制请求路由、幂等记录与有界发送 |
+| [core/transport](https://github.com/Caden-1224/nexweave/tree/main/core/transport) | ZeroMQ REQ/REP 控制传输、socket/线程生命周期、deadline 与客户端重连 |
 | [core/profile](https://github.com/Caden-1224/nexweave/tree/main/core/profile) | Mock profile 组装、四个确定性场景、运行账目与产物留档 |
-| [core/backend](https://github.com/Caden-1224/nexweave/tree/main/core/backend) | Fake 音频、Fake 流式 ASR、Fake RAG、Fake LLM 与 Fake TTS |
+| [core/backend](https://github.com/Caden-1224/nexweave/tree/main/core/backend) | Fake 音频、Fake 流式 ASR、Fake RAG、Fake LLM、Fake TTS 与 BM25 本地知识库检索 |
 | [core/observability](https://github.com/Caden-1224/nexweave/tree/main/core/observability) | 运行清单、事件与指标的值对象与编解码，以及把它们从一次运行里采集出来的证据记录器 |
 | [tests](https://github.com/Caden-1224/nexweave/tree/main/tests) | 单元、契约及构建门禁测试 |
 | [scripts](https://github.com/Caden-1224/nexweave/tree/main/scripts) | 构建与测试入口 |

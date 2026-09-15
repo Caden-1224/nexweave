@@ -19,6 +19,20 @@ if(NOT nlohmann_json_FOUND)
 endif()
 find_package(Threads REQUIRED)
 
+# ZeroMQ 控制传输依赖：libzmq3-dev 提供 zmq.h/zmq.hpp 与动态库，但发行版没有稳定 CMake
+# config 或 pkg-config 文件，因此在配置阶段直接探测头与库，并在缺失时给出安装命令。
+find_path(NEXWEAVE_ZMQ_INCLUDE_DIR NAMES zmq.h)
+find_path(NEXWEAVE_CPPZMQ_INCLUDE_DIR NAMES zmq.hpp)
+find_library(NEXWEAVE_ZMQ_LIBRARY NAMES zmq)
+if(NOT NEXWEAVE_ZMQ_INCLUDE_DIR OR NOT NEXWEAVE_CPPZMQ_INCLUDE_DIR OR
+   NOT NEXWEAVE_ZMQ_LIBRARY)
+  message(FATAL_ERROR
+    "缺少 ZeroMQ 开发文件（需要 zmq.h、zmq.hpp 与 libzmq）。"
+    "Ubuntu/Debian: sudo apt install libzmq3-dev；"
+    "自定义安装请设置 NEXWEAVE_ZMQ_INCLUDE_DIR、NEXWEAVE_CPPZMQ_INCLUDE_DIR "
+    "或 NEXWEAVE_ZMQ_LIBRARY。")
+endif()
+
 add_library(nexweave_warnings INTERFACE)
 target_compile_options(nexweave_warnings INTERFACE
   -Wall -Wextra -Wpedantic
@@ -104,6 +118,23 @@ target_include_directories(nexweave_gateway PUBLIC
 target_link_libraries(nexweave_gateway
   PUBLIC nexweave_app
   PRIVATE nexweave_warnings nlohmann_json::nlohmann_json
+)
+
+# 控制传输适配器：把进程内 Gateway 接到 ZeroMQ REQ/REP 控制面。Context/socket 类型只在实现
+# 文件里出现，公共头文件只暴露 NexWeave 值对象，避免传输细节进入 Session。
+add_library(nexweave_transport STATIC
+  core/transport/zmq_control.cpp
+)
+target_include_directories(nexweave_transport PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/transport
+)
+target_include_directories(nexweave_transport PRIVATE
+  ${NEXWEAVE_ZMQ_INCLUDE_DIR}
+  ${NEXWEAVE_CPPZMQ_INCLUDE_DIR}
+)
+target_link_libraries(nexweave_transport
+  PUBLIC nexweave_gateway
+  PRIVATE nexweave_warnings ${NEXWEAVE_ZMQ_LIBRARY}
 )
 
 enable_testing()
@@ -199,6 +230,12 @@ nexweave_test(gateway_entry tests/integration/gateway_entry_test.cpp integration
 target_link_libraries(nexweave_gateway_entry_test PRIVATE nexweave_gateway)
 # 闸门不放行或事件交付漏唤醒会表现为挂起，超时让它在 60 秒内变成明确失败。
 set_tests_properties(gateway_entry_integration PROPERTIES TIMEOUT 60)
+
+# ZeroMQ 控制面集成测试：真实 socket、真实 Gateway 与阻塞会话夹具共同验证长执行期间的
+# 控制可达性、幂等和启停清理。
+nexweave_test(zmq_control tests/integration/zmq_control_test.cpp integration)
+target_link_libraries(nexweave_zmq_control_test PRIVATE nexweave_transport)
+set_tests_properties(zmq_control_integration PROPERTIES TIMEOUT 60)
 
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。
 add_executable(nexweave_session_app apps/session_app/main.cpp)
