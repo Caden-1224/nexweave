@@ -78,6 +78,8 @@ add_library(nexweave_core_domain STATIC
   core/runtime/speech_segmentation.cpp
   core/runtime/resident_audio_input.cpp
   core/runtime/supervisor.cpp
+  core/runtime/child_process.cpp
+  core/runtime/child_process_owner.cpp
 )
 target_include_directories(nexweave_core_domain PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
@@ -139,6 +141,12 @@ target_link_libraries(nexweave_transport
   PRIVATE nexweave_warnings ${NEXWEAVE_ZMQ_LIBRARY}
 )
 
+# 子进程生命周期测试夹具：它只调用 notify_parent_ready() 并等待信号，供集成测试观察
+# 启动就绪、SIGTERM/SIGKILL 升级和退出归档。它不进入产品安装目标。
+add_executable(nexweave_child_process_helper tests/support/child_process_helper.cpp)
+target_link_libraries(nexweave_child_process_helper PRIVATE
+  nexweave_core_domain nexweave_warnings)
+
 enable_testing()
 # 所有测试通过同一配置入口注册，新增目标不会漏掉警告门禁。
 function(nexweave_test name source label)
@@ -199,6 +207,17 @@ target_include_directories(nexweave_supervisor_session_app_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/core/app)
 set_tests_properties(supervisor_session_app_integration PROPERTIES TIMEOUT 60)
 nexweave_test(supervisor_lifecycle tests/integration/supervisor_lifecycle_test.cpp integration)
+nexweave_test(child_process_contract tests/unit/child_process_contract_test.cpp unit)
+nexweave_test(child_process_lifecycle tests/integration/child_process_lifecycle_test.cpp integration)
+target_compile_definitions(nexweave_child_process_lifecycle_test PRIVATE
+  NEXWEAVE_CHILD_PROCESS_HELPER="$<TARGET_FILE:nexweave_child_process_helper>")
+# 测试包含真实 fork/exec、信号和 waitpid；超时让夹具挂起变成明确失败。
+set_tests_properties(child_process_lifecycle_integration PROPERTIES TIMEOUT 60)
+nexweave_test(child_process_owner tests/integration/child_process_owner_test.cpp integration)
+target_compile_definitions(nexweave_child_process_owner_test PRIVATE
+  NEXWEAVE_CHILD_PROCESS_HELPER="$<TARGET_FILE:nexweave_child_process_helper>")
+# 拥有者测试包含真实 Supervisor 工作线程、子进程和信号升级，超时用于暴露挂起。
+set_tests_properties(child_process_owner_integration PROPERTIES TIMEOUT 60)
 # 该目标包含真实线程交错：闸门不放行会表现为挂起，超时让它在 60 秒内变成明确失败。
 set_tests_properties(supervisor_lifecycle_integration PROPERTIES TIMEOUT 60)
 nexweave_test(protocol_boundaries tests/unit/protocol_boundaries_test.cpp unit)
