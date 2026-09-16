@@ -19,37 +19,32 @@ domain::OperationResult ZmqControlRoute::connect() {
     return domain::OperationResult::failure(domain::ErrorCode::kInvalidInput,
                                             "控制路由端点不能为空");
   }
-  if (client_ != nullptr && client_->connected()) {
-    return domain::OperationResult::success();
-  }
-  client_ = std::make_unique<ZmqControlClient>(endpoint_, config_);
-  const domain::OperationResult connected = client_->connect();
-  if (!connected.ok()) {
-    client_.reset();
-    return connected;
-  }
+  connected_.store(true);
   return domain::OperationResult::success();
 }
 
 void ZmqControlRoute::close() noexcept {
-  if (client_ != nullptr) {
-    client_->close();
-    client_.reset();
-  }
+  connected_.store(false);
 }
 
 bool ZmqControlRoute::connected() const noexcept {
-  return client_ != nullptr && client_->connected();
+  return connected_.load();
 }
 
 domain::Result<protocol::ControlResponse> ZmqControlRoute::call(
     const protocol::ControlRequest& request) {
-  if (client_ == nullptr || !client_->connected()) {
+  if (!connected()) {
     return domain::Result<protocol::ControlResponse>::failure(
         domain::ErrorCode::kBackendFailure, "控制路由尚未连接");
   }
   try {
-    return client_->call(request);
+    ZmqControlClient client(endpoint_, config_);
+    const domain::OperationResult opened = client.connect();
+    if (!opened.ok()) {
+      return domain::Result<protocol::ControlResponse>::failure(
+          opened.error.code, opened.error.message);
+    }
+    return client.call(request);
   } catch (const std::exception& error) {
     return domain::Result<protocol::ControlResponse>::failure(
         domain::ErrorCode::kBackendFailure,

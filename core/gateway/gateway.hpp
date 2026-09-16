@@ -113,12 +113,17 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 #include "../app/session_app_owner.hpp"
 #include "../domain/error.hpp"
@@ -171,6 +176,10 @@ struct GatewayConfig {
   // 路由模式下单次 poll_events() 最多取回的数据事件数。它限制一次外部驱动循环的工作量，
   // 防止远端一次积压大量事件时把本地单线程入口长时间占住；必须为正。
   std::size_t max_routed_events_per_poll = 64;
+  // 路由模式下的转发工作线程数。每条控制请求在独立工作线程上调用 IControlRoute，因此一个
+  // 慢转发不会阻塞同一入口的其他控制操作；必须为正。工作线程共享同一个路由对象，因此
+  // IControlRoute::call() 必须允许并发调用。
+  std::size_t max_route_workers = 4;
   // cancel 的等待清理预算默认值。0 表示只受理、不等待：取消响应只报告受理与快照，
   // 清理完成由终态事件回答。取值非负；请求自带的 deadline 会进一步收紧它。
   std::chrono::milliseconds cancel_wait_budget{0};
@@ -388,6 +397,23 @@ class Gateway final {
   // 路由模式下取回远端数据事件并投入连接队列；终态事件会关闭本次在途会话。
   std::size_t deliver_routed_events();
 
+  // 路由模式的线程池：提交、回收和分发。
+  struct RouteTask {
+    ConnectionId owner = kInvalidConnectionId;
+    protocol::ControlRequest request;
+  };
+  struct RouteCompletion {
+    ConnectionId owner = kInvalidConnectionId;
+    protocol::ControlRequest request;
+    domain::Result<protocol::ControlResponse> result;
+  };
+  void StartRouteWorkers();
+  void StopRouteWorkers() noexcept;
+  domain::OperationResult SubmitRouteTask(ConnectionId owner,
+                                          const protocol::ControlRequest& request);
+  void DrainRouteCompletions();
+  void HandleRouteCompletion(RouteCompletion completion);
+
   // 标记一条连接已关闭并记录原因（已关闭时保留首个原因），并把解帧器里尚未成帧的尾部字节
   // 计入账目。它不回收记录，也不触发取消策略：那条策略属于“对端断开”，由 close_connection()
   // 判定。
@@ -407,6 +433,13 @@ class Gateway final {
   runtime::ISessionRunSource* run_source_ = nullptr;
   IControlRoute* route_ = nullptr;
   GatewayConfig config_;
+  std::vector<std::thread> route_workers_;
+  std::mutex route_mutex_;
+  std::condition_variable route_condition_;
+  std::deque<RouteTask> route_tasks_;
+  std::deque<RouteCompletion> route_completions_;
+  bool route_stopping_ = false;
+  domain::Error route_worker_error_{};
   std::map<std::string, RequestRecord> requests_;
   std::map<ConnectionId, Connection> connections_;
   ConnectionId next_connection_id_ = 1;

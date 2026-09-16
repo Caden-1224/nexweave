@@ -234,7 +234,7 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | 进程内 Supervisor 生命周期 | 已实现基础版 | 设备级单活跃会话、忙碌拒绝、取消受理与清理完成的分别报告、清理未完成时槽位不可复用 |
 | 子进程生命周期 | 已实现基础版 | 显式就绪通知、SIGTERM/SIGKILL 有界停止升级、正常退出/信号退出/强杀原因归档、身份不复用与旧身份迟到操作拒绝；跨进程 Session 与统一背压待后续任务 |
 | 进程内 Gateway 请求入口 | 已实现基础版 | NDJSON 分帧、四类控制操作、受理响应与执行终态分离、请求幂等、有界发送与慢客户端关闭、断连取消策略；真实 TCP 传输与端到端背压待后续任务 |
-| 多进程 Gateway 控制路由 | 已实现基础版 | 复用同一套 NDJSON/ControlRequest/ControlResponse 与幂等语义，经 ZeroMQ 转发到独立进程中的 Gateway+Supervisor；推理阻塞时查询/取消仍可达，远端不可用返回结构化错误；数据事件回流随多进程 Session 适配接入 |
+| 多进程 Gateway 控制路由 | 已实现基础版 | 复用同一套 NDJSON/ControlRequest/ControlResponse 与幂等语义，经有界工作线程池异步转发到独立进程中的 Gateway+Supervisor；慢转发与推理阻塞时其他控制操作仍可推进，远端不可用返回结构化错误；数据事件回流随多进程 Session 适配接入 |
 | Mock profile 确定性入口 | 已实现 | 单进程组装工厂、监督器与请求入口，四个可显式选择的场景（正常、慢消费、取消、故障）、固定输入逐字节可复现、退出码语义、运行结束清理自证 |
 | Mock 运行证据 | 已实现 | 一次运行产生五份产物（run-manifest.json、events.jsonl、metrics.jsonl、protocol.jsonl、summary.md）；单调时间族与调度步数族分开标注，未测量项如实标注；`--evidence-dir` 留档，`--out-dir` 仍验证“返回即无残留” |
 | Gateway 传输与 ZeroMQ | 控制面与数据面适配已实现基础版 | ZeroMQ REQ/REP 控制传输、deadline 与幂等；PAIR multipart 输入音频/输出事件、二元长度与顺序校验；统一背压和 Linux 多进程链路待后续任务 |

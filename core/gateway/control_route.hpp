@@ -20,9 +20,11 @@
 //
 // 线程与所有权
 // ------------
-// 实现必须允许 `Gateway` 的驱动线程串行调用。`call()` 允许阻塞，但阻塞时间必须受请求自带
-// deadline 与实现配置共同约束；`poll_events()` 必须是非阻塞快照。实现不拥有 Gateway 的
-// 连接、队列或请求记录，返回的响应与事件都是调用方拥有的值对象。
+// `Gateway` 的路由模式用有界工作线程池调用 `call()`，使一个慢转发不会阻塞同一入口的其他
+// 控制操作；因此实现必须允许 `call()` 被多个工作线程并发调用。`call()` 允许阻塞，但阻塞
+// 时间必须受请求自带 deadline 与实现配置共同约束。`poll_events()` 仍由 Gateway 的驱动线程
+// 串行调用，必须是非阻塞快照。实现不拥有 Gateway 的连接、队列或请求记录，返回的响应与事件
+// 都是调用方拥有的值对象。
 #pragma once
 
 #include <cstddef>
@@ -56,6 +58,7 @@ class IControlRoute {
 
   // 执行一次控制请求。返回成功表示远端返回了合法 ControlResponse；返回失败表示本次转发
   // 没有取得可交付响应。request_id 必须原样保留在响应的归属中。
+  // 本方法必须支持多个工作线程并发调用；实现不得依赖单一 socket 的串行状态。
   virtual domain::Result<protocol::ControlResponse> call(
       const protocol::ControlRequest& request) = 0;
 

@@ -90,15 +90,50 @@ domain::Result<protocol::ControlResponse> Exchange(gateway::Gateway& entry,
   std::string frame = *encoded.value;
   frame.push_back('\n');
   // feed() 的返回值只表示连接之后是否仍打开；携带 exit 的请求会先处理再关闭，因此不能把
-  // false 当成“没有响应”。flush() 才是“还有没有答复可取”的判据。
+  // false 当成“没有响应”。路由模式是异步转发：在请求 deadline 内反复 flush，由 flush
+  // 驱动完成队列落地，直到取到一条响应或者预算耗尽。
   (void)entry.feed(connection, frame);
+  const std::chrono::milliseconds budget =
+      request.deadline > 10ms ? request.deadline : 10ms;
+  const auto deadline = std::chrono::steady_clock::now() + budget + 200ms;
   std::string response_bytes;
-  entry.flush(connection, response_bytes, 64U * 1024U);
+  while (std::chrono::steady_clock::now() < deadline) {
+    response_bytes.clear();
+    entry.flush(connection, response_bytes, 64U * 1024U);
+    if (!response_bytes.empty()) {
+      break;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
   const std::size_t newline = response_bytes.find('\n');
   if (newline != std::string::npos) {
     response_bytes.resize(newline);
   }
   return protocol::decode_response(response_bytes);
+}
+
+void FeedRequest(gateway::Gateway& entry, gateway::ConnectionId connection,
+                 const protocol::ControlRequest& request) {
+  const auto encoded = protocol::encode_request(request);
+  CHECK(encoded.ok());
+  std::string frame = *encoded.value;
+  frame.push_back('\n');
+  (void)entry.feed(connection, frame);
+}
+
+std::string CollectResponse(gateway::Gateway& entry, gateway::ConnectionId connection,
+                            std::chrono::milliseconds budget) {
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::string bytes;
+    entry.flush(connection, bytes, 64U * 1024U);
+    if (!bytes.empty()) {
+      const std::size_t newline = bytes.find('\n');
+      return newline == std::string::npos ? bytes : bytes.substr(0, newline);
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  return std::string();
 }
 
 std::string FactValue(const std::string& message, const std::string& key) {
@@ -182,7 +217,7 @@ void TestRemoteControlRouteEndToEnd() {
   const gateway::ConnectionId after_exit = entry_after_exit.open_connection();
   CHECK(after_exit != gateway::kInvalidConnectionId);
   const auto unavailable =
-      Exchange(entry_after_exit, after_exit, MakeRequest("r-after-exit", "query", {}, {}, 200ms));
+      Exchange(entry_after_exit, after_exit, MakeRequest("r-after-exit", "query", {}, {}, 500ms));
   CHECK(unavailable.ok());
   CHECK(!unavailable.value->result.ok());
   CHECK(unavailable.value->result.error.code == domain::ErrorCode::kTimeout ||
@@ -197,7 +232,7 @@ void TestUnavailableEndpointReturnsStructuredError() {
   gateway::Gateway entry(route);
   const gateway::ConnectionId connection = entry.open_connection();
   const auto response =
-      Exchange(entry, connection, MakeRequest("r-unavailable", "query", {}, {}, 150ms));
+      Exchange(entry, connection, MakeRequest("r-unavailable", "query", {}, {}, 500ms));
   CHECK(response.ok());
   CHECK(!response.value->result.ok());
   CHECK(response.value->result.error.code == domain::ErrorCode::kTimeout ||
@@ -247,6 +282,57 @@ class FakeEventRoute final : public gateway::IControlRoute {
   bool emitted_ = false;
 };
 
+// 慢转发测试路由：start 故意占用一个工作线程，query 立即可返回。如果 Gateway 仍同步调用
+// 路由，后续 query 会被 start 的 300 ms 阻塞并在 150 ms 预算内超时。
+class SlowRoute final : public gateway::IControlRoute {
+ public:
+  domain::Result<protocol::ControlResponse> call(
+      const protocol::ControlRequest& request) override {
+    if (request.operation == "start") {
+      std::this_thread::sleep_for(500ms);
+    }
+    protocol::ControlResponse response;
+    response.request_id = request.request_id;
+    response.result = domain::OperationResult::success();
+    response.result.error.message =
+        request.operation == "start" ? "work_id=w-1 session_id=s-1 session_sequence=1"
+                                     : "state=idle";
+    return domain::Result<protocol::ControlResponse>::success(std::move(response));
+  }
+
+  std::size_t poll_events(gateway::ControlRouteOwner owner,
+                          std::vector<protocol::DataEvent>& out,
+                          std::size_t max_events) override {
+    (void)owner;
+    (void)out;
+    (void)max_events;
+    return 0;
+  }
+};
+
+void TestSlowForwardDoesNotBlockOtherControls() {
+  SlowRoute route;
+  gateway::GatewayConfig config;
+  config.max_route_workers = 4;
+  gateway::Gateway entry(route, config);
+  const gateway::ConnectionId slow_connection = entry.open_connection();
+  const gateway::ConnectionId fast_connection = entry.open_connection();
+  CHECK(slow_connection != gateway::kInvalidConnectionId);
+  CHECK(fast_connection != gateway::kInvalidConnectionId);
+
+  FeedRequest(entry, slow_connection, MakeRequest("r-slow-start", "start", "w-1", "s-1", 1000ms));
+  const auto query = Exchange(entry, fast_connection,
+                              MakeRequest("r-fast-query", "query", {}, {}, 150ms));
+  CHECK(query.ok());
+  CHECK(query.value->result.ok());
+  CHECK(FactValue(query.value->result.error.message, "state") == "idle");
+
+  const std::string slow_response = CollectResponse(entry, slow_connection, 1000ms);
+  const auto started = protocol::decode_response(slow_response);
+  CHECK(started.ok());
+  CHECK(started.value->result.ok());
+}
+
 void TestRouteModePreservesEventQueue() {
   FakeEventRoute route;
   gateway::Gateway entry(route);
@@ -284,6 +370,7 @@ void TestRouteModePreservesEventQueue() {
 int main() {
   TestRemoteControlRouteEndToEnd();
   TestUnavailableEndpointReturnsStructuredError();
+  TestSlowForwardDoesNotBlockOtherControls();
   TestRouteModePreservesEventQueue();
   return 0;
 }

@@ -155,7 +155,8 @@ const char* to_string(GatewayCloseReason reason) noexcept {
 domain::OperationResult validate_gateway_config(const GatewayConfig& config) {
   if (config.max_connections == 0 || config.max_frame_bytes == 0 ||
       config.max_pending_control_bytes == 0 || config.max_pending_data_bytes == 0 ||
-      config.max_idempotency_records == 0 || config.max_routed_events_per_poll == 0) {
+      config.max_idempotency_records == 0 || config.max_routed_events_per_poll == 0 ||
+      config.max_route_workers == 0) {
     // 容量为 0 不是“不限制”，而是“一条都放不下”：它会让每条连接在第一次发送时就被判定为
     // 慢客户端。拒绝这种配置而不是替调用方猜意图。
     return OperationResult::failure(ErrorCode::kInvalidInput, "入口容量字段必须为正");
@@ -181,9 +182,12 @@ Gateway::Gateway(IControlRoute& route, GatewayConfig config)
   if (!validate_gateway_config(config_).ok()) {
     config_ = GatewayConfig{};
   }
+  StartRouteWorkers();
 }
 
-Gateway::~Gateway() = default;
+Gateway::~Gateway() {
+  StopRouteWorkers();
+}
 
 Gateway::Connection* Gateway::find_connection(ConnectionId id) {
   const auto found = connections_.find(id);
@@ -278,8 +282,7 @@ void Gateway::close_connection(ConnectionId id, GatewayCloseReason reason) {
       cancel.deadline = config_.cancel_wait_budget > std::chrono::milliseconds::zero()
                             ? config_.cancel_wait_budget
                             : std::chrono::milliseconds{1};
-      const auto routed = route_->call(cancel);
-      if (routed.ok()) {
+      if (SubmitRouteTask(id, cancel).ok()) {
         ++totals_.disconnects_cancelling_session;
       }
     } else {
@@ -325,6 +328,11 @@ bool Gateway::feed(ConnectionId id, std::string_view bytes) {
 }
 
 std::size_t Gateway::flush(ConnectionId id, std::string& out, std::size_t budget) {
+  if (route_ != nullptr) {
+    // 异步路由的完成事件必须先落到本地连接队列；这个入口本来就被外部循环周期调用，
+    // 因此无需额外线程触碰 Gateway 的连接表与待发队列。
+    DrainRouteCompletions();
+  }
   Connection* connection = find_connection(id);
   if (connection == nullptr || budget == 0) {
     return 0;
@@ -577,63 +585,214 @@ void Gateway::execute_exit(Connection& connection, const protocol::ControlReques
   }
 }
 
-void Gateway::execute_routed(Connection& connection, const protocol::ControlRequest& request,
-                            RequestRecord& record) {
-  if (request.operation == "start") {
-    // 与本地模式一致：新会话不能顶掉上一轮尚未交付的事件。先让路由把已到达事件排空，
-    // 终态事件会在这里把上一轮的 request 记录定局。
-    (void)deliver_routed_events();
+void Gateway::StartRouteWorkers() {
+  if (route_ == nullptr) {
+    return;
   }
-  const domain::Result<protocol::ControlResponse> routed = route_->call(request);
-  if (!routed.ok()) {
+  route_stopping_ = false;
+  try {
+    for (std::size_t index = 0; index < config_.max_route_workers; ++index) {
+      route_workers_.emplace_back([this] {
+        while (true) {
+          RouteTask task;
+          {
+            std::unique_lock<std::mutex> lock(route_mutex_);
+            route_condition_.wait(lock, [this] {
+              return route_stopping_ || !route_tasks_.empty();
+            });
+            if (route_stopping_ && route_tasks_.empty()) {
+              return;
+            }
+            task = std::move(route_tasks_.front());
+            route_tasks_.pop_front();
+          }
+
+          domain::Result<protocol::ControlResponse> result = route_->call(task.request);
+          {
+            const std::lock_guard<std::mutex> lock(route_mutex_);
+            RouteCompletion completion;
+            completion.owner = task.owner;
+            completion.request = std::move(task.request);
+            completion.result = std::move(result);
+            route_completions_.push_back(std::move(completion));
+          }
+          route_condition_.notify_all();
+        }
+      });
+    }
+  } catch (const std::exception& error) {
+    route_worker_error_ = OperationResult::failure(
+                              ErrorCode::kBackendFailure,
+                              std::string("启动路由工作线程失败: ") + error.what())
+                              .error;
+    StopRouteWorkers();
+  }
+}
+
+void Gateway::StopRouteWorkers() noexcept {
+  {
+    const std::lock_guard<std::mutex> lock(route_mutex_);
+    route_stopping_ = true;
+  }
+  route_condition_.notify_all();
+  for (std::thread& worker : route_workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  route_workers_.clear();
+}
+
+domain::OperationResult Gateway::SubmitRouteTask(
+    ConnectionId owner, const protocol::ControlRequest& request) {
+  if (route_ == nullptr) {
+    return OperationResult::failure(ErrorCode::kBackendFailure, "控制路由未配置");
+  }
+  {
+    const std::lock_guard<std::mutex> lock(route_mutex_);
+    if (!route_worker_error_.ok()) {
+      return OperationResult{route_worker_error_};
+    }
+    if (route_stopping_ || route_workers_.empty()) {
+      return OperationResult::failure(ErrorCode::kBackendFailure,
+                                      "控制路由工作线程不可用");
+    }
+    RouteTask task;
+    task.owner = owner;
+    task.request = request;
+    route_tasks_.push_back(std::move(task));
+  }
+  route_condition_.notify_one();
+  return OperationResult::success();
+}
+
+void Gateway::DrainRouteCompletions() {
+  if (route_ == nullptr) {
+    return;
+  }
+  std::deque<RouteCompletion> completions;
+  {
+    const std::lock_guard<std::mutex> lock(route_mutex_);
+    completions.swap(route_completions_);
+  }
+  while (!completions.empty()) {
+    HandleRouteCompletion(std::move(completions.front()));
+    completions.pop_front();
+  }
+}
+
+void Gateway::HandleRouteCompletion(RouteCompletion completion) {
+  const auto record_iterator = requests_.find(completion.request.request_id);
+  if (record_iterator == requests_.end()) {
+    // 断连取消等内部请求没有本地幂等记录；它们的响应无人认领，直接丢弃。
+    return;
+  }
+  RequestRecord& record = record_iterator->second;
+  Connection* connection = find_connection(completion.owner);
+
+  if (!completion.result.ok()) {
     ++totals_.requests_rejected;
-    const auto response = make_response(
-        request.request_id, OperationResult::failure(routed.error.code, routed.error.message));
     record.completed = true;
-    record.response = response;
-    enqueue_control(connection, response);
+    record.response = make_response(
+        completion.request.request_id,
+        OperationResult::failure(completion.result.error.code,
+                                 completion.result.error.message));
+    if (connection != nullptr) {
+      enqueue_control(*connection, record.response);
+    }
     return;
   }
 
-  const protocol::ControlResponse response = *routed.value;
-  if (request.operation == "start") {
+  const protocol::ControlResponse response = *completion.result.value;
+  if (completion.request.operation == "start") {
     if (!response.result.ok()) {
-      // 传输成功但远端明确拒绝创建：没有会话进入执行，记录当场定局。
       ++totals_.requests_rejected;
       record.response = response;
       record.completed = true;
-      enqueue_control(connection, response);
+      if (connection != nullptr) {
+        enqueue_control(*connection, response);
+      }
       return;
     }
-    // start 已受理但远端会话可能仍在执行：本记录保持 completed=false，等待远端事件里的
-    // end=true 终态把它定局。重复请求在终态到达前会得到 kAlreadyCompleted，与进程内一致。
+    if (connection == nullptr || !connection->ledger.open) {
+      // 发起连接在 start 完成前已断开：没有接收者，也没有本地在途记录可归属。
+      // 本地记录当场定局，避免同一 request_id 永远停在执行中；同时尽力发出一次
+      // 异步取消，让已经受理的远端会话知道输出已无接收者。取消响应无人认领，
+      // DrainRouteCompletions 会按“没有本地记录”丢弃。
+      const std::string work_id = completion.request.work_id.empty()
+                                      ? fact_value(response.result.error.message, "work_id")
+                                      : completion.request.work_id;
+      if (!work_id.empty()) {
+        protocol::ControlRequest cancel;
+        cancel.request_id = "disconnect-post-" + completion.request.request_id;
+        cancel.operation = "cancel";
+        cancel.work_id = work_id;
+        cancel.session_id = completion.request.session_id;
+        cancel.deadline = config_.cancel_wait_budget > std::chrono::milliseconds::zero()
+                              ? config_.cancel_wait_budget
+                              : std::chrono::milliseconds{1};
+        (void)SubmitRouteTask(kInvalidConnectionId, cancel);
+      }
+      record.response = response;
+      record.completed = true;
+      return;
+    }
     InFlightSession session;
-    session.owner = connection.id;
-    session.work_id = request.work_id.empty()
+    session.owner = completion.owner;
+    session.work_id = completion.request.work_id.empty()
                           ? fact_value(response.result.error.message, "work_id")
-                          : request.work_id;
-    session.session_id = request.session_id.empty()
+                          : completion.request.work_id;
+    session.session_id = completion.request.session_id.empty()
                              ? fact_value(response.result.error.message, "session_id")
-                             : request.session_id;
-    session.request_id = request.request_id;
+                             : completion.request.session_id;
+    session.request_id = completion.request.request_id;
     inflight_ = std::move(session);
     ++totals_.requests_accepted;
     record.response = response;
     record.completed = false;
-    enqueue_control(connection, response);
+    enqueue_control(*connection, response);
     return;
   }
 
-  ++totals_.requests_accepted;
+  if (response.result.ok()) {
+    ++totals_.requests_accepted;
+  } else {
+    ++totals_.requests_rejected;
+  }
   record.response = response;
   record.completed = true;
-  enqueue_control(connection, response);
-  if (request.operation == "exit" && response.result.ok()) {
+  if (connection != nullptr) {
+    enqueue_control(*connection, response);
+  }
+  if (completion.request.operation == "exit" && response.result.ok()) {
     closed_ = true;
     for (auto& entry : connections_) {
       mark_closed(entry.second, GatewayCloseReason::kExited);
     }
   }
+}
+
+void Gateway::execute_routed(Connection& connection, const protocol::ControlRequest& request,
+                            RequestRecord& record) {
+  if (request.operation == "start") {
+    // 与本地模式一致：新会话不能顶掉上一轮尚未交付的事件。先让路由把已完成响应和已到达
+    // 事件排空，终态事件会在这里把上一轮的 request 记录定局。
+    (void)deliver_settled();
+  }
+
+  const domain::OperationResult submitted = SubmitRouteTask(connection.id, request);
+  if (!submitted.ok()) {
+    ++totals_.requests_rejected;
+    record.completed = true;
+    record.response = make_response(
+        request.request_id,
+        OperationResult::failure(submitted.error.code, submitted.error.message));
+    enqueue_control(connection, record.response);
+    return;
+  }
+  // 请求已进入异步转发队列。完成前 record.completed 保持为假，重复 request_id 因此得到
+  // kAlreadyCompleted；完成到达后由 HandleRouteCompletion 统一写回响应和终态。
+  record.completed = false;
 }
 
 std::size_t Gateway::deliver_routed_events() {
@@ -675,6 +834,7 @@ std::size_t Gateway::deliver_routed_events() {
 
 std::size_t Gateway::deliver_settled() {
   if (route_ != nullptr) {
+    DrainRouteCompletions();
     return deliver_routed_events();
   }
   if (!inflight_.has_value()) {
