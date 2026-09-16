@@ -39,6 +39,23 @@ std::string flag(bool value) {
   return value ? "1" : "0";
 }
 
+// 从本入口自己产生的事实行里取一个键。它只服务路由模式：外部 ControlResponse 没有结构化
+// 状态载荷，远端 Gateway 也以同样的 key=value 事实行回答，因此本地入口需要在回填在途身份
+// 时读取这几个已约定的键。找不到返回空串，不猜测。
+std::string fact_value(const std::string& message, const std::string& key) {
+  const std::string needle = key + "=";
+  const std::size_t begin = message.find(needle);
+  if (begin == std::string::npos) {
+    return std::string();
+  }
+  const std::size_t value_begin = begin + needle.size();
+  const std::size_t value_end = message.find(' ', value_begin);
+  if (value_end == std::string::npos) {
+    return message.substr(value_begin);
+  }
+  return message.substr(value_begin, value_end - value_begin);
+}
+
 OperationResult ok_with_fact_line(std::string message) {
   // 刻意把事实行放进 message：v1 的 ControlResponse 没有状态载荷字段。这是对既有契约的迁就，
   // 不是把 message 当通用数据通道——事实行的语法在头文件里作为契约写明，且只出现在本入口
@@ -138,7 +155,7 @@ const char* to_string(GatewayCloseReason reason) noexcept {
 domain::OperationResult validate_gateway_config(const GatewayConfig& config) {
   if (config.max_connections == 0 || config.max_frame_bytes == 0 ||
       config.max_pending_control_bytes == 0 || config.max_pending_data_bytes == 0 ||
-      config.max_idempotency_records == 0) {
+      config.max_idempotency_records == 0 || config.max_routed_events_per_poll == 0) {
     // 容量为 0 不是“不限制”，而是“一条都放不下”：它会让每条连接在第一次发送时就被判定为
     // 慢客户端。拒绝这种配置而不是替调用方猜意图。
     return OperationResult::failure(ErrorCode::kInvalidInput, "入口容量字段必须为正");
@@ -151,9 +168,16 @@ domain::OperationResult validate_gateway_config(const GatewayConfig& config) {
 
 Gateway::Gateway(runtime::Supervisor& supervisor, runtime::ISessionRunSource& run_source,
                  GatewayConfig config)
-    : supervisor_(supervisor), run_source_(run_source), config_(config) {
+    : supervisor_(&supervisor), run_source_(&run_source), config_(config) {
   // 与监督器配置同一约定：构造不抛业务异常，非法配置整份回退到默认值。希望把配置错误当
   // 错误处理的调用方应先调用 validate_gateway_config()。
+  if (!validate_gateway_config(config_).ok()) {
+    config_ = GatewayConfig{};
+  }
+}
+
+Gateway::Gateway(IControlRoute& route, GatewayConfig config)
+    : route_(&route), config_(config) {
   if (!validate_gateway_config(config_).ok()) {
     config_ = GatewayConfig{};
   }
@@ -245,10 +269,25 @@ void Gateway::close_connection(ConnectionId id, GatewayCloseReason reason) {
       inflight_->owner == id) {
     // 断连即受理取消：这次会话的输出已经没有接收者，继续跑下去只会占用设备唯一的槽位。
     // 只受理、不等待——断开是传输层的事件，不该阻塞在清理上；清理结果仍由监督器回答。
-    const auto outcome =
-        supervisor_.cancel(inflight_->session_sequence, config_.cancel_wait_budget);
-    if (outcome.accepted) {
-      ++totals_.disconnects_cancelling_session;
+    if (route_ != nullptr) {
+      protocol::ControlRequest cancel;
+      cancel.request_id = "disconnect-" + std::to_string(id);
+      cancel.operation = "cancel";
+      cancel.work_id = inflight_->work_id;
+      cancel.session_id = inflight_->session_id;
+      cancel.deadline = config_.cancel_wait_budget > std::chrono::milliseconds::zero()
+                            ? config_.cancel_wait_budget
+                            : std::chrono::milliseconds{1};
+      const auto routed = route_->call(cancel);
+      if (routed.ok()) {
+        ++totals_.disconnects_cancelling_session;
+      }
+    } else {
+      const auto outcome =
+          supervisor_->cancel(inflight_->session_sequence, config_.cancel_wait_budget);
+      if (outcome.accepted) {
+        ++totals_.disconnects_cancelling_session;
+      }
     }
     // 会话照常收敛，但不再有投递目标；终态因此计入“没有接收者”的账目。
     inflight_->owner = kInvalidConnectionId;
@@ -388,6 +427,10 @@ void Gateway::handle_request(Connection& connection, const protocol::ControlRequ
 
 void Gateway::execute_start(Connection& connection, const protocol::ControlRequest& request,
                             RequestRecord& record) {
+  if (route_ != nullptr) {
+    execute_routed(connection, request, record);
+    return;
+  }
   // 先把上一次会话还没交付的结果交付掉。上一次会话必须在槽位空闲时才可能被新的创建取代，
   // 而“空闲”只说明它已经收敛、不说明它的终态已经送出去；直接覆盖在途记录会丢掉那批事件，
   // 并让那一次创建永远停在“执行中”——它的重试会一直得到 kAlreadyCompleted。
@@ -395,13 +438,13 @@ void Gateway::execute_start(Connection& connection, const protocol::ControlReque
 
   // 取消计数基线必须在 start() 之前取：会话可能在 start() 返回之后立刻收敛，晚取的基线会
   // 把这次会话自己的取消算进“之前”。
-  const std::uint64_t cancelled_before = supervisor_.status().sessions_cancelled;
+  const std::uint64_t cancelled_before = supervisor_->status().sessions_cancelled;
 
   runtime::SupervisorSessionSpec spec;
   spec.work_id = request.work_id;
   spec.session_id = request.session_id;
   spec.request_id = request.request_id;
-  const auto outcome = supervisor_.start(spec);
+  const auto outcome = supervisor_->start(spec);
   if (!outcome.ok()) {
     // 忙碌、已退出、槽位不可用、建立超时与拥有者的原始错误都在这里如实回给客户端。
     // 失败没有启动任何会话，因此这条请求当场定局。
@@ -414,7 +457,7 @@ void Gateway::execute_start(Connection& connection, const protocol::ControlReque
     return;
   }
 
-  const runtime::SupervisorStatus snapshot = supervisor_.status();
+  const runtime::SupervisorStatus snapshot = supervisor_->status();
   InFlightSession session;
   session.owner = connection.id;
   session.session_sequence = snapshot.session_sequence;
@@ -439,7 +482,11 @@ void Gateway::execute_start(Connection& connection, const protocol::ControlReque
 
 void Gateway::execute_query(Connection& connection, const protocol::ControlRequest& request,
                             RequestRecord& record) {
-  const runtime::SupervisorStatus snapshot = supervisor_.status();
+  if (route_ != nullptr) {
+    execute_routed(connection, request, record);
+    return;
+  }
+  const runtime::SupervisorStatus snapshot = supervisor_->status();
   const auto response = make_response(
       request.request_id,
       ok_with_fact_line(facts({{"state", runtime::to_string(snapshot.state)},
@@ -455,7 +502,11 @@ void Gateway::execute_query(Connection& connection, const protocol::ControlReque
 
 void Gateway::execute_cancel(Connection& connection, const protocol::ControlRequest& request,
                              RequestRecord& record) {
-  const runtime::SupervisorStatus snapshot = supervisor_.status();
+  if (route_ != nullptr) {
+    execute_routed(connection, request, record);
+    return;
+  }
+  const runtime::SupervisorStatus snapshot = supervisor_->status();
   if (!request.work_id.empty() && request.work_id != snapshot.work_id) {
     // 取消带上了目标身份时，身份不符就明确拒绝：一次针对旧会话的迟到取消不该打到当前
     // 会话上，这比“尽力而为地取消点什么”安全得多。
@@ -473,7 +524,7 @@ void Gateway::execute_cancel(Connection& connection, const protocol::ControlRequ
   // 请求自带的 deadline 收紧配置里的等待预算：一次配置过大的等待不该超出客户端自己声明的
   // 预算。两个预算都非负，取较小者即可。
   const auto budget = std::min(config_.cancel_wait_budget, request.deadline);
-  const auto outcome = supervisor_.cancel(expected, budget);
+  const auto outcome = supervisor_->cancel(expected, budget);
   const std::string message = facts({{"accepted", flag(outcome.accepted)},
                                      {"cleanup_completed", flag(outcome.cleanup_completed)},
                                      {"state", runtime::to_string(outcome.state)}});
@@ -492,8 +543,12 @@ void Gateway::execute_cancel(Connection& connection, const protocol::ControlRequ
 
 void Gateway::execute_exit(Connection& connection, const protocol::ControlRequest& request,
                            RequestRecord& record) {
+  if (route_ != nullptr) {
+    execute_routed(connection, request, record);
+    return;
+  }
   const auto budget = std::min(config_.exit_wait_budget, request.deadline);
-  const auto outcome = supervisor_.shutdown(budget);
+  const auto outcome = supervisor_->shutdown(budget);
   // “退没退”看状态，“上一次清理干不干净”看错误：两者由一个响应分别回答，不互相掩盖。
   const bool exited = outcome.state == runtime::SupervisorState::kClosed;
   const std::string message = facts({{"accepted", flag(outcome.accepted)},
@@ -522,20 +577,119 @@ void Gateway::execute_exit(Connection& connection, const protocol::ControlReques
   }
 }
 
+void Gateway::execute_routed(Connection& connection, const protocol::ControlRequest& request,
+                            RequestRecord& record) {
+  if (request.operation == "start") {
+    // 与本地模式一致：新会话不能顶掉上一轮尚未交付的事件。先让路由把已到达事件排空，
+    // 终态事件会在这里把上一轮的 request 记录定局。
+    (void)deliver_routed_events();
+  }
+  const domain::Result<protocol::ControlResponse> routed = route_->call(request);
+  if (!routed.ok()) {
+    ++totals_.requests_rejected;
+    const auto response = make_response(
+        request.request_id, OperationResult::failure(routed.error.code, routed.error.message));
+    record.completed = true;
+    record.response = response;
+    enqueue_control(connection, response);
+    return;
+  }
+
+  const protocol::ControlResponse response = *routed.value;
+  if (request.operation == "start") {
+    if (!response.result.ok()) {
+      // 传输成功但远端明确拒绝创建：没有会话进入执行，记录当场定局。
+      ++totals_.requests_rejected;
+      record.response = response;
+      record.completed = true;
+      enqueue_control(connection, response);
+      return;
+    }
+    // start 已受理但远端会话可能仍在执行：本记录保持 completed=false，等待远端事件里的
+    // end=true 终态把它定局。重复请求在终态到达前会得到 kAlreadyCompleted，与进程内一致。
+    InFlightSession session;
+    session.owner = connection.id;
+    session.work_id = request.work_id.empty()
+                          ? fact_value(response.result.error.message, "work_id")
+                          : request.work_id;
+    session.session_id = request.session_id.empty()
+                             ? fact_value(response.result.error.message, "session_id")
+                             : request.session_id;
+    session.request_id = request.request_id;
+    inflight_ = std::move(session);
+    ++totals_.requests_accepted;
+    record.response = response;
+    record.completed = false;
+    enqueue_control(connection, response);
+    return;
+  }
+
+  ++totals_.requests_accepted;
+  record.response = response;
+  record.completed = true;
+  enqueue_control(connection, response);
+  if (request.operation == "exit" && response.result.ok()) {
+    closed_ = true;
+    for (auto& entry : connections_) {
+      mark_closed(entry.second, GatewayCloseReason::kExited);
+    }
+  }
+}
+
+std::size_t Gateway::deliver_routed_events() {
+  if (!inflight_.has_value()) {
+    return 0;
+  }
+  std::vector<protocol::DataEvent> events;
+  const std::size_t polled = route_->poll_events(inflight_->owner, events,
+                                                 config_.max_routed_events_per_poll);
+  if (polled == 0 || events.empty()) {
+    return 0;
+  }
+
+  std::size_t emitted = 0;
+  bool terminal = false;
+  for (protocol::DataEvent& event : events) {
+    event.request_id = inflight_->request_id;
+    event.session_id = inflight_->session_id;
+    if (event.generation == 0) {
+      event.generation = kSessionGeneration;
+    }
+    inflight_->next_sequence += 1;
+    event.sequence = inflight_->next_sequence;
+    emitted += enqueue_event_for(inflight_->owner, event);
+    if (event.end) {
+      terminal = true;
+    }
+  }
+
+  if (terminal) {
+    const auto completed = requests_.find(inflight_->request_id);
+    if (completed != requests_.end()) {
+      completed->second.completed = true;
+    }
+    inflight_.reset();
+  }
+  return emitted;
+}
+
 std::size_t Gateway::deliver_settled() {
+  if (route_ != nullptr) {
+    return deliver_routed_events();
+  }
   if (!inflight_.has_value()) {
     return 0;
   }
   // 只做一次非阻塞判断：预算为 0 的等待等价于“现在收敛了没有”。它在 kQuiescing 期间为假，
   // 因此事件不会被提前交付——终态与会话证据必须来自同一个已经定局的快照。
-  if (!supervisor_.wait_for_slot(std::chrono::milliseconds{0})) {
+  if (!supervisor_->wait_for_slot(std::chrono::milliseconds{0})) {
     return 0;
   }
   return emit_session_events(*inflight_);
 }
 
 std::size_t Gateway::emit_session_events(const InFlightSession& session) {
-  const runtime::SupervisorStatus snapshot = supervisor_.status();
+  const runtime::SupervisorStatus snapshot = supervisor_->status();
   // 先把本次会话的归属信息**按值**取下来，再清空在途记录。
   //
   // 顺序理由：调用方传进来的是 *inflight_ 的引用，而紧接着的一步就是清空 inflight_。
@@ -546,7 +700,7 @@ std::size_t Gateway::emit_session_events(const InFlightSession& session) {
   const InFlightSession delivered = session;
   inflight_.reset();
 
-  const std::shared_ptr<const runtime::SessionAppRunRecord> record = run_source_.last_run();
+  const std::shared_ptr<const runtime::SessionAppRunRecord> record = run_source_->last_run();
   // 事件归属按会话序号核对。序号不一致说明本次会话还没有发布记录（例如建立阶段就失败了），
   // 此时一条事件都不能发——把上一次会话的文本当成本次输出，正是旧结果污染新会话的来源。
   const bool matches =
@@ -691,7 +845,9 @@ GatewayStatus Gateway::status() const {
     snapshot.in_flight_session_id = inflight_->session_id;
     snapshot.in_flight_request_id = inflight_->request_id;
   }
-  snapshot.supervisor = supervisor_.status();
+  if (supervisor_ != nullptr) {
+    snapshot.supervisor = supervisor_->status();
+  }
   return snapshot;
 }
 

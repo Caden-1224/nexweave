@@ -128,6 +128,7 @@ target_link_libraries(nexweave_gateway
 add_library(nexweave_transport STATIC
   core/transport/zmq_control.cpp
   core/transport/zmq_data.cpp
+  core/transport/zmq_gateway_route.cpp
 )
 target_include_directories(nexweave_transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/transport
@@ -146,6 +147,12 @@ target_link_libraries(nexweave_transport
 add_executable(nexweave_child_process_helper tests/support/child_process_helper.cpp)
 target_link_libraries(nexweave_child_process_helper PRIVATE
   nexweave_core_domain nexweave_warnings)
+
+# 多进程 Gateway 路由测试夹具：在独立进程中运行真实 Gateway + Supervisor，并通过
+# notify_parent_ready() 报告控制端点已绑定。
+add_executable(nexweave_remote_gateway_fixture tests/support/remote_gateway_fixture.cpp)
+target_link_libraries(nexweave_remote_gateway_fixture PRIVATE
+  nexweave_transport nexweave_warnings)
 
 enable_testing()
 # 所有测试通过同一配置入口注册，新增目标不会漏掉警告门禁。
@@ -257,6 +264,15 @@ set_tests_properties(gateway_entry_integration PROPERTIES TIMEOUT 60)
 nexweave_test(zmq_control tests/integration/zmq_control_test.cpp integration)
 target_link_libraries(nexweave_zmq_control_test PRIVATE nexweave_transport)
 set_tests_properties(zmq_control_integration PROPERTIES TIMEOUT 60)
+
+# 多进程 Gateway 控制路由：本地 Gateway 通过 ZeroMQ 路由到独立进程中的 Gateway+Supervisor，
+# 验证推理阻塞时控制可达、取消收敛、远端不可用结构化错误与进程退出后的明确失败。
+nexweave_test(gateway_route tests/integration/gateway_route_test.cpp integration)
+target_link_libraries(nexweave_gateway_route_test PRIVATE nexweave_transport)
+target_compile_definitions(nexweave_gateway_route_test PRIVATE
+  NEXWEAVE_REMOTE_GATEWAY_FIXTURE="$<TARGET_FILE:nexweave_remote_gateway_fixture>")
+# 夹具包含真实线程、ZeroMQ socket 与独立子进程，挂起时必须在 60 秒内变成明确失败。
+set_tests_properties(gateway_route_integration PROPERTIES TIMEOUT 60)
 
 # ZeroMQ 数据面集成测试：真实 PAIR socket、multipart 编解码、输入流顺序和事件终态。
 nexweave_test(zmq_data tests/integration/zmq_data_test.cpp integration)

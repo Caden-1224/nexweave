@@ -125,6 +125,7 @@
 #include "../protocol/control_rpc.hpp"
 #include "../protocol/data_event.hpp"
 #include "../runtime/supervisor.hpp"
+#include "control_route.hpp"
 #include "ndjson_framer.hpp"
 
 namespace nexweave::gateway {
@@ -167,6 +168,9 @@ struct GatewayConfig {
   std::size_t max_pending_data_bytes = 512U * 1024U;
   // 幂等记录容量上限（条）。达到上限后拒绝新的 request_id，见类注释。
   std::size_t max_idempotency_records = 256;
+  // 路由模式下单次 poll_events() 最多取回的数据事件数。它限制一次外部驱动循环的工作量，
+  // 防止远端一次积压大量事件时把本地单线程入口长时间占住；必须为正。
+  std::size_t max_routed_events_per_poll = 64;
   // cancel 的等待清理预算默认值。0 表示只受理、不等待：取消响应只报告受理与快照，
   // 清理完成由终态事件回答。取值非负；请求自带的 deadline 会进一步收紧它。
   std::chrono::milliseconds cancel_wait_budget{0};
@@ -255,6 +259,11 @@ class Gateway final {
   Gateway(runtime::Supervisor& supervisor, runtime::ISessionRunSource& run_source,
           GatewayConfig config = {});
 
+  // 路由模式：把解析后的控制请求交给 route 执行。它复用同一个 Gateway 的分帧、幂等、连接
+  // 账目与有界发送，因此外部协议不变；route 必须比本对象活得久。事件交付通过 route 的
+  // poll_events() 接缝继续使用本对象的数据队列。
+  explicit Gateway(IControlRoute& route, GatewayConfig config = {});
+
   // 析构不排空待发字节、不受理取消、不等待在途会话（见类注释的资源归属）。不抛异常。
   ~Gateway();
 
@@ -341,6 +350,8 @@ class Gateway final {
     std::string work_id;
     std::string session_id;
     std::string request_id;
+    // 路由模式下事件可能分多次 poll 到达；序号在本次会话内连续递增，不因分批交付而重置。
+    std::uint64_t next_sequence = 0;
     // 本次会话开始之前监督器的“已取消会话数”。终态算不算取消以这个计数的增量为准，而不是
     // 以本入口自己的标志为准：退出（shutdown）同样会受理停止，而那个停止不是通过 cancel
     // 请求进来的，只看本入口的标志会把它漏掉。
@@ -370,6 +381,13 @@ class Gateway final {
   // 事件——把上一次会话的结果当成本次输出，正是“旧结果污染新会话”的来源。
   std::size_t emit_session_events(const InFlightSession& session);
 
+  // 路由模式下的四个执行入口。它们复用同一个 RequestRecord 幂等表与连接队列，只把执行体
+  // 换成 IControlRoute；返回值语义与本地入口一致。
+  void execute_routed(Connection& connection, const protocol::ControlRequest& request,
+                      RequestRecord& record);
+  // 路由模式下取回远端数据事件并投入连接队列；终态事件会关闭本次在途会话。
+  std::size_t deliver_routed_events();
+
   // 标记一条连接已关闭并记录原因（已关闭时保留首个原因），并把解帧器里尚未成帧的尾部字节
   // 计入账目。它不回收记录，也不触发取消策略：那条策略属于“对端断开”，由 close_connection()
   // 判定。
@@ -385,8 +403,9 @@ class Gateway final {
   // 打开连接数（不含已关闭的记录）。
   std::size_t open_connection_count() const;
 
-  runtime::Supervisor& supervisor_;
-  runtime::ISessionRunSource& run_source_;
+  runtime::Supervisor* supervisor_ = nullptr;
+  runtime::ISessionRunSource* run_source_ = nullptr;
+  IControlRoute* route_ = nullptr;
   GatewayConfig config_;
   std::map<std::string, RequestRecord> requests_;
   std::map<ConnectionId, Connection> connections_;
