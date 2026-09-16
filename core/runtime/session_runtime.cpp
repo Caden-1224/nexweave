@@ -360,6 +360,7 @@ SessionTurnResult SessionRuntime::run(const SessionTurnInput& input) {
     finish_turn(result);
     return result;
   }
+  result.generation = *generation.value;
   // 代际水位不在本地缓存：状态机在 audio_start 与 cancel 时都会推进水位，本地副本
   // 一旦与它脱节，失败/取消过的轮次就会带着过期代际提交事件并被拒绝。这里统一在
   // 每次提交前读取状态机，使“夹具记录的代际”与“状态机裁决的代际”永远是同一个值。

@@ -77,6 +77,7 @@ add_library(nexweave_core_domain STATIC
   core/runtime/text_segmentation.cpp
   core/runtime/speech_segmentation.cpp
   core/runtime/resident_audio_input.cpp
+  core/runtime/queued_audio_source.cpp
   core/runtime/supervisor.cpp
   core/runtime/child_process.cpp
   core/runtime/child_process_owner.cpp
@@ -129,6 +130,8 @@ add_library(nexweave_transport STATIC
   core/transport/zmq_control.cpp
   core/transport/zmq_data.cpp
   core/transport/zmq_gateway_route.cpp
+  core/transport/remote_session_server.cpp
+  core/transport/remote_session_proxy.cpp
 )
 target_include_directories(nexweave_transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/transport
@@ -154,6 +157,11 @@ add_executable(nexweave_remote_gateway_fixture tests/support/remote_gateway_fixt
 target_link_libraries(nexweave_remote_gateway_fixture PRIVATE
   nexweave_transport nexweave_warnings)
 
+# 多进程 Session 测试夹具：在独立进程中运行真实 SessionApp 与数据面服务端。
+add_executable(nexweave_remote_session_fixture tests/support/remote_session_fixture.cpp)
+target_link_libraries(nexweave_remote_session_fixture PRIVATE
+  nexweave_transport nexweave_warnings)
+
 enable_testing()
 # 所有测试通过同一配置入口注册，新增目标不会漏掉警告门禁。
 function(nexweave_test name source label)
@@ -163,7 +171,8 @@ function(nexweave_test name source label)
   target_include_directories(nexweave_${name}_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
-    ${CMAKE_CURRENT_SOURCE_DIR}/core/observability)
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/observability
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   add_test(NAME ${name}_${label} COMMAND nexweave_${name}_test)
   set_tests_properties(${name}_${label} PROPERTIES LABELS "${label}")
 endfunction()
@@ -180,6 +189,8 @@ nexweave_test(observability tests/unit/observability_test.cpp unit)
 # 运行证据记录器：用注入的手动时钟验收步数分配、首次出现语义与未测量标注。
 nexweave_test(run_evidence tests/unit/run_evidence_test.cpp unit)
 nexweave_test(fake_audio tests/unit/fake_audio_test.cpp unit)
+# 队列音频源边界：满队列拒绝、自然结束保留帧、取消唤醒阻塞读取。
+nexweave_test(queued_audio_source tests/unit/queued_audio_source_test.cpp unit)
 nexweave_test(fake_asr tests/unit/fake_asr_test.cpp unit)
 nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
 nexweave_test(bm25_rag tests/unit/bm25_rag_test.cpp unit)
@@ -278,6 +289,13 @@ set_tests_properties(gateway_route_integration PROPERTIES TIMEOUT 60)
 nexweave_test(zmq_data tests/integration/zmq_data_test.cpp integration)
 target_link_libraries(nexweave_zmq_data_test PRIVATE nexweave_transport)
 set_tests_properties(zmq_data_integration PROPERTIES TIMEOUT 60)
+
+# 多进程 Session 适配：真实子进程、持续输入上行、输出事件接收、取消与重复启停。
+nexweave_test(remote_session tests/integration/remote_session_test.cpp integration)
+target_link_libraries(nexweave_remote_session_test PRIVATE nexweave_transport)
+target_compile_definitions(nexweave_remote_session_test PRIVATE
+  NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>")
+set_tests_properties(remote_session_integration PROPERTIES TIMEOUT 60)
 
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。
 add_executable(nexweave_session_app apps/session_app/main.cpp)

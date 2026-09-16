@@ -53,6 +53,9 @@ struct SessionTurnResult {
   // 本轮的请求标识：原样回显调用方传入的 request_id，使结果能归回到具体一次操作，
   // 而不是只靠调用顺序对应。不影响任何判定逻辑。
   std::string request_id;
+  // 本轮的回答代际：由交互契约在 begin_generation() 成功时提交，取消或重开后递增。
+  // 它用于把跨进程输出事件绑定到同一代回答；输入流建立失败等尚未开启代际的路径保持 0。
+  std::uint64_t generation = 0;
   SessionStateMachine::State state = SessionStateMachine::State::kIdle;
   // 本轮**提交过**的终态标记：成功提交后为 kTerminalSucceeded，取消或失败提交后为
   // kTerminalCancelled。默认取取消终态，它是保守默认（避免默认值伪装成功），而不是对
