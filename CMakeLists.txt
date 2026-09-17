@@ -191,6 +191,10 @@ nexweave_test(run_evidence tests/unit/run_evidence_test.cpp unit)
 nexweave_test(fake_audio tests/unit/fake_audio_test.cpp unit)
 # 队列音频源边界：满队列拒绝、自然结束保留帧、取消唤醒阻塞读取。
 nexweave_test(queued_audio_source tests/unit/queued_audio_source_test.cpp unit)
+# 统一队列语义：容量、拒绝、超时、关闭、清空与峰值。
+nexweave_test(bounded_queue tests/unit/bounded_queue_test.cpp unit)
+# 终态缓存：容量淘汰、保留期限与显式过期查询。
+nexweave_test(terminal_cache tests/unit/terminal_cache_test.cpp unit)
 nexweave_test(fake_asr tests/unit/fake_asr_test.cpp unit)
 nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
 nexweave_test(bm25_rag tests/unit/bm25_rag_test.cpp unit)

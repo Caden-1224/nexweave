@@ -50,9 +50,11 @@ int main() {
     const auto ended = source.read();
     CHECK(ended.error.code == ErrorCode::kAlreadyCompleted);
     const auto stats = source.stats();
+    CHECK(stats.capacity_frames == 2);
     CHECK(stats.pushed == 2);
     CHECK(stats.popped == 2);
     CHECK(stats.rejected_full == 1);
+    CHECK(stats.peak_pending_frames == 2);
   }
 
   {

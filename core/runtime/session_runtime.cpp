@@ -814,7 +814,7 @@ void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
 
   // token 回调按“先交付、后统计”的顺序处理：token 一旦到达就立刻进入分句与合成，
   // 因此“首段播放”可以发生在 generate 返回之前；统计只记录事实，不改变交付顺序。
-  const auto token_callback = [this, &chunker](const capability::TextEvent& event) {
+  const auto token_callback = [this, &chunker, &result](const capability::TextEvent& event) {
     if (llm_error_.has_value() || cancel_requested_.load() || playback_backpressure_) {
       // 本轮已经不可能成功：不再分句、不再合成。继续处理只会让回调耗时随输出长度
       // 增长，而不会产生任何可交付的结果。
@@ -850,6 +850,9 @@ void SessionRuntime::run_generation_turn(SessionTurnResult& result) {
     // “片段”不会错位，也不会保留上一帧的片段。
     llm_chunks_.clear();
     chunker.feed(event.text, llm_chunks_);
+    if (chunker.buffered_bytes() > result.peak_text_buffer_bytes) {
+      result.peak_text_buffer_bytes = chunker.buffered_bytes();
+    }
     for (const auto& chunk : llm_chunks_) {
       if (!synthesize_chunk(chunk)) {
         return;

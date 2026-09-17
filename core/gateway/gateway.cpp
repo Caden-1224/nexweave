@@ -948,6 +948,9 @@ std::size_t Gateway::enqueue_event_for(ConnectionId owner, const protocol::DataE
   }
   connection->pending_data.append(*encoded.value);
   connection->pending_data.push_back('\n');
+  if (connection->pending_data.size() > connection->ledger.pending_data_peak_bytes) {
+    connection->ledger.pending_data_peak_bytes = connection->pending_data.size();
+  }
   ++connection->ledger.events_sent;
   ++totals_.data_events;
   return 1;
@@ -972,6 +975,9 @@ void Gateway::enqueue_control(Connection& connection, const protocol::ControlRes
   }
   connection.pending_control.append(*encoded.value);
   connection.pending_control.push_back('\n');
+  if (connection.pending_control.size() > connection.ledger.pending_control_peak_bytes) {
+    connection.ledger.pending_control_peak_bytes = connection.pending_control.size();
+  }
   ++connection.ledger.responses_sent;
   ++totals_.control_responses;
 }
@@ -991,6 +997,8 @@ GatewayConnectionStats Gateway::connection_stats(ConnectionId id) const {
   stats.known = true;
   stats.pending_control_bytes = connection->pending_control.size();
   stats.pending_data_bytes = connection->pending_data.size();
+  stats.pending_control_capacity_bytes = config_.max_pending_control_bytes;
+  stats.pending_data_capacity_bytes = config_.max_pending_data_bytes;
   return stats;
 }
 

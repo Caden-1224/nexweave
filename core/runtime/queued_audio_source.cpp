@@ -8,6 +8,14 @@ namespace {
 using domain::ErrorCode;
 using domain::OperationResult;
 
+BoundedQueueConfig MakeQueueConfig(const QueuedAudioSourceConfig& config) {
+  BoundedQueueConfig queue_config;
+  queue_config.capacity = config.max_pending_frames;
+  // 连续音频的中间帧不允许被最新帧覆盖；满队列必须显式失败。
+  queue_config.drop_oldest_on_full = false;
+  return queue_config;
+}
+
 }  // namespace
 
 domain::OperationResult validate_queued_audio_source_config(
@@ -19,9 +27,11 @@ domain::OperationResult validate_queued_audio_source_config(
 }
 
 QueuedAudioSource::QueuedAudioSource(QueuedAudioSourceConfig config)
-    : config_(std::move(config)) {
+    : queue_(std::make_unique<BoundedQueue<domain::AudioFrame>>(MakeQueueConfig(config))),
+      config_(std::move(config)) {
   if (!validate_queued_audio_source_config(config_).ok()) {
     config_ = QueuedAudioSourceConfig{};
+    queue_ = std::make_unique<BoundedQueue<domain::AudioFrame>>(MakeQueueConfig(config_));
   }
 }
 
@@ -33,7 +43,7 @@ domain::OperationResult QueuedAudioSource::open() {
   // close() 之后的 open 是同一对象的新输入轮次：旧队列不保留，取消标志复位。
   // 初始 open 前的 push 是允许的启动窗口，不能被清掉，否则先到帧会被静默丢弃。
   if (closed_) {
-    pending_.clear();
+    queue_ = std::make_unique<BoundedQueue<domain::AudioFrame>>(MakeQueueConfig(config_));
   }
   opened_ = true;
   closed_ = false;
@@ -43,33 +53,46 @@ domain::OperationResult QueuedAudioSource::open() {
 }
 
 domain::Result<domain::AudioFrame> QueuedAudioSource::read() {
-  std::unique_lock<std::mutex> lock(mutex_);
-  if (!opened_) {
-    return domain::Result<domain::AudioFrame>::failure(ErrorCode::kDeviceFailure,
-                                                       "音频源尚未打开");
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!opened_) {
+      return domain::Result<domain::AudioFrame>::failure(ErrorCode::kDeviceFailure,
+                                                         "音频源尚未打开");
+    }
+    if (cancelled_) {
+      ++cancelled_reads_;
+      return domain::Result<domain::AudioFrame>::failure(ErrorCode::kCancelled,
+                                                         "音频源已经取消");
+    }
+    if (closed_) {
+      return domain::Result<domain::AudioFrame>::failure(ErrorCode::kDeviceFailure,
+                                                         "音频源已经关闭");
+    }
   }
-  condition_.wait(lock, [this] {
-    return closed_ || cancelled_ || ended_ || !pending_.empty();
-  });
 
-  if (closed_) {
+  domain::AudioFrame frame;
+  const QueuePopStatus status = queue_->pop_blocking(frame);
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (status == QueuePopStatus::kItem) {
+      return domain::Result<domain::AudioFrame>::success(std::move(frame));
+    }
+    if (cancelled_) {
+      ++cancelled_reads_;
+      return domain::Result<domain::AudioFrame>::failure(ErrorCode::kCancelled,
+                                                         "音频源已经取消");
+    }
+    if (closed_) {
+      return domain::Result<domain::AudioFrame>::failure(ErrorCode::kDeviceFailure,
+                                                         "音频源已经关闭");
+    }
+    if (ended_) {
+      return domain::Result<domain::AudioFrame>::failure(ErrorCode::kAlreadyCompleted,
+                                                         "音频输入已经结束");
+    }
     return domain::Result<domain::AudioFrame>::failure(ErrorCode::kDeviceFailure,
-                                                       "音频源已经关闭");
+                                                       "音频源没有可读数据");
   }
-  if (cancelled_) {
-    note_cancelled_read_locked();
-    return domain::Result<domain::AudioFrame>::failure(ErrorCode::kCancelled,
-                                                       "音频源已经取消");
-  }
-  if (!pending_.empty()) {
-    domain::AudioFrame frame = std::move(pending_.front());
-    pending_.pop_front();
-    ++stats_.popped;
-    return domain::Result<domain::AudioFrame>::success(std::move(frame));
-  }
-  // 只有 ended_ 可能从上面的谓词剩下：没有帧且不会再产出。
-  return domain::Result<domain::AudioFrame>::failure(ErrorCode::kAlreadyCompleted,
-                                                     "音频输入已经结束");
 }
 
 domain::OperationResult QueuedAudioSource::cancel() noexcept {
@@ -80,9 +103,9 @@ domain::OperationResult QueuedAudioSource::cancel() noexcept {
     }
     cancelled_ = true;
     ended_ = false;
-    pending_.clear();
+    queue_->clear();
+    queue_->close();
   }
-  condition_.notify_all();
   return OperationResult::success();
 }
 
@@ -96,9 +119,9 @@ domain::OperationResult QueuedAudioSource::close() noexcept {
     opened_ = false;
     cancelled_ = false;
     ended_ = false;
-    pending_.clear();
+    queue_->clear();
+    queue_->close();
   }
-  condition_.notify_all();
   return OperationResult::success();
 }
 
@@ -118,15 +141,18 @@ domain::OperationResult QueuedAudioSource::push(domain::AudioFrame frame) {
     if (ended_) {
       return OperationResult::failure(ErrorCode::kAlreadyCompleted, "音频输入已经结束");
     }
-    if (pending_.size() >= config_.max_pending_frames) {
-      ++stats_.rejected_full;
+    const QueuePushStatus pushed = queue_->try_push(std::move(frame));
+    if (pushed == QueuePushStatus::kAccepted) {
+      return OperationResult::success();
+    }
+    if (pushed == QueuePushStatus::kRejectedFull) {
       return OperationResult::failure(ErrorCode::kBackendFailure, "音频输入队列已满");
     }
-    pending_.push_back(std::move(frame));
-    ++stats_.pushed;
+    if (pushed == QueuePushStatus::kRejectedClosed) {
+      return OperationResult::failure(ErrorCode::kDeviceFailure, "音频源已经关闭");
+    }
+    return OperationResult::failure(ErrorCode::kBackendFailure, "音频输入队列拒绝了本次写入");
   }
-  condition_.notify_one();
-  return OperationResult::success();
 }
 
 domain::OperationResult QueuedAudioSource::end_input() noexcept {
@@ -136,23 +162,29 @@ domain::OperationResult QueuedAudioSource::end_input() noexcept {
       return OperationResult::success();
     }
     ended_ = true;
+    queue_->close();
   }
-  condition_.notify_all();
   return OperationResult::success();
 }
 
 bool QueuedAudioSource::has_pending_frames() const noexcept {
   const std::lock_guard<std::mutex> lock(mutex_);
-  return !pending_.empty();
+  return queue_->size() > 0;
 }
 
 QueuedAudioSourceStats QueuedAudioSource::stats() const noexcept {
   const std::lock_guard<std::mutex> lock(mutex_);
-  return stats_;
-}
-
-void QueuedAudioSource::note_cancelled_read_locked() {
-  ++stats_.cancelled_reads;
+  const BoundedQueueStats queue_stats = queue_->stats();
+  QueuedAudioSourceStats output;
+  output.pushed = queue_stats.push_accepted;
+  output.popped = queue_stats.pop_items;
+  output.rejected_full = queue_stats.rejected_full;
+  output.cancelled_reads = cancelled_reads_;
+  output.capacity_frames = queue_stats.capacity;
+  output.peak_pending_frames = queue_stats.peak_size;
+  output.wait_count = queue_stats.waits;
+  output.wait_timeouts = queue_stats.wait_timeouts;
+  return output;
 }
 
 }  // namespace nexweave::runtime

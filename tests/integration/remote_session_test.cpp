@@ -98,6 +98,8 @@ void TestNormalInputBeforeEnd() {
   bool has_text = false;
   bool has_pcm = false;
   bool has_done = false;
+  std::string terminal_request_id;
+  std::uint64_t terminal_generation = 0;
   for (const DataEvent& event : events) {
     if (event.type == DataEventType::kFinal && !event.text.empty()) {
       has_text = true;
@@ -111,11 +113,23 @@ void TestNormalInputBeforeEnd() {
       CHECK(!event.request_id.empty());
       CHECK(!event.session_id.empty());
       CHECK(event.generation >= 1);
+      terminal_request_id = event.request_id;
+      terminal_generation = event.generation;
     }
   }
   CHECK(has_text);
   CHECK(has_pcm);
   CHECK(has_done);
+  const auto cached_terminal =
+      proxy.query_terminal(terminal_request_id, terminal_generation);
+  CHECK(cached_terminal.ok());
+  CHECK(cached_terminal.value->end);
+  const auto proxy_stats = proxy.stats();
+  CHECK(proxy_stats.input_queue_capacity == 64);
+  CHECK(proxy_stats.output_queue_capacity == 256);
+  CHECK(proxy_stats.terminal_cache_capacity == 8);
+  CHECK(proxy_stats.output_queue_peak <= 256);
+  CHECK(proxy_stats.terminal_cache_peak_entries >= 1);
 
   // 输入尚未结束时已经完成第一轮，说明音频是持续上行且远端后端在流结束前就开始处理。
   CHECK(proxy.queue_end_stream(0).ok());
@@ -157,6 +171,8 @@ void TestOutputQueueOverflow() {
   }
   CHECK(!proxy.last_error().ok());
   CHECK(proxy.last_error().code == ErrorCode::kBackendFailure);
+  // 输出队列满只应阻塞数据交付，不应让控制取消本身排在一个满的数据队列后面。
+  CHECK(proxy.queue_cancel_stream().ok());
   CHECK(proxy.stop().ok());
 }
 

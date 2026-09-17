@@ -88,6 +88,10 @@ struct SessionTurnResult {
   // 本轮是否因播放缓冲达到声明容量而以 backpressure（背压）失败收敛。为真时本轮已经
   // 停止播放并丢弃未播部分，因此不会留下「半段回答仍然发声」的残留。
   bool backpressure = false;
+  // 生成路径的文本分句缓冲峰值（UTF-8 字节）。它由 SessionRuntimeConfig::text_chunk_max_bytes
+  // 约束，正常路径不超过该值加 3 个未收完的 UTF-8 字节；取消或失败时只记录取消前已经
+  // 到达的真实峰值。它说明文本缓冲有明确上限，不能说明模型输出长度或端到端回答时延。
+  std::size_t peak_text_buffer_bytes = 0;
   // 本轮是否被“用户新语音”打断。它与控制意图取消（用户喊停）和设备失败区分开：
   // 三者都以取消终态收敛，但只有它为真时 interrupt_notice 才携带新语音的归属。
   bool interrupted_by_speech = false;

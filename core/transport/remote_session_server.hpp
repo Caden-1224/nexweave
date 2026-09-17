@@ -76,6 +76,8 @@ struct RemoteSessionServerStats {
   std::uint64_t sent_output_events = 0;
   std::uint64_t input_rejected = 0;
   std::uint64_t output_queue_overflows = 0;
+  std::size_t output_queue_capacity = 0;
+  std::size_t output_queue_peak = 0;
   std::uint64_t send_failures = 0;
   std::uint64_t receive_timeouts = 0;
 };

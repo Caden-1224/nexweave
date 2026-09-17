@@ -209,6 +209,12 @@ struct GatewayConnectionStats {
   // 当前待发字节数。它与 flush() 一起构成慢客户端判定的依据。
   std::size_t pending_control_bytes = 0;
   std::size_t pending_data_bytes = 0;
+  // 控制响应与数据事件待发队列的容量及历史峰值（字节）。峰值不超过容量；容量为零
+  // 在入口配置校验阶段被拒绝，因此这里不会出现“无界缓冲”。
+  std::size_t pending_control_capacity_bytes = 0;
+  std::size_t pending_data_capacity_bytes = 0;
+  std::size_t pending_control_peak_bytes = 0;
+  std::size_t pending_data_peak_bytes = 0;
   // 已被 flush() 取走的字节数。
   std::uint64_t bytes_written = 0;
   // 连接关闭时仍未成帧的尾部字节数。输入在中途断掉时，这些字节没有构成任何请求，既不能

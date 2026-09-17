@@ -2,8 +2,10 @@
 
 #include <cstdio>
 #include <fstream>
-#include <sstream>
 #include <utility>
+
+#include "bounded_queue.hpp"
+#include "terminal_cache.hpp"
 
 namespace nexweave::transport {
 namespace {
@@ -11,8 +13,12 @@ namespace {
 using domain::ErrorCode;
 using domain::OperationResult;
 using protocol::DataEvent;
-using runtime::ChildProcessExit;
-using runtime::ChildProcessIdentity;
+using runtime::BoundedQueue;
+using runtime::BoundedQueueConfig;
+using runtime::QueuePopStatus;
+using runtime::QueuePushStatus;
+using runtime::TerminalCache;
+using runtime::TerminalCacheConfig;
 
 std::string ReadEndpointFile(const std::string& path) {
   std::ifstream file(path);
@@ -26,6 +32,27 @@ std::string ReadEndpointFile(const std::string& path) {
     endpoint.pop_back();
   }
   return endpoint;
+}
+
+BoundedQueueConfig MakeInputQueueConfig(const RemoteSessionProxyConfig& config) {
+  BoundedQueueConfig queue;
+  queue.capacity = config.max_pending_input_events;
+  queue.drop_oldest_on_full = false;
+  return queue;
+}
+
+BoundedQueueConfig MakeOutputQueueConfig(const RemoteSessionProxyConfig& config) {
+  BoundedQueueConfig queue;
+  queue.capacity = config.max_pending_output_events;
+  queue.drop_oldest_on_full = false;
+  return queue;
+}
+
+TerminalCacheConfig MakeTerminalCacheConfig(const RemoteSessionProxyConfig& config) {
+  TerminalCacheConfig cache;
+  cache.capacity = config.terminal_cache_capacity;
+  cache.retention = config.terminal_retention;
+  return cache;
 }
 
 }  // namespace
@@ -49,12 +76,17 @@ domain::OperationResult validate_remote_session_proxy_config(
   if (config.max_pending_input_events == 0 || config.max_pending_output_events == 0) {
     return OperationResult::failure(ErrorCode::kInvalidInput, "代理队列容量必须为正");
   }
+  if (config.terminal_cache_capacity == 0 || config.terminal_retention.count() <= 0) {
+    return OperationResult::failure(ErrorCode::kInvalidInput,
+                                    "终态缓存容量与保留期限必须为正");
+  }
   return validate_zmq_data_config(config.data);
 }
 
 struct RemoteSessionProxy::Impl {
   explicit Impl(RemoteSessionProxyConfig config_value)
       : config(std::move(config_value)),
+        child(config.child_config),
         channel(config.data) {}
 
   RemoteSessionProxyConfig config;
@@ -65,10 +97,9 @@ struct RemoteSessionProxy::Impl {
   std::thread io_thread;
 
   mutable std::mutex mutex;
-  std::condition_variable input_ready;
-  std::condition_variable output_ready;
-  std::deque<runtime::InputStreamEvent> inbound;
-  std::deque<DataEvent> outbound;
+  std::unique_ptr<BoundedQueue<runtime::InputStreamEvent>> inbound_queue;
+  std::unique_ptr<BoundedQueue<DataEvent>> outbound_queue;
+  std::unique_ptr<TerminalCache<DataEvent>> terminal_cache;
   domain::Error error{};
   RemoteSessionProxyStats stats{};
   bool stream_started = false;
@@ -86,8 +117,11 @@ struct RemoteSessionProxy::Impl {
   domain::OperationResult QueueCancel();
   std::size_t ReceiveEvents(std::vector<DataEvent>& out, std::size_t max_events,
                             std::chrono::milliseconds timeout);
+  domain::Result<DataEvent> QueryTerminal(const std::string& request_id,
+                                          std::uint64_t generation_value) const;
   void IoLoop();
   bool PushInputLocked(const runtime::InputStreamEvent& event);
+  void StoreTerminal(const DataEvent& event);
   void RecordError(const domain::Error& error_value);
 };
 
@@ -99,8 +133,12 @@ domain::OperationResult RemoteSessionProxy::Impl::Start() {
   stop_requested.store(false);
   {
     const std::lock_guard<std::mutex> lock(mutex);
-    inbound.clear();
-    outbound.clear();
+    inbound_queue = std::make_unique<BoundedQueue<runtime::InputStreamEvent>>(
+        MakeInputQueueConfig(config));
+    outbound_queue = std::make_unique<BoundedQueue<DataEvent>>(
+        MakeOutputQueueConfig(config));
+    terminal_cache = std::make_unique<TerminalCache<DataEvent>>(
+        MakeTerminalCacheConfig(config));
     error = domain::Error{};
     stats = RemoteSessionProxyStats{};
     stream_started = false;
@@ -157,10 +195,18 @@ OperationResult RemoteSessionProxy::Impl::Stop() noexcept {
     if (!running.load()) {
       return OperationResult::success();
     }
-    // 先让已经在途的输入有机会送达，再放入取消事件；停止标志只阻止新的 queue_* 调用。
+    // 先在途输入有机会送达，再放入取消事件；最后关闭队列唤醒 I/O 线程。
     (void)QueueCancel();
     stop_requested.store(true);
-    input_ready.notify_all();
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (inbound_queue != nullptr) {
+        inbound_queue->close();
+      }
+      if (outbound_queue != nullptr) {
+        outbound_queue->close();
+      }
+    }
     if (io_thread.joinable()) {
       io_thread.join();
     }
@@ -180,16 +226,19 @@ OperationResult RemoteSessionProxy::Impl::Stop() noexcept {
 }
 
 bool RemoteSessionProxy::Impl::PushInputLocked(const runtime::InputStreamEvent& event) {
-  if (stop_requested.load()) {
+  // 前置条件：调用方已持有 mutex。
+  if (stop_requested.load() || inbound_queue == nullptr) {
     return false;
   }
-  if (inbound.size() >= config.max_pending_input_events) {
+  const QueuePushStatus pushed = inbound_queue->try_push(event);
+  if (pushed == QueuePushStatus::kAccepted) {
+    return true;
+  }
+  if (pushed == QueuePushStatus::kRejectedFull) {
     ++stats.input_queue_full;
     return false;
   }
-  inbound.push_back(event);
-  input_ready.notify_all();
-  return true;
+  return false;
 }
 
 domain::OperationResult RemoteSessionProxy::Impl::QueueStart(std::string id,
@@ -325,34 +374,60 @@ std::size_t RemoteSessionProxy::Impl::ReceiveEvents(
   if (max_events == 0) {
     return 0;
   }
-  std::unique_lock<std::mutex> lock(mutex);
-  output_ready.wait_for(lock, timeout, [this] {
-    return !outbound.empty() || !error.ok() || stop_requested.load();
-  });
+  BoundedQueue<DataEvent>* queue = nullptr;
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    queue = outbound_queue.get();
+  }
+  if (queue == nullptr) {
+    return 0;
+  }
   std::size_t count = 0;
-  while (count < max_events && !outbound.empty()) {
-    out.push_back(std::move(outbound.front()));
-    outbound.pop_front();
+  DataEvent event;
+  const QueuePopStatus first = queue->pop_for(event, timeout);
+  if (first == QueuePopStatus::kItem) {
+    out.push_back(std::move(event));
+    ++count;
+  } else {
+    return 0;
+  }
+  while (count < max_events) {
+    DataEvent next;
+    const QueuePopStatus popped = queue->pop_for(next, std::chrono::milliseconds(0));
+    if (popped != QueuePopStatus::kItem) {
+      break;
+    }
+    out.push_back(std::move(next));
     ++count;
   }
   return count;
 }
 
+domain::Result<DataEvent> RemoteSessionProxy::Impl::QueryTerminal(
+    const std::string& request_id, std::uint64_t generation_value) const {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (terminal_cache == nullptr) {
+    return domain::Result<DataEvent>::failure(ErrorCode::kAlreadyCompleted,
+                                              "终态缓存尚不可用");
+  }
+  return terminal_cache->Query(request_id, generation_value);
+}
+
+void RemoteSessionProxy::Impl::StoreTerminal(const DataEvent& event) {
+  if (!event.end) {
+    return;
+  }
+  const std::lock_guard<std::mutex> lock(mutex);
+  if (terminal_cache != nullptr) {
+    terminal_cache->Store(event.request_id, event.generation, event);
+  }
+}
+
 void RemoteSessionProxy::Impl::IoLoop() {
   while (true) {
     runtime::InputStreamEvent event;
-    bool has_input = false;
-    {
-      const std::lock_guard<std::mutex> lock(mutex);
-      if (!inbound.empty()) {
-        event = std::move(inbound.front());
-        inbound.pop_front();
-        has_input = true;
-      } else if (stop_requested.load()) {
-        break;
-      }
-    }
-    if (has_input) {
+    const QueuePopStatus popped = inbound_queue->try_pop(event);
+    if (popped == QueuePopStatus::kItem) {
       const auto sent = channel.send_input(event);
       if (!sent.ok()) {
         RecordError(sent.error);
@@ -369,29 +444,35 @@ void RemoteSessionProxy::Impl::IoLoop() {
       }
       continue;
     }
+    if (popped == QueuePopStatus::kClosed) {
+      break;
+    }
+    if (stop_requested.load() && inbound_queue->empty()) {
+      break;
+    }
 
     const auto received = channel.receive_output(config.pump_interval);
     if (received.ok()) {
-      bool overflow = false;
-      {
+      const DataEvent& event = received.value.value();
+      StoreTerminal(event);
+      const QueuePushStatus pushed = outbound_queue->try_push(event);
+      if (pushed == QueuePushStatus::kAccepted) {
         const std::lock_guard<std::mutex> lock(mutex);
-        if (outbound.size() >= config.max_pending_output_events) {
+        ++stats.received_output_events;
+        continue;
+      }
+      if (pushed == QueuePushStatus::kRejectedFull) {
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
           ++stats.output_queue_full;
           if (error.ok()) {
             error = domain::Error{ErrorCode::kBackendFailure, "远端输出队列已满"};
           }
-          overflow = true;
-        } else {
-          outbound.push_back(received.value.value());
-          ++stats.received_output_events;
         }
-      }
-      if (overflow) {
         child.request_stop();
         break;
       }
-      output_ready.notify_all();
-      continue;
+      break;
     }
 
     if (received.error.code == ErrorCode::kTimeout) {
@@ -404,7 +485,7 @@ void RemoteSessionProxy::Impl::IoLoop() {
     child.request_stop();
     break;
   }
-  output_ready.notify_all();
+  outbound_queue->close();
 }
 
 void RemoteSessionProxy::Impl::RecordError(const domain::Error& error_value) {
@@ -472,6 +553,15 @@ std::size_t RemoteSessionProxy::receive_events(std::vector<protocol::DataEvent>&
   return impl_->ReceiveEvents(out, max_events, timeout);
 }
 
+domain::Result<protocol::DataEvent> RemoteSessionProxy::query_terminal(
+    const std::string& request_id, std::uint64_t generation) const {
+  if (impl_ == nullptr) {
+    return domain::Result<protocol::DataEvent>::failure(ErrorCode::kAlreadyCompleted,
+                                                        "代理尚未构造");
+  }
+  return impl_->QueryTerminal(request_id, generation);
+}
+
 domain::Error RemoteSessionProxy::last_error() const {
   if (impl_ == nullptr) {
     return domain::Error{};
@@ -489,7 +579,25 @@ RemoteSessionProxyStats RemoteSessionProxy::stats() const {
     return RemoteSessionProxyStats{};
   }
   const std::lock_guard<std::mutex> lock(impl_->mutex);
-  return impl_->stats;
+  RemoteSessionProxyStats snapshot = impl_->stats;
+  if (impl_->inbound_queue != nullptr) {
+    const auto queue_stats = impl_->inbound_queue->stats();
+    snapshot.input_queue_capacity = queue_stats.capacity;
+    snapshot.input_queue_peak = queue_stats.peak_size;
+  }
+  if (impl_->outbound_queue != nullptr) {
+    const auto queue_stats = impl_->outbound_queue->stats();
+    snapshot.output_queue_capacity = queue_stats.capacity;
+    snapshot.output_queue_peak = queue_stats.peak_size;
+  }
+  if (impl_->terminal_cache != nullptr) {
+    const auto terminal_stats = impl_->terminal_cache->stats();
+    snapshot.terminal_cache_capacity = terminal_stats.capacity;
+    snapshot.terminal_cache_entries = terminal_stats.live_entries;
+    snapshot.terminal_cache_peak_entries = terminal_stats.peak_live_entries;
+    snapshot.terminal_cache_expired_markers = terminal_stats.expired_markers;
+  }
+  return snapshot;
 }
 
 }  // namespace nexweave::transport

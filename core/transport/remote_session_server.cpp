@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "bounded_queue.hpp"
+
 namespace nexweave::transport {
 namespace {
 
@@ -13,6 +15,10 @@ using domain::ErrorCode;
 using domain::OperationResult;
 using protocol::DataEvent;
 using protocol::DataEventType;
+using runtime::BoundedQueue;
+using runtime::BoundedQueueConfig;
+using runtime::QueuePopStatus;
+using runtime::QueuePushStatus;
 using runtime::QueuedAudioSource;
 using runtime::SessionApp;
 using runtime::SessionAppObserver;
@@ -66,6 +72,13 @@ RemoteSessionServerConfig EffectiveServerConfig(RemoteSessionServerConfig config
   return config;
 }
 
+BoundedQueueConfig MakeOutputQueueConfig(const RemoteSessionServerConfig& config) {
+  BoundedQueueConfig queue;
+  queue.capacity = config.output_queue_capacity;
+  queue.drop_oldest_on_full = false;
+  return queue;
+}
+
 }  // namespace
 
 struct RemoteSessionServer::Impl {
@@ -74,7 +87,8 @@ struct RemoteSessionServer::Impl {
       : app(app_value),
         input(input_value),
         config(std::move(config_value)),
-        channel(config.data) {}
+        channel(config.data),
+        outbound(MakeOutputQueueConfig(config)) {}
 
   class Observer final : public SessionAppObserver {
    public:
@@ -99,8 +113,7 @@ struct RemoteSessionServer::Impl {
   std::string endpoint;
   std::thread worker;
   mutable std::mutex mutex;
-  std::condition_variable output_ready;
-  std::deque<DataEvent> outbound;
+  BoundedQueue<DataEvent> outbound;
   bool app_finished = false;
   bool terminal_sent = false;
   bool output_overflow = false;
@@ -331,7 +344,6 @@ void RemoteSessionServer::Impl::RunApp() {
       error = result.cleanup_error;
     }
   }
-  output_ready.notify_all();
 }
 
 void RemoteSessionServer::Impl::RequestStop() {
@@ -339,21 +351,20 @@ void RemoteSessionServer::Impl::RequestStop() {
 }
 
 bool RemoteSessionServer::Impl::EnqueueEvent(const DataEvent& event) {
-  {
-    const std::lock_guard<std::mutex> lock(mutex);
-    if (outbound.size() >= config.output_queue_capacity) {
-      output_overflow = true;
-      if (error.ok()) {
-        error = domain::Error{ErrorCode::kBackendFailure, "远端输出队列已满"};
-      }
-      input.cancel();
-      app.request_stop();
-      return false;
-    }
-    outbound.push_back(event);
+  const std::lock_guard<std::mutex> lock(mutex);
+  const QueuePushStatus pushed = outbound.try_push(event);
+  if (pushed == QueuePushStatus::kAccepted) {
+    return true;
   }
-  output_ready.notify_all();
-  return true;
+  if (pushed == QueuePushStatus::kRejectedFull) {
+    output_overflow = true;
+    if (error.ok()) {
+      error = domain::Error{ErrorCode::kBackendFailure, "远端输出队列已满"};
+    }
+    input.cancel();
+    app.request_stop();
+  }
+  return false;
 }
 
 void RemoteSessionServer::Impl::EnqueueTurn(const SessionTurnResult& result) {
@@ -411,13 +422,9 @@ void RemoteSessionServer::Impl::EnqueueTurn(const SessionTurnResult& result) {
 bool RemoteSessionServer::Impl::DrainOutbound() {
   while (true) {
     DataEvent event;
-    {
-      const std::lock_guard<std::mutex> lock(mutex);
-      if (outbound.empty()) {
-        return true;
-      }
-      event = std::move(outbound.front());
-      outbound.pop_front();
+    const QueuePopStatus popped = outbound.try_pop(event);
+    if (popped == QueuePopStatus::kEmpty || popped == QueuePopStatus::kClosed) {
+      return true;
     }
     const auto sent = channel.send_output(event);
     if (!sent.ok()) {
@@ -436,10 +443,6 @@ bool RemoteSessionServer::Impl::DrainOutbound() {
 }
 
 void RemoteSessionServer::Impl::EnqueueSessionErrorLocked(const domain::Error& error_value) {
-  if (outbound.size() >= config.output_queue_capacity) {
-    output_overflow = true;
-    return;
-  }
   const std::string session_id =
       stream_id.empty() ? std::string("remote-session") : stream_id;
   DataEvent event = MakeEvent(session_id + "-session", session_id, 0, 0,
@@ -448,8 +451,12 @@ void RemoteSessionServer::Impl::EnqueueSessionErrorLocked(const domain::Error& e
   event.error_code = error_value.ok() ? ErrorCode::kBackendFailure : error_value.code;
   event.message = error_value.ok() ? std::string("远端会话没有产生终态事件")
                                    : error_value.message;
-  outbound.push_back(std::move(event));
-  terminal_sent = true;
+  const QueuePushStatus pushed = outbound.try_push(std::move(event));
+  if (pushed == QueuePushStatus::kAccepted) {
+    terminal_sent = true;
+    return;
+  }
+  output_overflow = true;
 }
 
 RemoteSessionServer::RemoteSessionServer(runtime::SessionApp& app,
@@ -490,7 +497,11 @@ RemoteSessionServerStats RemoteSessionServer::stats() const {
     return RemoteSessionServerStats{};
   }
   const std::lock_guard<std::mutex> lock(impl_->mutex);
-  return impl_->stats;
+  RemoteSessionServerStats snapshot = impl_->stats;
+  const auto queue_stats = impl_->outbound.stats();
+  snapshot.output_queue_capacity = queue_stats.capacity;
+  snapshot.output_queue_peak = queue_stats.peak_size;
+  return snapshot;
 }
 
 }  // namespace nexweave::transport

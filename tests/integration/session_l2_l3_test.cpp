@@ -497,6 +497,9 @@ void TestL2OverlapAndEvidence() {
   CHECK(result.terminal_marker == ActivityMarker::kTerminalSucceeded);
   CHECK(result.text == answer);
   CHECK(!result.backpressure);
+  // 文本分句缓冲受显式配置约束；允许最多 3 字节未收完的 UTF-8 序列。
+  CHECK(result.peak_text_buffer_bytes > 0);
+  CHECK(result.peak_text_buffer_bytes <= config.text_chunk_max_bytes + 3);
   CHECK(result.decision.hits.size() == 1);
   CHECK(result.decision.hits.front().id == "geo-capital-fr");
 

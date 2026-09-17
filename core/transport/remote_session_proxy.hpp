@@ -70,13 +70,18 @@ struct RemoteSessionProxyConfig {
   // queue_* 返回 kBackendFailure，输出队列满时代理进入显式失败并停止子进程。
   std::size_t max_pending_input_events = 64;
   std::size_t max_pending_output_events = 1024;
+  // 终态缓存容量与保留期限。终态即使没有及时从输出队列取走，也可以在期限内查询；
+  // 超过期限查询返回明确失败。两者都必须为正。
+  std::size_t terminal_cache_capacity = 8;
+  std::chrono::milliseconds terminal_retention{30000};
 };
 
 // 配置校验：进程参数、端点文件路径、预算和容量都必须有效。只读，不启动进程、不创建 socket。
 domain::OperationResult validate_remote_session_proxy_config(
     const RemoteSessionProxyConfig& config);
 
-// 代理只读账目快照。计数只增不减，用于核对入队、发送、接收和失败路径。
+// 代理只读账目快照。同一次 start 生命周期内计数只增不减；start 成功开始新的
+// 子进程会话时清零，避免上一会话的峰值和失败被误读成本会话事实。
 struct RemoteSessionProxyStats {
   std::uint64_t queued_input_events = 0;
   std::uint64_t sent_input_events = 0;
@@ -85,6 +90,14 @@ struct RemoteSessionProxyStats {
   std::uint64_t output_queue_full = 0;
   std::uint64_t send_failures = 0;
   std::uint64_t receive_timeouts = 0;
+  std::size_t input_queue_capacity = 0;
+  std::size_t output_queue_capacity = 0;
+  std::size_t input_queue_peak = 0;
+  std::size_t output_queue_peak = 0;
+  std::size_t terminal_cache_capacity = 0;
+  std::size_t terminal_cache_entries = 0;
+  std::size_t terminal_cache_peak_entries = 0;
+  std::size_t terminal_cache_expired_markers = 0;
 };
 
 class RemoteSessionProxy final {
@@ -121,6 +134,11 @@ class RemoteSessionProxy final {
   std::size_t receive_events(std::vector<protocol::DataEvent>& out,
                              std::size_t max_events,
                              std::chrono::milliseconds timeout);
+
+  // 查询终态缓存。命中返回事件副本；已过期返回 kTimeout；从未记录或过期标记已被容量
+  // 淘汰返回 kAlreadyCompleted。查询无阻塞、不改变缓存保留期限。
+  domain::Result<protocol::DataEvent> query_terminal(const std::string& request_id,
+                                                     std::uint64_t generation) const;
 
   // 最近一次传输/进程错误快照；成功时为 kNone。返回副本，可跨线程调用。
   domain::Error last_error() const;

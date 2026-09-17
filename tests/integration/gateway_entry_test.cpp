@@ -748,6 +748,9 @@ void TestSlowClientClosesAtTheDeclaredBound() {
   CHECK(stats.close_reason == GatewayCloseReason::kSlowClient);
   // 关键不变量：待发数据始终不超过声明上限，因此“客户端不读”不会变成无限内存占用。
   CHECK(stats.pending_data_bytes <= config.max_pending_data_bytes);
+  CHECK(stats.pending_data_capacity_bytes == config.max_pending_data_bytes);
+  CHECK(stats.pending_data_peak_bytes <= config.max_pending_data_bytes);
+  CHECK(stats.pending_data_peak_bytes > 0);
   CHECK(fixture.gateway.status().slow_client_closes == 1);
   // 被关闭的连接仍然可以被取走已产生的字节，客户端因此能看到一段有界的、不掺假的输出。
   CHECK(!Drain(fixture.gateway, fixture.client).empty());

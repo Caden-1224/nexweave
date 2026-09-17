@@ -20,13 +20,13 @@
 // “输入自然结束”。close 幂等，关闭后 read/push 明确失败。
 #pragma once
 
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <memory>
 #include <mutex>
 
 #include "../capability/backend.hpp"
+#include "bounded_queue.hpp"
 
 namespace nexweave::runtime {
 
@@ -41,12 +41,17 @@ struct QueuedAudioSourceConfig {
 domain::OperationResult validate_queued_audio_source_config(
     const QueuedAudioSourceConfig& config);
 
-// 只读账目快照。字段只增不减，用于证明生产、消费、拒绝被分别记录。
+// 只读账目快照。字段在同一个输入轮次内只增不减；close 后再次 open 会开始新轮次并从 0
+// 重新计数，因为容量与峰值事实属于具体一轮。
 struct QueuedAudioSourceStats {
   std::uint64_t pushed = 0;
   std::uint64_t popped = 0;
   std::uint64_t rejected_full = 0;
   std::uint64_t cancelled_reads = 0;
+  std::size_t capacity_frames = 0;
+  std::size_t peak_pending_frames = 0;
+  std::uint64_t wait_count = 0;
+  std::uint64_t wait_timeouts = 0;
 };
 
 // 有界且可取消的音频源。调用方必须先 open()（或先 push，open 后消费），再按音频合同
@@ -94,15 +99,15 @@ class QueuedAudioSource final : public capability::IAudioSource {
   // 记录一次取消读取；在持锁路径上调用，避免统计与终态读取不一致。
   void note_cancelled_read_locked();
 
+  // 队列对象在 open 后固定；初始构造出一份空队列，允许启动窗口内的 push 先到。
+  std::unique_ptr<BoundedQueue<domain::AudioFrame>> queue_;
   QueuedAudioSourceConfig config_;
   mutable std::mutex mutex_;
-  std::condition_variable condition_;
-  std::deque<domain::AudioFrame> pending_;
+  std::uint64_t cancelled_reads_ = 0;
   bool opened_ = false;
   bool closed_ = false;
   bool ended_ = false;
   bool cancelled_ = false;
-  QueuedAudioSourceStats stats_{};
 };
 
 }  // namespace nexweave::runtime
