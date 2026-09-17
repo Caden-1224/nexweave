@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -73,6 +74,24 @@ std::string EndpointFilePath() {
   return value == nullptr ? std::string() : std::string(value);
 }
 
+std::string TraceFilePath() {
+  const char* value = std::getenv("NEXWEAVE_REMOTE_SESSION_TRACE_FILE");
+  return value == nullptr ? std::string() : std::string(value);
+}
+
+void WriteTrace(const std::string& path, const std::vector<nexweave::runtime::ActivityMarker>& trace) {
+  if (path.empty()) {
+    return;
+  }
+  std::ofstream file(path);
+  if (!file.is_open()) {
+    return;
+  }
+  for (const auto marker : trace) {
+    file << static_cast<int>(marker) << "\n";
+  }
+}
+
 bool WriteEndpoint(const std::string& path, const std::string& endpoint) {
   std::ofstream file(path);
   if (!file.is_open()) {
@@ -90,6 +109,7 @@ int main() {
     std::cerr << "缺少远端会话端点文件环境变量" << std::endl;
     return 2;
   }
+  const std::string trace_file = TraceFilePath();
 
   std::signal(SIGTERM, HandleSignal);
   std::signal(SIGINT, HandleSignal);
@@ -181,6 +201,7 @@ int main() {
   if (monitor.joinable()) {
     monitor.join();
   }
+  WriteTrace(trace_file, app.trace());
   if (!served.ok() && served.error.code != nexweave::domain::ErrorCode::kCancelled) {
     std::cerr << "远端会话失败: " << served.error.message << std::endl;
     return 7;

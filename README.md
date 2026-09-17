@@ -33,7 +33,7 @@ NexWeave 面向华为昇腾 AI 计算平台、鲲鹏处理器平台、瑞芯微 
 | WSL / 通用 Linux 开发环境 | 构建核心模块和执行确定性测试 | 已验证当前开发配置 |
 | 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | 硬件适配尚未完成 |
 
-> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期、进程内 Gateway 的控制请求入口与有界发送、ZeroMQ 控制传输和 multipart 数据面适配、子进程的显式启动就绪、停止升级与身份隔离，多进程 Gateway 控制路由，独立子进程 Session 的增量音频上行与输出事件回流，以及音频、控制响应、数据事件和终态缓存的有界策略。真实模型、ALSA/AEC/VAD 和板端语音交互尚未交付。
+> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期、进程内 Gateway 的控制请求入口与有界发送、ZeroMQ 控制传输和 multipart 数据面适配、子进程的显式启动就绪、停止升级与身份隔离，多进程 Gateway 控制路由，独立子进程 Session 的增量音频上行与输出事件回流，Linux 多进程端到端链路，以及音频、控制响应、数据事件和终态缓存的有界策略。真实模型、ALSA/AEC/VAD 和板端语音交互尚未交付。
 
 <a id="background"></a>
 
@@ -237,9 +237,10 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | 多进程 Gateway 控制路由 | 已实现基础版 | 复用同一套 NDJSON/ControlRequest/ControlResponse 与幂等语义，经有界工作线程池异步转发到独立进程中的 Gateway+Supervisor；慢转发与推理阻塞时其他控制操作仍可推进，远端不可用返回结构化错误 |
 | 多进程 Session 适配 | 已实现基础版 | 独立子进程承载 Session 与确定性 Fake 后端；队列音频源逐帧上行，PAIR 数据面回传文本、PCM 与终态；取消、满队列、子进程启动失败和重复启停都有结构化收敛 |
 | 有界数据流与背压 | 已实现基础版 | 公共有界队列区分拒绝、淘汰和关闭策略；音频、控制响应、数据事件和终态缓存记录容量、峰值与等待/过期事实；连续音频不使用 latest-only；慢消费者、输出队列满和终态查询有测试；真实 HWM 压力与完整 Linux profile 暂未交付 |
+| Linux 多进程端到端链路 | 已实现基础版 | 本地 Gateway 控制路由经独立 Session 进程完成增量输入、Fake Session 推理、文本/PCM/终态回传和退出清理；单活跃忙碌拒绝与远端播放/生成顺序有夹具证据；故障恢复、profile 启停和对照证据由后续任务继续 |
 | Mock profile 确定性入口 | 已实现 | 单进程组装工厂、监督器与请求入口，四个可显式选择的场景（正常、慢消费、取消、故障）、固定输入逐字节可复现、退出码语义、运行结束清理自证 |
 | Mock 运行证据 | 已实现 | 一次运行产生五份产物（run-manifest.json、events.jsonl、metrics.jsonl、protocol.jsonl、summary.md）；单调时间族与调度步数族分开标注，未测量项如实标注；`--evidence-dir` 留档，`--out-dir` 仍验证“返回即无残留” |
-| Gateway 传输与 ZeroMQ | 控制面与数据面适配已实现基础版 | ZeroMQ REQ/REP 控制传输、deadline 与幂等；PAIR multipart 输入音频/输出事件、二元长度与顺序校验；统一队列与终态缓存已接入，完整 Linux 多进程链路暂未交付 |
+| Gateway 传输与 ZeroMQ | 控制面与数据面适配已实现基础版 | ZeroMQ REQ/REP 控制传输、deadline 与幂等；PAIR multipart 输入音频/输出事件、二元长度与顺序校验；统一队列与终态缓存已接入，Linux 多进程端到端基础链路已交付；故障恢复与 profile 对照暂未交付 |
 | 本地知识库与真实检索 | 已实现基础版 | 固定 JSONL 知识库、BM25 词项检索、L0-L3 阈值与上下文字节预算校准；板端真实知识库部署待后续任务 |
 | RK3576 模型与音频前端 | 规划中 | RKNN、RKLLM、MeloTTS、ALSA、AEC 和 VAD |
 | 板端故障与稳定性验证 | 待前置能力完成 | 真实闭环、打断、恢复和资源实验 |
@@ -400,10 +401,11 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 - [x] 多进程 Gateway 控制路由到独立 Supervisor
 - [x] 多进程 Session 适配：独立子进程、增量音频上行与事件回流
 - [x] 有界数据流与背压：音频/控制/数据/终态容量、峰值、关闭与过期策略
+- [x] Linux 多进程端到端链路：增量输入、独立 Session、事件回流与退出清理
 - [x] 进程内 Gateway 请求入口、请求幂等与有界发送
 - [x] Mock profile 确定性入口与四个可复现场景
 - [x] Mock 运行证据与运行目录（run-manifest、events、metrics 留档）
-- [ ] 端到端多进程链路、统一背压与故障恢复
+- [ ] Linux profile 故障恢复、启停清理与对照证据
 - [ ] 本地知识库、真实检索与路由校准
 - [ ] RK3576 模型、全双工音频前端与语音打断
 - [ ] 故障恢复、板端实验与发布验证

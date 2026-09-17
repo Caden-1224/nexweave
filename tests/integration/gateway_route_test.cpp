@@ -1,10 +1,15 @@
 #include "../test_support.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -12,6 +17,7 @@
 
 #include "child_process.hpp"
 #include "gateway.hpp"
+#include "remote_session_route.hpp"
 #include "zmq_gateway_route.hpp"
 
 using namespace nexweave;
@@ -20,8 +26,126 @@ using namespace std::chrono_literals;
 #ifndef NEXWEAVE_REMOTE_GATEWAY_FIXTURE
 #error "测试需要 NEXWEAVE_REMOTE_GATEWAY_FIXTURE 指向远端网关夹具"
 #endif
+#ifndef NEXWEAVE_REMOTE_SESSION_FIXTURE
+#error "测试需要 NEXWEAVE_REMOTE_SESSION_FIXTURE 指向远端 Session 夹具"
+#endif
 
 namespace {
+
+// 可控音频源：测试线程向队列推送帧，路由输入线程阻塞读取；EOF 由 Finish 显式给出。
+// 这样测试可以在输入结束前观察远端是否已经消费前序音频并回传终态。
+struct ScriptedSourceState {
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::deque<domain::AudioFrame> frames;
+  bool ended = false;
+  bool cancelled = false;
+};
+
+class ScriptedAudioSource final : public capability::IAudioSource {
+ public:
+  explicit ScriptedAudioSource(std::shared_ptr<ScriptedSourceState> state)
+      : state_(std::move(state)) {}
+
+  domain::OperationResult open() override {
+    return domain::OperationResult::success();
+  }
+
+  domain::Result<domain::AudioFrame> read() override {
+    std::unique_lock<std::mutex> lock(state_->mutex);
+    state_->condition.wait(lock, [this] {
+      return state_->cancelled || state_->ended || !state_->frames.empty();
+    });
+    if (state_->cancelled) {
+      return domain::Result<domain::AudioFrame>::failure(domain::ErrorCode::kCancelled,
+                                                         "输入源已取消");
+    }
+    if (!state_->frames.empty()) {
+      domain::AudioFrame frame = std::move(state_->frames.front());
+      state_->frames.pop_front();
+      return domain::Result<domain::AudioFrame>::success(std::move(frame));
+    }
+    return domain::Result<domain::AudioFrame>::failure(domain::ErrorCode::kAlreadyCompleted,
+                                                       "输入源已结束");
+  }
+
+  domain::OperationResult cancel() noexcept override {
+    {
+      const std::lock_guard<std::mutex> lock(state_->mutex);
+      state_->cancelled = true;
+    }
+    state_->condition.notify_all();
+    return domain::OperationResult::success();
+  }
+
+  domain::OperationResult close() noexcept override {
+    {
+      const std::lock_guard<std::mutex> lock(state_->mutex);
+      state_->ended = true;
+    }
+    state_->condition.notify_all();
+    return domain::OperationResult::success();
+  }
+
+ private:
+  std::shared_ptr<ScriptedSourceState> state_;
+};
+
+void PushSourceFrame(const std::shared_ptr<ScriptedSourceState>& state,
+                     std::int16_t value) {
+  const auto frame = domain::AudioFrame::from_samples(
+      std::vector<std::int16_t>(domain::kAudioFrameSamples, value));
+  CHECK(frame.ok());
+  {
+    const std::lock_guard<std::mutex> lock(state->mutex);
+    state->frames.push_back(frame.value);
+  }
+  state->condition.notify_all();
+}
+
+void FinishSource(const std::shared_ptr<ScriptedSourceState>& state) {
+  {
+    const std::lock_guard<std::mutex> lock(state->mutex);
+    state->ended = true;
+  }
+  state->condition.notify_all();
+}
+
+std::vector<protocol::DataEvent> CollectDataEvents(gateway::Gateway& entry,
+                                                   gateway::ConnectionId connection,
+                                                   std::chrono::milliseconds budget) {
+  std::vector<protocol::DataEvent> events;
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (std::chrono::steady_clock::now() < deadline) {
+    (void)entry.deliver_settled();
+    std::string bytes;
+    entry.flush(connection, bytes, 64U * 1024U);
+    std::size_t position = 0;
+    bool terminal = false;
+    while (position < bytes.size()) {
+      const std::size_t newline = bytes.find('\n', position);
+      if (newline == std::string::npos) {
+        break;
+      }
+      const std::string line = bytes.substr(position, newline - position);
+      position = newline + 1;
+      const auto decoded = protocol::decode_event_metadata(line);
+      if (!decoded.ok()) {
+        continue;
+      }
+      if (decoded.value->end) {
+        terminal = true;
+      }
+      events.push_back(*decoded.value);
+    }
+    if (terminal) {
+      return events;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  return events;
+}
+
 
 std::string MakeTempPath() {
   char path[] = "/tmp/nexweave-route-XXXXXX";
@@ -365,10 +489,108 @@ void TestRouteModePreservesEventQueue() {
   CHECK(done.value->end);
 }
 
+void TestRemoteSessionRouteEndToEnd() {
+  auto source_state = std::make_shared<ScriptedSourceState>();
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = NEXWEAVE_REMOTE_SESSION_FIXTURE;
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = MakeTempPath();
+  config.proxy.ready_timeout = 5000ms;
+  config.proxy.pump_interval = 5ms;
+  config.proxy.terminal_retention = 30s;
+  const std::string trace_file = MakeTempPath();
+  config.proxy.child.environment = {
+      "NEXWEAVE_REMOTE_SESSION_TRACE_FILE=" + trace_file};
+  config.input_factory = [source_state]() -> std::unique_ptr<capability::IAudioSource> {
+    return std::make_unique<ScriptedAudioSource>(source_state);
+  };
+  config.stream_id = "remote-session";
+
+  transport::RemoteSessionRoute route(config);
+  gateway::Gateway entry(route);
+  const gateway::ConnectionId first = entry.open_connection();
+  const gateway::ConnectionId second = entry.open_connection();
+  CHECK(first != gateway::kInvalidConnectionId);
+  CHECK(second != gateway::kInvalidConnectionId);
+
+  const auto started = Exchange(
+      entry, first, MakeRequest("r-rs-start", "start", "w-1", "s-rs", 5000ms));
+  CHECK(started.ok());
+  CHECK(started.value->result.ok());
+
+  // 第二个客户端在首个会话终态前不能创建并行会话；忙碌拒绝必须来自路由本身。
+  const auto busy = Exchange(
+      entry, second, MakeRequest("r-rs-busy", "start", "w-2", "s-rs-2", 1000ms));
+  CHECK(busy.ok());
+  CHECK(!busy.value->result.ok());
+  CHECK(busy.value->result.error.code == domain::ErrorCode::kBusy);
+
+  // 输入尚未结束时，远端应先完成一段说话并回传文本/PCM/终态。
+  PushSourceFrame(source_state, 1000);
+  PushSourceFrame(source_state, 1000);
+  PushSourceFrame(source_state, 0);
+  PushSourceFrame(source_state, 0);
+  const auto events = CollectDataEvents(entry, first, 5000ms);
+  bool has_text = false;
+  bool has_pcm = false;
+  bool has_terminal = false;
+  for (const protocol::DataEvent& event : events) {
+    if (event.type == protocol::DataEventType::kFinal && !event.text.empty()) {
+      has_text = true;
+    }
+    if (event.type == protocol::DataEventType::kPcm) {
+      has_pcm = true;
+    }
+    if (event.end) {
+      has_terminal = true;
+    }
+  }
+  CHECK(has_text);
+  CHECK(has_pcm);
+  CHECK(has_terminal);
+  {
+    const std::lock_guard<std::mutex> lock(source_state->mutex);
+    CHECK(!source_state->ended);
+  }
+
+  FinishSource(source_state);
+  const auto exited = Exchange(
+      entry, first, MakeRequest("r-rs-exit", "exit", "w-1", "s-rs", 2000ms));
+  CHECK(exited.ok());
+  CHECK(exited.value->result.ok());
+  CHECK(entry.status().closed);
+
+  // 独立进程中的 SessionApp 也必须保持“播放开始早于文本定稿”的单进程语义；
+  // 这里读取远端夹具落盘的标记顺序，而不是用客户端事件到达顺序冒充。
+  std::vector<int> markers;
+  {
+    std::ifstream trace(trace_file);
+    int marker = 0;
+    while (trace >> marker) {
+      markers.push_back(marker);
+    }
+  }
+  const auto playback_started = std::find(
+      markers.begin(), markers.end(),
+      static_cast<int>(runtime::ActivityMarker::kPlaybackStarted));
+  const auto generation_done = std::find(
+      markers.begin(), markers.end(),
+      static_cast<int>(runtime::ActivityMarker::kGenerationDone));
+  CHECK(playback_started != markers.end());
+  CHECK(generation_done != markers.end());
+  CHECK(playback_started < generation_done);
+
+  // 夹具退出后回收本用例创建的临时文件；端点文件与 trace 文件都不能留给下一次运行。
+  std::error_code remove_error;
+  std::filesystem::remove(trace_file, remove_error);
+  std::filesystem::remove(config.proxy.endpoint_file, remove_error);
+}
+
 }  // namespace
 
 int main() {
   TestRemoteControlRouteEndToEnd();
+  TestRemoteSessionRouteEndToEnd();
   TestUnavailableEndpointReturnsStructuredError();
   TestSlowForwardDoesNotBlockOtherControls();
   TestRouteModePreservesEventQueue();

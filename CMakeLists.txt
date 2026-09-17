@@ -132,6 +132,7 @@ add_library(nexweave_transport STATIC
   core/transport/zmq_gateway_route.cpp
   core/transport/remote_session_server.cpp
   core/transport/remote_session_proxy.cpp
+  core/transport/remote_session_route.cpp
 )
 target_include_directories(nexweave_transport PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/transport
@@ -285,7 +286,8 @@ set_tests_properties(zmq_control_integration PROPERTIES TIMEOUT 60)
 nexweave_test(gateway_route tests/integration/gateway_route_test.cpp integration)
 target_link_libraries(nexweave_gateway_route_test PRIVATE nexweave_transport)
 target_compile_definitions(nexweave_gateway_route_test PRIVATE
-  NEXWEAVE_REMOTE_GATEWAY_FIXTURE="$<TARGET_FILE:nexweave_remote_gateway_fixture>")
+  NEXWEAVE_REMOTE_GATEWAY_FIXTURE="$<TARGET_FILE:nexweave_remote_gateway_fixture>"
+  NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>")
 # 夹具包含真实线程、ZeroMQ socket 与独立子进程，挂起时必须在 60 秒内变成明确失败。
 set_tests_properties(gateway_route_integration PROPERTIES TIMEOUT 60)
 
