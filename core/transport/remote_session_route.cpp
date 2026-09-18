@@ -1,8 +1,10 @@
 #include "remote_session_route.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -77,6 +79,9 @@ domain::OperationResult validate_remote_session_route_config(
   if (config.frame_interval.count() < 0) {
     return OperationResult::failure(ErrorCode::kInvalidInput, "帧间隔不能为负");
   }
+  if (config.cancel_timeout.count() <= 0) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "取消收敛预算必须为正");
+  }
   return OperationResult::success();
 }
 
@@ -102,10 +107,17 @@ struct RemoteSessionRoute::Impl {
   std::atomic<bool> terminal_seen{false};
   std::atomic<capability::IAudioSource*> source{nullptr};
   std::uint64_t generation = 0;
+  std::string request_id;
   std::string work_id;
   std::string session_id;
   State state = State::kIdle;
   domain::Error last_error{};
+  // 取消计时与终态过滤。cancel_accepted_at 在第一次取消受理时写入；取消预算到期且
+  // 还没有终态时，poll_events() 合成一条 kTimeout 终态并请求代理停止。
+  std::chrono::steady_clock::time_point cancel_accepted_at{};
+  std::chrono::steady_clock::time_point cancel_deadline{};
+  bool cancellation_pending = false;
+  RemoteSessionRouteStats stats{};
 
   domain::Result<ControlResponse> HandleStart(const ControlRequest& request);
   domain::Result<ControlResponse> HandleQuery(const ControlRequest& request);
@@ -157,6 +169,10 @@ void RemoteSessionRoute::Impl::CleanupLocked() {
   state = State::kIdle;
   input_finished.store(false);
   terminal_seen.store(false);
+  cancellation_pending = false;
+  cancel_accepted_at = std::chrono::steady_clock::time_point{};
+  cancel_deadline = std::chrono::steady_clock::time_point{};
+  request_id.clear();
   work_id.clear();
   session_id.clear();
 }
@@ -184,7 +200,15 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleStart(
   stop_requested.store(false);
   input_finished.store(false);
   terminal_seen.store(false);
+  cancellation_pending = false;
+  cancel_accepted_at = std::chrono::steady_clock::time_point{};
+  cancel_deadline = std::chrono::steady_clock::time_point{};
+  if (generation == std::numeric_limits<std::uint64_t>::max()) {
+    return domain::Result<ControlResponse>::failure(ErrorCode::kBackendFailure,
+                                                    "远端会话代际已经耗尽");
+  }
   ++generation;
+  request_id = request.request_id;
   work_id = request.work_id;
   session_id = request.session_id;
 
@@ -221,6 +245,7 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleStart(
     return domain::Result<ControlResponse>::failure(ErrorCode::kBackendFailure,
                                                     "创建输入线程失败");
   }
+  ++stats.starts_accepted;
 
   const auto response = MakeResponse(
       request, OperationResult::success());
@@ -241,6 +266,7 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleCancel(
     const ControlRequest& request) {
   std::lock_guard<std::mutex> lock(mutex);
   if (state == State::kIdle || state == State::kCompleted) {
+    ++stats.duplicate_cancel_requests;
     ControlResponse response = MakeResponse(request, OperationResult::success());
     response.result.error.message = StateFactLocked();
     return domain::Result<ControlResponse>::success(std::move(response));
@@ -249,11 +275,29 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleCancel(
     return domain::Result<ControlResponse>::failure(ErrorCode::kInvalidInput,
                                                     "当前状态不能取消");
   }
+
+  const auto now = std::chrono::steady_clock::now();
+  if (state == State::kActive) {
+    auto budget = config.cancel_timeout;
+    if (request.deadline.count() > 0) {
+      budget = std::min(budget, request.deadline);
+    }
+    cancel_accepted_at = now;
+    cancel_deadline = now + budget;
+    cancellation_pending = true;
+    ++stats.cancel_requests;
+  } else {
+    // 重复取消不延长原预算：取消必须按第一次受理时承诺的收敛时间报告超时或终态。
+    ++stats.duplicate_cancel_requests;
+  }
+
   stop_requested.store(true);
   capability::IAudioSource* audio = source.load();
   if (audio != nullptr) {
     (void)audio->cancel();
   }
+  // 输入队列已满时 queue_cancel_stream() 仍返回成功：代理把取消置为待发送事件，
+  // 等已排队的输入发完后再发送，因此满队列不会吞掉停止指令。
   (void)proxy.queue_cancel_stream();
   state = State::kStopping;
   ControlResponse response = MakeResponse(request, OperationResult::success());
@@ -286,6 +330,15 @@ void RemoteSessionRoute::Impl::RunInput(
   const auto started = proxy.queue_start_stream(config.stream_id, generation_value);
   if (!started.ok()) {
     RecordError(started.error);
+    (void)audio_source->close();
+    input_finished.store(true);
+    source.store(nullptr);
+    return;
+  }
+  // 取消可能早于输入线程执行到 queue_start_stream()：此时第一次 queue_cancel_stream()
+  // 会因为没有活动输入流而失败。必须在流建立后补一次取消，否则远端会永远等待输入。
+  if (stop_requested.load()) {
+    (void)proxy.queue_cancel_stream();
     (void)audio_source->close();
     input_finished.store(true);
     source.store(nullptr);
@@ -368,21 +421,102 @@ std::size_t RemoteSessionRoute::poll_events(gateway::ControlRouteOwner owner,
     return 0;
   }
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  if (impl_->state != Impl::State::kActive && impl_->state != Impl::State::kCompleted &&
-      impl_->state != Impl::State::kStopping) {
+  Impl& self = *impl_;
+  if (self.state != Impl::State::kActive && self.state != Impl::State::kCompleted &&
+      self.state != Impl::State::kStopping) {
     return 0;
   }
+  if (self.terminal_seen.load()) {
+    // 终态已经交付后，旧会话后续到达的任何输出都不再属于当前请求。主动清空软件队列，
+    // 让“输出队列清空”成为可观察事实；socket 中仍在途的数据会由终态过滤丢弃。
+    (void)self.proxy.discard_output_events();
+    return 0;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  if (self.state == Impl::State::kStopping && self.cancellation_pending &&
+      now >= self.cancel_deadline) {
+    // 取消预算到期且没有收到终态：交付唯一的结构化超时终态，并请求后台停止。
+    // 先封锁后续输出 poll，避免迟到的 done/error 与这条终态形成两个操作结论。
+    DataEvent timeout;
+    timeout.request_id = self.request_id;
+    timeout.session_id = self.session_id;
+    timeout.generation = self.generation;
+    timeout.type = protocol::DataEventType::kError;
+    timeout.end = true;
+    timeout.error_code = ErrorCode::kTimeout;
+    timeout.message = "取消后远端未在预算内收敛";
+    out.push_back(std::move(timeout));
+
+    self.terminal_seen.store(true);
+    self.state = Impl::State::kCompleted;
+    self.cancellation_pending = false;
+    ++self.stats.cancel_timeouts;
+    ++self.stats.terminal_events_delivered;
+    const auto cancel_started = self.cancel_accepted_at;
+    if (cancel_started != std::chrono::steady_clock::time_point{}) {
+      self.stats.last_cancel_accept_to_terminal = std::chrono::duration_cast<
+          std::chrono::microseconds>(now - cancel_started);
+    }
+    self.proxy.request_stop();
+    (void)self.proxy.discard_output_events();
+    if (cancel_started != std::chrono::steady_clock::time_point{}) {
+      self.stats.last_cancel_accept_to_queue_clear = std::chrono::duration_cast<
+          std::chrono::microseconds>(std::chrono::steady_clock::now() - cancel_started);
+    }
+    self.cancel_accepted_at = std::chrono::steady_clock::time_point{};
+    return 1;
+  }
+
   std::vector<DataEvent> events;
-  const std::size_t count = impl_->proxy.receive_events(events, max_events,
-                                                        std::chrono::milliseconds(0));
+  (void)self.proxy.receive_events(events, max_events, std::chrono::milliseconds{0});
+  std::size_t delivered = 0;
   for (DataEvent& event : events) {
-    if (event.end) {
-      impl_->terminal_seen.store(true);
-      impl_->state = Impl::State::kCompleted;
+    if (self.terminal_seen.load()) {
+      // 同一批或后续到达的旧 partial/final/token/PCM/done/error 一律不进入上层；
+      // 它们不改变本轮的终态，也不允许把请求复制成第二个操作结论。
+      ++self.stats.stale_events_filtered;
+      continue;
+    }
+
+    const bool terminal = event.end;
+    if (terminal) {
+      self.terminal_seen.store(true);
+      self.state = Impl::State::kCompleted;
+      self.cancellation_pending = false;
+      ++self.stats.terminal_events_delivered;
     }
     out.push_back(std::move(event));
+    ++delivered;
+
+    if (terminal) {
+      const auto cancel_started = self.cancel_accepted_at;
+      const auto terminal_now = std::chrono::steady_clock::now();
+      if (cancel_started != std::chrono::steady_clock::time_point{}) {
+        self.stats.last_cancel_accept_to_terminal = std::chrono::duration_cast<
+            std::chrono::microseconds>(terminal_now - cancel_started);
+      }
+      (void)self.proxy.discard_output_events();
+      if (cancel_started != std::chrono::steady_clock::time_point{}) {
+        self.stats.last_cancel_accept_to_queue_clear = std::chrono::duration_cast<
+            std::chrono::microseconds>(std::chrono::steady_clock::now() - cancel_started);
+      }
+      self.cancel_accepted_at = std::chrono::steady_clock::time_point{};
+    }
   }
-  return count;
+  return delivered;
+}
+
+RemoteSessionRouteStats RemoteSessionRoute::stats() const {
+  RemoteSessionRouteStats snapshot;
+  if (impl_ == nullptr) {
+    return snapshot;
+  }
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  snapshot = impl_->stats;
+  snapshot.cancellation_pending = impl_->cancellation_pending;
+  snapshot.terminal_delivered = impl_->terminal_seen.load();
+  return snapshot;
 }
 
 }  // namespace nexweave::transport

@@ -78,5 +78,18 @@ int main() {
     CHECK(source.stats().cancelled_reads >= 1);
   }
 
+  {
+    // 保护不变量：取消先于 open() 到达时，建立输入必须显式返回 kCancelled，不能把
+    // 取消标志清掉后留下一个已关闭但终态标志为假的队列；close() 之后仍可开始新轮次。
+    QueuedAudioSource source;
+    CHECK(source.cancel().ok());
+    const auto rejected_open = source.open();
+    CHECK(!rejected_open.ok());
+    CHECK(rejected_open.error.code == ErrorCode::kCancelled);
+
+    CHECK(source.close().ok());
+    CHECK(source.open().ok());
+  }
+
   return 0;
 }

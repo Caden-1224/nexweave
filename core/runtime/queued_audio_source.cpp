@@ -40,6 +40,13 @@ domain::OperationResult QueuedAudioSource::open() {
   if (opened_ && !closed_) {
     return OperationResult::failure(ErrorCode::kAlreadyCompleted, "音频源已经打开");
   }
+  // 取消可能先于会话线程真正打开输入：此时若 open() 只是清掉 cancelled_，会留下一个
+  // 已经关闭但三个终态标志都为假的队列，read() 会把这种内部不一致报告成设备无数据。
+  // 取消状态只能由 close() 清除；未打开先取消时必须让建立输入显式失败，而不是假装
+  // 可以重新开始一轮。
+  if (!opened_ && cancelled_) {
+    return OperationResult::failure(ErrorCode::kCancelled, "音频源已经取消");
+  }
   // close() 之后的 open 是同一对象的新输入轮次：旧队列不保留，取消标志复位。
   // 初始 open 前的 push 是允许的启动窗口，不能被清掉，否则先到帧会被静默丢弃。
   if (closed_) {

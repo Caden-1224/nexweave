@@ -10,8 +10,13 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
+
+#ifndef NEXWEAVE_REMOTE_SCRIPTED_FIXTURE
+#error "测试需要 NEXWEAVE_REMOTE_SCRIPTED_FIXTURE 指向脚本夹具"
+#endif
 
 namespace {
 
@@ -193,6 +198,69 @@ void TestStartFailureAndRepeatLifecycle() {
   CHECK(!proxy.running());
 }
 
+// 保护不变量：输入队列已满时取消事件不能丢失。fq-block 夹具在 ready 后故意不读输入，
+// 使代理输入队列在一个事件内达到上限；取消必须仍能越过数据队列送达对端，并得到唯一
+// kCancelled 终态。
+void TestCancelWhenInputQueueFull() {
+  RemoteSessionProxyConfig config =
+      ProxyConfig("full-cancel", NEXWEAVE_REMOTE_SCRIPTED_FIXTURE);
+  config.max_pending_input_events = 1;
+  config.data.send_high_water_mark = 1;
+  config.data.send_timeout = std::chrono::milliseconds(2000);
+  config.child.environment = {
+      "NEXWEAVE_SCRIPTED_MODE=block",
+      "NEXWEAVE_SCRIPTED_BLOCK_MS=500",
+  };
+
+  RemoteSessionProxy proxy(config);
+  CHECK(proxy.start().ok());
+  CHECK(proxy.queue_start_stream("remote-session", 1).ok());
+
+  bool input_queue_full = false;
+  for (int attempt = 0; attempt < 512; ++attempt) {
+    const auto queued = proxy.queue_frame(ToneFrame(static_cast<std::int16_t>(attempt % 100 + 1)));
+    if (!queued.ok()) {
+      CHECK(queued.error.code == ErrorCode::kBackendFailure);
+      input_queue_full = true;
+      break;
+    }
+  }
+  CHECK_MESSAGE(input_queue_full, "未观察到输入事件队列满，夹具前置条件不成立");
+
+  // 旧实现把取消事件塞进同一个有界队列，此时会返回 kBackendFailure 并让取消丢失。
+  CHECK(proxy.queue_cancel_stream().ok());
+
+  const std::vector<DataEvent> events =
+      CollectUntilTerminal(proxy, std::chrono::seconds(5));
+  AssertHasTerminal(events, DataEventType::kError, ErrorCode::kCancelled);
+  CHECK(proxy.stop().ok());
+  CHECK(!proxy.running());
+}
+
+// 保护不变量：旧代际或重复终态被传输层拒绝时，代理只应丢弃并记账，不能把它升级成
+// kBackendFailure 并杀死仍在服务当前请求的子进程。
+void TestStaleOutputEventsDoNotStopProxy() {
+  RemoteSessionProxyConfig config =
+      ProxyConfig("stale", NEXWEAVE_REMOTE_SCRIPTED_FIXTURE);
+  config.child.environment = {"NEXWEAVE_SCRIPTED_MODE=stale"};
+  RemoteSessionProxy proxy(config);
+  CHECK(proxy.start().ok());
+
+  const std::vector<DataEvent> events =
+      CollectUntilTerminal(proxy, std::chrono::seconds(5));
+  AssertHasTerminal(events, DataEventType::kDone, ErrorCode::kNone);
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline &&
+         proxy.stats().stale_output_events_filtered == 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  CHECK(proxy.stats().stale_output_events_filtered >= 1);
+  CHECK(proxy.last_error().ok());
+  CHECK(proxy.stop().ok());
+  CHECK(!proxy.running());
+}
+
 }  // namespace
 
 int main() {
@@ -200,5 +268,7 @@ int main() {
   TestCancelBeforeTurn();
   TestOutputQueueOverflow();
   TestStartFailureAndRepeatLifecycle();
+  TestCancelWhenInputQueueFull();
+  TestStaleOutputEventsDoNotStopProxy();
   return 0;
 }

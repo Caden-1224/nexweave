@@ -90,10 +90,21 @@ struct RemoteSessionProxyStats {
   std::uint64_t output_queue_full = 0;
   std::uint64_t send_failures = 0;
   std::uint64_t receive_timeouts = 0;
+  // 传输层已经判定为旧代际或重复终态、因此没有交给上层的输出事件数。它把“旧结果被丢弃”
+  // 和“传输故障”分开记账：过滤不改变 last_error()，也不会停止子进程。
+  std::uint64_t stale_output_events_filtered = 0;
+  // 调用方在收到终态或取消超时后主动丢弃的待取输出事件数。它说明旧会话的队列不会跨越
+  // 新的 start 生命周期继续增长；不代表 socket 中已被 ZeroMQ 接收的数据量。
+  std::uint64_t discarded_output_events = 0;
+  // 非阻塞停止申请次数。request_stop() 可被取消超时路径调用，真正回收仍由 stop() 完成。
+  std::uint64_t requested_stops = 0;
   std::size_t input_queue_capacity = 0;
   std::size_t output_queue_capacity = 0;
   std::size_t input_queue_peak = 0;
   std::size_t output_queue_peak = 0;
+  // 快照瞬间仍未被调用方取走的输出事件数。它用于验证取消后队列是否已经收敛到空；
+  // 不能替代“发送端已经停止产生”或“socket 已排空”的结论。
+  std::size_t output_queue_size = 0;
   std::size_t terminal_cache_capacity = 0;
   std::size_t terminal_cache_entries = 0;
   std::size_t terminal_cache_peak_entries = 0;
@@ -117,6 +128,15 @@ class RemoteSessionProxy final {
   // 可在任意线程调用，但不得与 start 或 queue_* 并发进入同一个代理生命周期之外。
   domain::OperationResult stop() noexcept;
 
+  // 请求停止但不等待回收：置停止标志、丢弃尚未发送的输入、关闭输出队列并请求子进程停止。
+  // 供取消超时路径快速脱离卡死的后端使用；非阻塞、幂等。调用后仍必须用 stop() 或析构
+  // 完成 I/O 线程 join 和子进程 waitpid；重复调用不会重复增加资源。
+  void request_stop() noexcept;
+
+  // 丢弃输出队列中尚未被 receive_events() 取走的事件，返回丢弃条数。它只清理旧的软件队列，
+  // 不关闭通道、不停止子进程，也不改变 last_error()；下一轮 start 仍会重建独立队列。
+  std::size_t discard_output_events() noexcept;
+
   // 输入生产接口。stream_id 非空、generation 只是流身份的一部分；同一时刻只允许一个
   // 未结束的输入流。所有 queue_* 可在不同线程并发调用，内部按调用顺序线性化。
   domain::OperationResult queue_start_stream(std::string stream_id,
@@ -125,7 +145,9 @@ class RemoteSessionProxy final {
   // 结束输入流：valid_samples 为 0 表示整帧结束；1..319 时必须提供补零尾帧。
   domain::OperationResult queue_end_stream(std::size_t valid_samples = 0,
                                            std::optional<domain::AudioFrame> tail = std::nullopt);
-  // 取消当前输入流。已经结束或未开始的流返回 kInvalidInput。
+  // 取消当前输入流。实现不把取消事件塞进有界输入队列，因此输入队列已满时也能受理；
+  // I/O 线程会先发送此前已入队的输入事件，再发送取消事件。重复取消幂等成功；未开始或
+  // 已经自然结束的流返回 kInvalidInput。
   domain::OperationResult queue_cancel_stream();
 
   // 取回已到达的输出事件，最多 max_events 条，追加到 out。超时返回 0；返回 0 不代表

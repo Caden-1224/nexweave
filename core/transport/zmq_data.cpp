@@ -151,6 +151,11 @@ domain::OperationResult validate_zmq_data_config(const ZmqDataConfig& config) {
           static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     return OperationResult::failure(ErrorCode::kInvalidInput, "ZeroMQ 数据水位超出范围");
   }
+  if (config.close_linger.count() < 0 ||
+      config.close_linger.count() > std::numeric_limits<int>::max()) {
+    return OperationResult::failure(ErrorCode::kInvalidInput,
+                                    "ZeroMQ 数据关闭等待预算超出范围");
+  }
   return OperationResult::success();
 }
 
@@ -381,7 +386,7 @@ struct ZmqDataChannel::Impl {
   OperationResult make_socket() {
     try {
       socket = std::make_unique<zmq::socket_t>(context, zmq::socket_type::pair);
-      socket->set(zmq::sockopt::linger, 0);
+      socket->set(zmq::sockopt::linger, static_cast<int>(config.close_linger.count()));
       socket->set(zmq::sockopt::sndhwm, static_cast<int>(config.send_high_water_mark));
       socket->set(zmq::sockopt::rcvhwm,
                   static_cast<int>(config.receive_high_water_mark));

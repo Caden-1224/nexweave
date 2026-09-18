@@ -163,6 +163,11 @@ add_executable(nexweave_remote_session_fixture tests/support/remote_session_fixt
 target_link_libraries(nexweave_remote_session_fixture PRIVATE
   nexweave_transport nexweave_warnings)
 
+# 数据面脚本夹具：阻塞输入队列以验证满队列取消，并为旧代际输出过滤提供可控对端。
+add_executable(nexweave_remote_scripted_fixture tests/support/remote_scripted_fixture.cpp)
+target_link_libraries(nexweave_remote_scripted_fixture PRIVATE
+  nexweave_transport nexweave_warnings)
+
 enable_testing()
 # 所有测试通过同一配置入口注册，新增目标不会漏掉警告门禁。
 function(nexweave_test name source label)
@@ -287,7 +292,8 @@ nexweave_test(gateway_route tests/integration/gateway_route_test.cpp integration
 target_link_libraries(nexweave_gateway_route_test PRIVATE nexweave_transport)
 target_compile_definitions(nexweave_gateway_route_test PRIVATE
   NEXWEAVE_REMOTE_GATEWAY_FIXTURE="$<TARGET_FILE:nexweave_remote_gateway_fixture>"
-  NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>")
+  NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>"
+  NEXWEAVE_REMOTE_SCRIPTED_FIXTURE="$<TARGET_FILE:nexweave_remote_scripted_fixture>")
 # 夹具包含真实线程、ZeroMQ socket 与独立子进程，挂起时必须在 60 秒内变成明确失败。
 set_tests_properties(gateway_route_integration PROPERTIES TIMEOUT 60)
 
@@ -300,7 +306,8 @@ set_tests_properties(zmq_data_integration PROPERTIES TIMEOUT 60)
 nexweave_test(remote_session tests/integration/remote_session_test.cpp integration)
 target_link_libraries(nexweave_remote_session_test PRIVATE nexweave_transport)
 target_compile_definitions(nexweave_remote_session_test PRIVATE
-  NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>")
+  NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>"
+  NEXWEAVE_REMOTE_SCRIPTED_FIXTURE="$<TARGET_FILE:nexweave_remote_scripted_fixture>")
 set_tests_properties(remote_session_integration PROPERTIES TIMEOUT 60)
 
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。

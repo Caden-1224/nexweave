@@ -29,6 +29,9 @@ using namespace std::chrono_literals;
 #ifndef NEXWEAVE_REMOTE_SESSION_FIXTURE
 #error "测试需要 NEXWEAVE_REMOTE_SESSION_FIXTURE 指向远端 Session 夹具"
 #endif
+#ifndef NEXWEAVE_REMOTE_SCRIPTED_FIXTURE
+#error "测试需要 NEXWEAVE_REMOTE_SCRIPTED_FIXTURE 指向脚本夹具"
+#endif
 
 namespace {
 
@@ -146,6 +149,42 @@ std::vector<protocol::DataEvent> CollectDataEvents(gateway::Gateway& entry,
   return events;
 }
 
+
+std::vector<protocol::DataEvent> CollectRouteEvents(
+    transport::RemoteSessionRoute& route,
+    std::chrono::milliseconds budget) {
+  std::vector<protocol::DataEvent> events;
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::vector<protocol::DataEvent> batch;
+    const std::size_t count = route.poll_events(1, batch, 64);
+    if (count == 0) {
+      std::this_thread::sleep_for(1ms);
+      continue;
+    }
+    bool terminal = false;
+    for (protocol::DataEvent& event : batch) {
+      if (event.end) {
+        terminal = true;
+      }
+      events.push_back(std::move(event));
+    }
+    if (terminal) {
+      return events;
+    }
+  }
+  return events;
+}
+
+bool HasTerminal(const std::vector<protocol::DataEvent>& events,
+                 protocol::DataEventType type, domain::ErrorCode error_code) {
+  for (const protocol::DataEvent& event : events) {
+    if (event.end && event.type == type && event.error_code == error_code) {
+      return true;
+    }
+  }
+  return false;
+}
 
 std::string MakeTempPath() {
   char path[] = "/tmp/nexweave-route-XXXXXX";
@@ -586,6 +625,195 @@ void TestRemoteSessionRouteEndToEnd() {
   std::filesystem::remove(config.proxy.endpoint_file, remove_error);
 }
 
+// 保护不变量：取消可以早于输入线程建立远端输入流；此时第一次 queue_cancel_stream()
+// 还没有活动流可取消，路由必须在流建立后补发取消，否则远端会永远等待输入。随后同一路由
+// 上的下一次 start 必须能建立新会话，不能被旧清理路径删除。
+void TestRemoteCancelBeforeFirstFrameAndRestart() {
+  const std::string endpoint_file = MakeTempPath();
+  const auto first_state = std::make_shared<ScriptedSourceState>();
+  const auto second_state = std::make_shared<ScriptedSourceState>();
+  auto pending_states =
+      std::make_shared<std::deque<std::shared_ptr<ScriptedSourceState>>>();
+  pending_states->push_back(first_state);
+  pending_states->push_back(second_state);
+
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = NEXWEAVE_REMOTE_SESSION_FIXTURE;
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = endpoint_file;
+  config.proxy.ready_timeout = 5000ms;
+  config.proxy.pump_interval = 5ms;
+  config.cancel_timeout = 5000ms;
+  config.input_factory = [pending_states]() -> std::unique_ptr<capability::IAudioSource> {
+    if (pending_states->empty()) {
+      return {};
+    }
+    const std::shared_ptr<ScriptedSourceState> state = pending_states->front();
+    pending_states->pop_front();
+    return std::make_unique<ScriptedAudioSource>(state);
+  };
+  config.stream_id = "remote-session";
+
+  transport::RemoteSessionRoute route(config);
+  const auto started = route.call(
+      MakeRequest("r-cancel-before-frame", "start", "w-1", "s-1", 3000ms));
+  CHECK(started.ok());
+  CHECK(started.value->result.ok());
+
+  // 立即取消，输入线程可能尚未执行 queue_start_stream()，用来覆盖取消早到竞态。
+  const auto cancelled = route.call(
+      MakeRequest("r-cancel-before-frame-action", "cancel", "w-1", "s-1", 5000ms));
+  CHECK(cancelled.ok());
+  CHECK(cancelled.value->result.ok());
+
+  const auto first_events = CollectRouteEvents(route, 8s);
+  CHECK(HasTerminal(first_events, protocol::DataEventType::kError,
+                    domain::ErrorCode::kCancelled));
+  CHECK(route.stats().cancel_requests == 1);
+  CHECK(route.stats().terminal_events_delivered == 1);
+  CHECK(route.stats().last_cancel_accept_to_terminal.count() > 0);
+
+  // 旧会话收敛后必须能重新建立新会话；新会话输出不能因为旧清理而被丢弃。
+  const auto restarted = route.call(
+      MakeRequest("r-cancel-before-frame-restart", "start", "w-2", "s-2", 5000ms));
+  CHECK(restarted.ok());
+  CHECK(restarted.value->result.ok());
+
+  PushSourceFrame(second_state, 1000);
+  PushSourceFrame(second_state, 1000);
+  PushSourceFrame(second_state, 0);
+  PushSourceFrame(second_state, 0);
+  const auto second_events = CollectRouteEvents(route, 5s);
+  CHECK(HasTerminal(second_events, protocol::DataEventType::kDone,
+                    domain::ErrorCode::kNone));
+  std::size_t terminal_count = 0;
+  for (const protocol::DataEvent& event : second_events) {
+    if (event.end) {
+      ++terminal_count;
+    }
+  }
+  CHECK(terminal_count == 1);
+  CHECK(route.stats().starts_accepted == 2);
+
+  const auto exited = route.call(MakeRequest("r-cancel-before-frame-exit", "exit"));
+  CHECK(exited.ok());
+  CHECK(exited.value->result.ok());
+
+  std::error_code remove_error;
+  std::filesystem::remove(endpoint_file, remove_error);
+}
+
+// 保护不变量：取消预算到期而远端没有产生终态时，poll_events() 必须交付唯一的结构化
+// kTimeout 终态并请求停止；不能把取消响应 ok 当成后端已经停止，也不能无限等待。
+void TestRemoteCancelTimeoutIsStructured() {
+  const std::string endpoint_file = MakeTempPath();
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = NEXWEAVE_REMOTE_SCRIPTED_FIXTURE;
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = endpoint_file;
+  config.proxy.ready_timeout = 5000ms;
+  config.proxy.pump_interval = 5ms;
+  config.cancel_timeout = 50ms;
+  config.input_factory = []() -> std::unique_ptr<capability::IAudioSource> {
+    return std::make_unique<ScriptedAudioSource>(std::make_shared<ScriptedSourceState>());
+  };
+  config.stream_id = "remote-session";
+  config.proxy.child.environment = {
+      "NEXWEAVE_SCRIPTED_MODE=block",
+      "NEXWEAVE_SCRIPTED_BLOCK_MS=2000",
+  };
+
+  transport::RemoteSessionRoute route(config);
+  const auto started = route.call(
+      MakeRequest("r-cancel-timeout-start", "start", "w-1", "s-1", 3000ms));
+  CHECK(started.ok());
+  CHECK(started.value->result.ok());
+
+  const auto cancelled = route.call(
+      MakeRequest("r-cancel-timeout-action", "cancel", "w-1", "s-1", 1000ms));
+  CHECK(cancelled.ok());
+  CHECK(cancelled.value->result.ok());
+
+  const auto events = CollectRouteEvents(route, 2s);
+  CHECK(HasTerminal(events, protocol::DataEventType::kError,
+                    domain::ErrorCode::kTimeout));
+  CHECK(route.stats().cancel_timeouts == 1);
+  CHECK(route.stats().terminal_events_delivered == 1);
+  CHECK(route.stats().last_cancel_accept_to_terminal.count() > 0);
+
+  const auto exited = route.call(MakeRequest("r-cancel-timeout-exit", "exit"));
+  CHECK(exited.ok());
+  CHECK(exited.value->result.ok());
+
+  std::error_code remove_error;
+  std::filesystem::remove(endpoint_file, remove_error);
+}
+
+// 保护不变量：终态之后仍然到达的旧事件不能进入上层，也不能污染同一路由上的下一次
+// start；旧清理只作用于旧代理和旧队列，新代理的输出必须完整交付。
+void TestStaleEventsDoNotLeakIntoNextStart() {
+  const std::string endpoint_file = MakeTempPath();
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = NEXWEAVE_REMOTE_SCRIPTED_FIXTURE;
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = endpoint_file;
+  config.proxy.ready_timeout = 5000ms;
+  config.proxy.pump_interval = 5ms;
+  config.cancel_timeout = 500ms;
+  config.input_factory = []() -> std::unique_ptr<capability::IAudioSource> {
+    return std::make_unique<ScriptedAudioSource>(std::make_shared<ScriptedSourceState>());
+  };
+  config.stream_id = "remote-session";
+  config.proxy.child.environment = {"NEXWEAVE_SCRIPTED_MODE=stale"};
+
+  transport::RemoteSessionRoute route(config);
+  const auto started = route.call(
+      MakeRequest("r-stale-start", "start", "w-1", "s-1", 3000ms));
+  CHECK(started.ok());
+  CHECK(started.value->result.ok());
+
+  const auto first_events = CollectRouteEvents(route, 3s);
+  CHECK(HasTerminal(first_events, protocol::DataEventType::kDone,
+                    domain::ErrorCode::kNone));
+  std::size_t first_terminals = 0;
+  for (const protocol::DataEvent& event : first_events) {
+    if (event.end) {
+      ++first_terminals;
+    }
+    CHECK(event.text != "late-new-key");
+  }
+  CHECK(first_terminals == 1);
+
+  // 终态之后再次 poll 不能交付旧键的新轮次事件。
+  std::vector<protocol::DataEvent> after_terminal;
+  CHECK(route.poll_events(1, after_terminal, 64) == 0);
+  CHECK(after_terminal.empty());
+
+  // 新 start 必须重新建立终态水位并交付自己的唯一终态。
+  const auto restarted = route.call(
+      MakeRequest("r-stale-restart", "start", "w-2", "s-2", 3000ms));
+  CHECK(restarted.ok());
+  CHECK(restarted.value->result.ok());
+  const auto second_events = CollectRouteEvents(route, 3s);
+  CHECK(HasTerminal(second_events, protocol::DataEventType::kDone,
+                    domain::ErrorCode::kNone));
+  std::size_t second_terminals = 0;
+  for (const protocol::DataEvent& event : second_events) {
+    if (event.end) {
+      ++second_terminals;
+    }
+    CHECK(event.text != "late-new-key");
+  }
+  CHECK(second_terminals == 1);
+
+  const auto exited = route.call(MakeRequest("r-stale-exit", "exit"));
+  CHECK(exited.ok());
+  CHECK(exited.value->result.ok());
+
+  std::error_code remove_error;
+  std::filesystem::remove(endpoint_file, remove_error);
+}
+
 }  // namespace
 
 int main() {
@@ -594,5 +822,8 @@ int main() {
   TestUnavailableEndpointReturnsStructuredError();
   TestSlowForwardDoesNotBlockOtherControls();
   TestRouteModePreservesEventQueue();
+  TestRemoteCancelBeforeFirstFrameAndRestart();
+  TestRemoteCancelTimeoutIsStructured();
+  TestStaleEventsDoNotLeakIntoNextStart();
   return 0;
 }

@@ -46,11 +46,32 @@ struct RemoteSessionRouteConfig {
   std::function<std::unique_ptr<capability::IAudioSource>()> input_factory;
   std::string stream_id = "linux-profile";
   std::chrono::milliseconds frame_interval{0};
+  // 取消受理后等待远端产生唯一终态的预算。预算内没有终态时，poll_events() 会交付一条
+  // kTimeout 终态并请求子进程停止；它不把“响应成功”当成“后端已经停止”。必须为正。
+  std::chrono::milliseconds cancel_timeout{5000};
 };
 
-// 配置校验：proxy 配置必须有效，input_factory 和 stream_id 必须非空，frame_interval 不得为负。
+// 配置校验：proxy 配置必须有效，input_factory 和 stream_id 必须非空，frame_interval 不得为负，
+// cancel_timeout 必须为正。
 domain::OperationResult validate_remote_session_route_config(
     const RemoteSessionRouteConfig& config);
+
+// 远端路由只读账目快照。计数在对象生命周期内累加；cancellation_pending 与 terminal_delivered
+// 描述快照瞬间的当前 start。stale_events_filtered 只统计调用方已经取到、因此能被丢弃的旧事件；
+// 仍在代理队列或 socket 中的旧事件由终态过滤与下一轮清理负责，不能从该计数推断其数量。
+// 时长为 0 只表示尚未完成对应阶段，不表示该阶段立即完成。
+struct RemoteSessionRouteStats {
+  std::uint64_t starts_accepted = 0;
+  std::uint64_t cancel_requests = 0;
+  std::uint64_t duplicate_cancel_requests = 0;
+  std::uint64_t stale_events_filtered = 0;
+  std::uint64_t terminal_events_delivered = 0;
+  std::uint64_t cancel_timeouts = 0;
+  std::chrono::microseconds last_cancel_accept_to_terminal{0};
+  std::chrono::microseconds last_cancel_accept_to_queue_clear{0};
+  bool cancellation_pending = false;
+  bool terminal_delivered = false;
+};
 
 // 远端 Session 控制路由。构造只保存配置和创建代理对象，不启动子进程、不创建输入线程。
 class RemoteSessionRoute final : public gateway::IControlRoute {
@@ -67,10 +88,14 @@ class RemoteSessionRoute final : public gateway::IControlRoute {
       const protocol::ControlRequest& request) override;
 
   // 非阻塞取出当前会话已到达的数据事件；终态事件出现后状态进入 completed，下一次 start
-  // 会清理资源。没有会话或当前没有事件时返回 0。
+  // 会清理资源。每个 start 生命周期只交付一个 end=true 终态；同一批中终态之后的旧事件会被
+  // 丢弃并计入 stale_events_filtered。取消超时会在下一次 poll_events() 交付 kTimeout 终态。
   std::size_t poll_events(gateway::ControlRouteOwner owner,
                           std::vector<protocol::DataEvent>& out,
                           std::size_t max_events) override;
+
+  // 路由账目快照。可跨线程调用，返回副本；不阻塞、不驱动 I/O。
+  RemoteSessionRouteStats stats() const;
 
  private:
   struct Impl;

@@ -53,6 +53,10 @@ struct ZmqDataConfig {
   std::size_t send_high_water_mark = 64;
   std::size_t receive_high_water_mark = 64;
   std::chrono::milliseconds send_timeout{500};
+  // socket 关闭时等待已排队消息发往对端的上限。取消或自然收尾后子进程可能立即退出；
+  // 若这里为 0，刚刚发送的终态可能在父进程取走前被丢弃。取值必须非负且不溢出 int；
+  // 它是清理路径的有界延迟，不是端到端送达保证。
+  std::chrono::milliseconds close_linger{2000};
   std::size_t max_metadata_bytes = 64U * 1024U;
   std::size_t max_payload_bytes = 64U * 1024U;
 };

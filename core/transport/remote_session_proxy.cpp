@@ -1,6 +1,5 @@
 #include "remote_session_proxy.hpp"
 
-#include <cstdio>
 #include <fstream>
 #include <utility>
 
@@ -104,12 +103,17 @@ struct RemoteSessionProxy::Impl {
   RemoteSessionProxyStats stats{};
   bool stream_started = false;
   bool stream_ended = false;
+  // 取消事件绕过有界输入队列：置位后 I/O 线程把此前排队的输入发完，再补发这条取消。
+  bool cancel_pending = false;
+  std::uint64_t pending_cancel_sequence = 0;
   std::string stream_id;
   std::uint64_t generation = 0;
   std::uint64_t next_sequence = 0;
 
   domain::OperationResult Start();
   OperationResult Stop() noexcept;
+  void RequestStop() noexcept;
+  std::size_t DiscardOutputEvents() noexcept;
   domain::OperationResult QueueStart(std::string id, std::uint64_t generation_value);
   domain::OperationResult QueueFrame(const domain::AudioFrame& frame);
   domain::OperationResult QueueEnd(std::size_t valid_samples,
@@ -143,6 +147,8 @@ domain::OperationResult RemoteSessionProxy::Impl::Start() {
     stats = RemoteSessionProxyStats{};
     stream_started = false;
     stream_ended = false;
+    cancel_pending = false;
+    pending_cancel_sequence = 0;
     stream_id.clear();
     generation = 0;
     next_sequence = 0;
@@ -225,6 +231,42 @@ OperationResult RemoteSessionProxy::Impl::Stop() noexcept {
   }
 }
 
+void RemoteSessionProxy::Impl::RequestStop() noexcept {
+  try {
+    stop_requested.store(true);
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      ++stats.requested_stops;
+      if (inbound_queue != nullptr) {
+        // 取消超时后不再等待在途输入送达：先丢弃软件队列，再请求子进程停止。
+        // 已经交给 channel 的消息无法撤回，但调用方不会再消费它们的输出。
+        (void)inbound_queue->clear();
+        inbound_queue->close();
+      }
+      if (outbound_queue != nullptr) {
+        outbound_queue->close();
+      }
+    }
+    child.request_stop();
+  } catch (...) {
+    // 非阻塞停止路径只做尽力回收；异常不能从析构/超时收敛路径穿透。
+  }
+}
+
+std::size_t RemoteSessionProxy::Impl::DiscardOutputEvents() noexcept {
+  try {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (outbound_queue == nullptr) {
+      return 0;
+    }
+    const std::size_t removed = outbound_queue->clear();
+    stats.discarded_output_events += removed;
+    return removed;
+  } catch (...) {
+    return 0;
+  }
+}
+
 bool RemoteSessionProxy::Impl::PushInputLocked(const runtime::InputStreamEvent& event) {
   // 前置条件：调用方已持有 mutex。
   if (stop_requested.load() || inbound_queue == nullptr) {
@@ -264,6 +306,8 @@ domain::OperationResult RemoteSessionProxy::Impl::QueueStart(std::string id,
     }
     stream_started = true;
     stream_ended = false;
+    cancel_pending = false;
+    pending_cancel_sequence = 0;
     stream_id = event.stream_id;
     generation = generation_value;
     next_sequence = 1;
@@ -348,23 +392,24 @@ domain::OperationResult RemoteSessionProxy::Impl::QueueEnd(
 }
 
 domain::OperationResult RemoteSessionProxy::Impl::QueueCancel() {
-  runtime::InputStreamEvent event;
-  {
-    const std::lock_guard<std::mutex> lock(mutex);
-    if (!stream_started || stream_ended) {
-      return OperationResult::failure(ErrorCode::kInvalidInput, "没有可取消的输入流");
-    }
-    event.stream_id = stream_id;
-    event.generation = generation;
-    event.sequence = next_sequence;
-    event.kind = runtime::InputEventKind::kCancel;
-    if (!PushInputLocked(event)) {
-      return OperationResult::failure(ErrorCode::kBackendFailure, "输入事件队列已满");
-    }
-    stream_ended = true;
-    ++next_sequence;
-    ++stats.queued_input_events;
+  const std::lock_guard<std::mutex> lock(mutex);
+  if (!running.load() || stop_requested.load()) {
+    return OperationResult::failure(ErrorCode::kAlreadyCompleted, "远端代理尚未运行");
   }
+  if (!stream_started) {
+    return OperationResult::failure(ErrorCode::kInvalidInput, "输入流尚未开始");
+  }
+  // 取消是流级终态：已经结束的流重复取消返回成功，让调用方的幂等重试不会在
+  // 取消与自然完成竞态时被误报为协议错误。取消事件不进入有界队列，因此队列已满
+  // 也不会丢失停止指令；I/O 线程会在排空此前输入后补发它。
+  if (cancel_pending || stream_ended) {
+    return OperationResult::success();
+  }
+  cancel_pending = true;
+  pending_cancel_sequence = next_sequence;
+  stream_ended = true;
+  ++next_sequence;
+  ++stats.queued_input_events;
   return OperationResult::success();
 }
 
@@ -447,15 +492,50 @@ void RemoteSessionProxy::Impl::IoLoop() {
     if (popped == QueuePopStatus::kClosed) {
       break;
     }
+
+    // 取消事件绕过有界输入队列：只有在此前排队的输入事件都已经弹出并发送后，
+    // 才补发这条取消。这样队列满时也不会丢失停止指令，而且线上的 sequence
+    // 仍保持连续、取消排在已提交音频之后。
+    runtime::InputStreamEvent cancel_event;
+    bool has_pending_cancel = false;
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (cancel_pending) {
+        cancel_event.stream_id = stream_id;
+        cancel_event.generation = generation;
+        cancel_event.sequence = pending_cancel_sequence;
+        cancel_event.kind = runtime::InputEventKind::kCancel;
+        cancel_pending = false;
+        has_pending_cancel = true;
+      }
+    }
+    if (has_pending_cancel) {
+      const auto sent = channel.send_input(cancel_event);
+      if (!sent.ok()) {
+        RecordError(sent.error);
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
+          ++stats.send_failures;
+        }
+        child.request_stop();
+        break;
+      }
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        ++stats.sent_input_events;
+      }
+      continue;
+    }
+
     if (stop_requested.load() && inbound_queue->empty()) {
       break;
     }
 
     const auto received = channel.receive_output(config.pump_interval);
     if (received.ok()) {
-      const DataEvent& event = received.value.value();
-      StoreTerminal(event);
-      const QueuePushStatus pushed = outbound_queue->try_push(event);
+      const DataEvent& event_value = received.value.value();
+      StoreTerminal(event_value);
+      const QueuePushStatus pushed = outbound_queue->try_push(event_value);
       if (pushed == QueuePushStatus::kAccepted) {
         const std::lock_guard<std::mutex> lock(mutex);
         ++stats.received_output_events;
@@ -478,6 +558,16 @@ void RemoteSessionProxy::Impl::IoLoop() {
     if (received.error.code == ErrorCode::kTimeout) {
       const std::lock_guard<std::mutex> lock(mutex);
       ++stats.receive_timeouts;
+      continue;
+    }
+
+    // 传输层已经在同一 request/session 上判定这条输出属于旧代际或重复终态。
+    // 这类事件必须被丢弃而不是升级成进程故障，否则一个迟到的旧结果会终止
+    // 正在服务新轮次的子进程；过滤只记账，不影响 last_error()。
+    if (received.error.code == ErrorCode::kCancelled ||
+        received.error.code == ErrorCode::kAlreadyCompleted) {
+      const std::lock_guard<std::mutex> lock(mutex);
+      ++stats.stale_output_events_filtered;
       continue;
     }
 
@@ -512,6 +602,19 @@ domain::OperationResult RemoteSessionProxy::start() {
 
 domain::OperationResult RemoteSessionProxy::stop() noexcept {
   return impl_->Stop();
+}
+
+void RemoteSessionProxy::request_stop() noexcept {
+  if (impl_ != nullptr) {
+    impl_->RequestStop();
+  }
+}
+
+std::size_t RemoteSessionProxy::discard_output_events() noexcept {
+  if (impl_ == nullptr) {
+    return 0;
+  }
+  return impl_->DiscardOutputEvents();
 }
 
 domain::OperationResult RemoteSessionProxy::queue_start_stream(std::string stream_id,
@@ -589,6 +692,7 @@ RemoteSessionProxyStats RemoteSessionProxy::stats() const {
     const auto queue_stats = impl_->outbound_queue->stats();
     snapshot.output_queue_capacity = queue_stats.capacity;
     snapshot.output_queue_peak = queue_stats.peak_size;
+    snapshot.output_queue_size = queue_stats.current_size;
   }
   if (impl_->terminal_cache != nullptr) {
     const auto terminal_stats = impl_->terminal_cache->stats();

@@ -206,5 +206,11 @@ int main() {
     std::cerr << "远端会话失败: " << served.error.message << std::endl;
     return 7;
   }
+  // 测试夹具模拟由父进程拥有的常驻子进程：serve() 返回后不主动退出，保留数据面 socket，
+  // 直到父进程发送停止信号。刚交付的终态因此不会被进程退出与父进程读取之间的竞争丢弃；
+  // 真实部署也应由代理/监督器的停止顺序决定子进程何时退出。
+  while (g_stop_requested == 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
   return 0;
 }
