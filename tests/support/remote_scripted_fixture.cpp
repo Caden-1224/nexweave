@@ -93,6 +93,7 @@ bool Send(ZmqDataChannel& channel, const DataEvent& event) {
 
 int RunStaleMode(ZmqDataChannel& channel) {
   const std::string session_id = "scripted-session";
+  // 先交付一条正常轮次，让父进程建立终态水位；随后发送的旧事件必须被拒绝。
   if (!Send(channel, MakeEvent("old-turn-1", session_id, 1, 1, DataEventType::kToken))) {
     return 8;
   }
@@ -101,24 +102,62 @@ int RunStaleMode(ZmqDataChannel& channel) {
   if (!Send(channel, done)) {
     return 9;
   }
+
+  // 同键同代际的迟到 token 走传输层接收路径，预期得到 kAlreadyCompleted 并被代理过滤，
+  // 不应升级成进程故障，也不应交给上层。
   DataEvent late_same_key =
       MakeEvent("old-turn-1", session_id, 1, 3, DataEventType::kToken);
   late_same_key.text = "late-same";
   if (!Send(channel, late_same_key)) {
     return 10;
   }
-  DataEvent new_key = MakeEvent("old-turn-2", session_id, 1, 1, DataEventType::kToken);
-  new_key.text = "late-new-key";
-  if (!Send(channel, new_key)) {
+
+  // 以下六类事件使用不同 request_id 开启新的传输流；传输层会接受它们，但路由层已经交付
+  // 终态，必须全部按旧输出封锁丢弃。覆盖 partial / final / token / PCM / done / error。
+  DataEvent late_partial =
+      MakeEvent("old-partial", session_id, 1, 1, DataEventType::kPartial);
+  late_partial.text = "late-partial";
+  if (!Send(channel, late_partial)) {
     return 11;
   }
-  DataEvent late_error = MakeEvent("old-turn-2", session_id, 1, 2, DataEventType::kError);
+
+  DataEvent late_final =
+      MakeEvent("old-final", session_id, 1, 1, DataEventType::kFinal);
+  late_final.text = "late-final";
+  if (!Send(channel, late_final)) {
+    return 12;
+  }
+
+  DataEvent late_token =
+      MakeEvent("old-token", session_id, 1, 1, DataEventType::kToken);
+  late_token.text = "late-token";
+  if (!Send(channel, late_token)) {
+    return 13;
+  }
+
+  DataEvent late_pcm = MakeEvent("old-pcm", session_id, 1, 1, DataEventType::kPcm);
+  late_pcm.frame_index = 0;
+  late_pcm.pcm.assign(nexweave::domain::kAudioFrameBytes, 0x7B);
+  late_pcm.expected_pcm_bytes = nexweave::domain::kAudioFrameBytes;
+  if (!Send(channel, late_pcm)) {
+    return 14;
+  }
+
+  DataEvent late_done = MakeEvent("old-done", session_id, 1, 1, DataEventType::kDone);
+  late_done.end = true;
+  late_done.message = "迟到的旧完成";
+  if (!Send(channel, late_done)) {
+    return 15;
+  }
+
+  DataEvent late_error = MakeEvent("old-error", session_id, 1, 1, DataEventType::kError);
   late_error.end = true;
   late_error.error_code = ErrorCode::kBackendFailure;
   late_error.message = "迟到的旧错误";
   if (!Send(channel, late_error)) {
-    return 12;
+    return 16;
   }
+
   // 保持通道存活，让父进程在完成断言后通过停止路径回收本进程。
   while (true) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));

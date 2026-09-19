@@ -285,6 +285,11 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleCancel(
     cancel_accepted_at = now;
     cancel_deadline = now + budget;
     cancellation_pending = true;
+    // 每次受理新取消都从零开始记录四阶段，避免上一轮耗时被误读成本轮事实。
+    stats.last_cancel_accept_to_terminal = std::chrono::nanoseconds{0};
+    stats.last_cancel_accept_to_backend_stop = std::chrono::nanoseconds{0};
+    stats.last_cancel_accept_to_queue_clear = std::chrono::nanoseconds{0};
+    stats.last_cancel_accept_to_total = std::chrono::nanoseconds{0};
     ++stats.cancel_requests;
   } else {
     // 重复取消不延长原预算：取消必须按第一次受理时承诺的收敛时间报告超时或终态。
@@ -427,8 +432,14 @@ std::size_t RemoteSessionRoute::poll_events(gateway::ControlRouteOwner owner,
     return 0;
   }
   if (self.terminal_seen.load()) {
-    // 终态已经交付后，旧会话后续到达的任何输出都不再属于当前请求。主动清空软件队列，
-    // 让“输出队列清空”成为可观察事实；socket 中仍在途的数据会由终态过滤丢弃。
+    // 终态已经交付后，旧会话后续到达的任何输出都不再属于当前请求。这里继续非阻塞排空
+    // 代理队列和 socket，而不是只清本地队列：这样在途旧事件也会被取回、拒绝并记账，
+    // 不会因为“路由提前停止读取”而潜伏到下一次 start。没有新事件时 receive_events
+    // 立即返回 0，不阻塞调用方。
+    std::vector<DataEvent> late;
+    const std::size_t late_count =
+        self.proxy.receive_events(late, max_events, std::chrono::milliseconds{0});
+    self.stats.stale_events_filtered += late_count;
     (void)self.proxy.discard_output_events();
     return 0;
   }
@@ -456,15 +467,22 @@ std::size_t RemoteSessionRoute::poll_events(gateway::ControlRouteOwner owner,
     const auto cancel_started = self.cancel_accepted_at;
     if (cancel_started != std::chrono::steady_clock::time_point{}) {
       self.stats.last_cancel_accept_to_terminal = std::chrono::duration_cast<
-          std::chrono::microseconds>(now - cancel_started);
+          std::chrono::nanoseconds>(now - cancel_started);
     }
     self.proxy.request_stop();
     (void)self.proxy.discard_output_events();
     if (cancel_started != std::chrono::steady_clock::time_point{}) {
+      const auto queue_clear_now = std::chrono::steady_clock::now();
       self.stats.last_cancel_accept_to_queue_clear = std::chrono::duration_cast<
-          std::chrono::microseconds>(std::chrono::steady_clock::now() - cancel_started);
+          std::chrono::nanoseconds>(queue_clear_now - cancel_started);
+      // 超时只证明本地已经给出结构化失败并封锁旧输出，不能把后端停止写成已完成事实。
+      self.stats.last_cancel_accept_to_backend_stop = std::chrono::nanoseconds{0};
     }
     self.cancel_accepted_at = std::chrono::steady_clock::time_point{};
+    if (cancel_started != std::chrono::steady_clock::time_point{}) {
+      self.stats.last_cancel_accept_to_total = std::chrono::duration_cast<
+          std::chrono::nanoseconds>(std::chrono::steady_clock::now() - cancel_started);
+    }
     return 1;
   }
 
@@ -494,14 +512,23 @@ std::size_t RemoteSessionRoute::poll_events(gateway::ControlRouteOwner owner,
       const auto terminal_now = std::chrono::steady_clock::now();
       if (cancel_started != std::chrono::steady_clock::time_point{}) {
         self.stats.last_cancel_accept_to_terminal = std::chrono::duration_cast<
-            std::chrono::microseconds>(terminal_now - cancel_started);
+            std::chrono::nanoseconds>(terminal_now - cancel_started);
+        // 远端服务端只在会话收尾后发送唯一终态，因此这条事件是“后端停止”的协议上界；
+        // 不能据此声称 SDK 内部计算或设备实际静默已经在同一时刻停止。
+        self.stats.last_cancel_accept_to_backend_stop =
+            self.stats.last_cancel_accept_to_terminal;
       }
       (void)self.proxy.discard_output_events();
       if (cancel_started != std::chrono::steady_clock::time_point{}) {
+        const auto queue_clear_now = std::chrono::steady_clock::now();
         self.stats.last_cancel_accept_to_queue_clear = std::chrono::duration_cast<
-            std::chrono::microseconds>(std::chrono::steady_clock::now() - cancel_started);
+            std::chrono::nanoseconds>(queue_clear_now - cancel_started);
       }
       self.cancel_accepted_at = std::chrono::steady_clock::time_point{};
+      if (cancel_started != std::chrono::steady_clock::time_point{}) {
+        self.stats.last_cancel_accept_to_total = std::chrono::duration_cast<
+            std::chrono::nanoseconds>(std::chrono::steady_clock::now() - cancel_started);
+      }
     }
   }
   return delivered;
@@ -514,6 +541,9 @@ RemoteSessionRouteStats RemoteSessionRoute::stats() const {
   }
   const std::lock_guard<std::mutex> lock(impl_->mutex);
   snapshot = impl_->stats;
+  const RemoteSessionProxyStats proxy_stats = impl_->proxy.stats();
+  snapshot.transport_stale_events_filtered = proxy_stats.stale_output_events_filtered;
+  snapshot.discarded_output_events = proxy_stats.discarded_output_events;
   snapshot.cancellation_pending = impl_->cancellation_pending;
   snapshot.terminal_delivered = impl_->terminal_seen.load();
   return snapshot;

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -180,6 +181,22 @@ bool HasTerminal(const std::vector<protocol::DataEvent>& events,
                  protocol::DataEventType type, domain::ErrorCode error_code) {
   for (const protocol::DataEvent& event : events) {
     if (event.end && event.type == type && event.error_code == error_code) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 陈旧事件夹具的迟到轮次使用固定 request_id 和 late- 文本前缀；第一轮正常事件复用
+// old-turn-1，因此不能用 "old-" 前缀来判断泄漏，只能检查迟到键与迟到文本是否混入新轮次。
+bool HasLateScriptedEvent(const std::vector<protocol::DataEvent>& events) {
+  for (const protocol::DataEvent& event : events) {
+    if (event.request_id == "old-partial" || event.request_id == "old-final" ||
+        event.request_id == "old-token" || event.request_id == "old-pcm" ||
+        event.request_id == "old-done" || event.request_id == "old-error") {
+      return true;
+    }
+    if (event.text.rfind("late-", 0) == 0 || event.text == "late-same") {
       return true;
     }
   }
@@ -672,6 +689,16 @@ void TestRemoteCancelBeforeFirstFrameAndRestart() {
   CHECK(route.stats().cancel_requests == 1);
   CHECK(route.stats().terminal_events_delivered == 1);
   CHECK(route.stats().last_cancel_accept_to_terminal.count() > 0);
+  CHECK(route.stats().last_cancel_accept_to_backend_stop.count() > 0);
+  CHECK(route.stats().last_cancel_accept_to_queue_clear.count() > 0);
+  CHECK(route.stats().last_cancel_accept_to_total.count() > 0);
+  std::size_t first_terminals = 0;
+  for (const protocol::DataEvent& event : first_events) {
+    if (event.end) {
+      ++first_terminals;
+    }
+  }
+  CHECK(first_terminals == 1);
 
   // 旧会话收敛后必须能重新建立新会话；新会话输出不能因为旧清理而被丢弃。
   const auto restarted = route.call(
@@ -740,8 +767,128 @@ void TestRemoteCancelTimeoutIsStructured() {
   CHECK(route.stats().cancel_timeouts == 1);
   CHECK(route.stats().terminal_events_delivered == 1);
   CHECK(route.stats().last_cancel_accept_to_terminal.count() > 0);
+  // 超时只说明本轮已按失败收敛；预算内没有收到“后端已停止”的证据，不能把它填成 0 以外的值。
+  CHECK(route.stats().last_cancel_accept_to_backend_stop.count() == 0);
+  CHECK(route.stats().last_cancel_accept_to_queue_clear.count() > 0);
+  CHECK(route.stats().last_cancel_accept_to_total.count() > 0);
 
   const auto exited = route.call(MakeRequest("r-cancel-timeout-exit", "exit"));
+  CHECK(exited.ok());
+  CHECK(exited.value->result.ok());
+
+  std::error_code remove_error;
+  std::filesystem::remove(endpoint_file, remove_error);
+}
+
+// 保护不变量：一次正常取消必须分别记录受理、后端停止上界、输出队列清空和总收敛；
+// 第二次取消只增加幂等账目，不产生第二个终态；随后新 start 必须能完成一轮新输出。
+void TestRemoteCancelStagesAndDuplicateCancel() {
+  const std::string endpoint_file = MakeTempPath();
+  const auto first_state = std::make_shared<ScriptedSourceState>();
+  const auto second_state = std::make_shared<ScriptedSourceState>();
+  auto pending_states =
+      std::make_shared<std::deque<std::shared_ptr<ScriptedSourceState>>>();
+  pending_states->push_back(first_state);
+  pending_states->push_back(second_state);
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = NEXWEAVE_REMOTE_SCRIPTED_FIXTURE;
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = endpoint_file;
+  config.proxy.ready_timeout = 5000ms;
+  config.proxy.pump_interval = 5ms;
+  config.cancel_timeout = 3000ms;
+  config.input_factory = [pending_states]() -> std::unique_ptr<capability::IAudioSource> {
+    if (pending_states->empty()) {
+      return {};
+    }
+    const std::shared_ptr<ScriptedSourceState> state = pending_states->front();
+    pending_states->pop_front();
+    return std::make_unique<ScriptedAudioSource>(state);
+  };
+  config.stream_id = "remote-session";
+
+  transport::RemoteSessionRoute route(config);
+  const auto started = route.call(
+      MakeRequest("r-stages-start", "start", "w-1", "s-1", 3000ms));
+  CHECK(started.ok());
+  CHECK(started.value->result.ok());
+
+  const auto cancelled = route.call(
+      MakeRequest("r-stages-cancel", "cancel", "w-1", "s-1", 3000ms));
+  CHECK(cancelled.ok());
+  CHECK(cancelled.value->result.ok());
+  // 停止中再次取消：不延长首次受理的收敛预算，也不产生第二个终态。
+  const auto duplicate_while_stopping = route.call(
+      MakeRequest("r-stages-cancel-while-stopping", "cancel", "w-1", "s-1", 3000ms));
+  CHECK(duplicate_while_stopping.ok());
+  CHECK(duplicate_while_stopping.value->result.ok());
+
+  const auto first_events = CollectRouteEvents(route, 5s);
+  CHECK(HasTerminal(first_events, protocol::DataEventType::kError,
+                    domain::ErrorCode::kCancelled));
+  std::size_t first_terminals = 0;
+  for (const protocol::DataEvent& event : first_events) {
+    if (event.end) {
+      ++first_terminals;
+    }
+  }
+  CHECK(first_terminals == 1);
+
+  const transport::RemoteSessionRouteStats first_stats = route.stats();
+  CHECK(first_stats.cancel_requests == 1);
+  CHECK(first_stats.duplicate_cancel_requests == 1);
+  CHECK(first_stats.terminal_events_delivered == 1);
+  CHECK(first_stats.last_cancel_accept_to_terminal.count() > 0);
+  CHECK(first_stats.last_cancel_accept_to_backend_stop.count() > 0);
+  CHECK(first_stats.last_cancel_accept_to_queue_clear.count() > 0);
+  CHECK(first_stats.last_cancel_accept_to_total.count() > 0);
+
+  if (std::getenv("NEXWEAVE_CANCEL_EVIDENCE") != nullptr) {
+    std::cout << "cancel_accept_to_terminal_ns="
+              << first_stats.last_cancel_accept_to_terminal.count() << '\n';
+    std::cout << "cancel_accept_to_backend_stop_ns="
+              << first_stats.last_cancel_accept_to_backend_stop.count() << '\n';
+    std::cout << "cancel_accept_to_queue_clear_ns="
+              << first_stats.last_cancel_accept_to_queue_clear.count() << '\n';
+    std::cout << "cancel_accept_to_total_ns="
+              << first_stats.last_cancel_accept_to_total.count() << '\n';
+  }
+
+  // 完成后再取消一次：只增加幂等账目，不追加终态，也不改变本轮阶段时间。
+  const auto duplicate = route.call(
+      MakeRequest("r-stages-cancel-again", "cancel", "w-1", "s-1", 3000ms));
+  CHECK(duplicate.ok());
+  CHECK(duplicate.value->result.ok());
+  CHECK(route.stats().duplicate_cancel_requests == 2);
+  CHECK(route.stats().terminal_events_delivered == 1);
+  std::vector<protocol::DataEvent> after_duplicate;
+  CHECK(route.poll_events(1, after_duplicate, 64) == 0);
+  CHECK(after_duplicate.empty());
+
+  // 新 start 必须建立新的输入源与输出流，旧取消清理不能吃掉新轮次输出。
+  const auto restarted = route.call(
+      MakeRequest("r-stages-restart", "start", "w-2", "s-2", 3000ms));
+  CHECK(restarted.ok());
+  CHECK(restarted.value->result.ok());
+  PushSourceFrame(second_state, 1000);
+  PushSourceFrame(second_state, 1000);
+  PushSourceFrame(second_state, 0);
+  PushSourceFrame(second_state, 0);
+  FinishSource(second_state);
+  const auto second_events = CollectRouteEvents(route, 5s);
+  CHECK(HasTerminal(second_events, protocol::DataEventType::kDone,
+                    domain::ErrorCode::kNone));
+  std::size_t second_terminals = 0;
+  for (const protocol::DataEvent& event : second_events) {
+    if (event.end) {
+      ++second_terminals;
+    }
+  }
+  CHECK(second_terminals == 1);
+  CHECK(route.stats().starts_accepted == 2);
+  CHECK(route.stats().terminal_events_delivered == 2);
+
+  const auto exited = route.call(MakeRequest("r-stages-exit", "exit"));
   CHECK(exited.ok());
   CHECK(exited.value->result.ok());
 
@@ -780,16 +927,25 @@ void TestStaleEventsDoNotLeakIntoNextStart() {
     if (event.end) {
       ++first_terminals;
     }
-    CHECK(event.text != "late-new-key");
   }
   CHECK(first_terminals == 1);
 
-  // 终态之后再次 poll 不能交付旧键的新轮次事件。
-  std::vector<protocol::DataEvent> after_terminal;
-  CHECK(route.poll_events(1, after_terminal, 64) == 0);
-  CHECK(after_terminal.empty());
+  // 终态之后继续非阻塞 poll，直到六类旧事件都被路由取回并拒绝；传输层同键迟到事件
+  // 则由代理在 socket 接收路径过滤。两个计数分开证明队列与 socket 两条在途路径。
+  const auto stale_deadline = std::chrono::steady_clock::now() + 3s;
+  while (std::chrono::steady_clock::now() < stale_deadline &&
+         (route.stats().stale_events_filtered < 6 ||
+          route.stats().transport_stale_events_filtered < 1)) {
+    std::vector<protocol::DataEvent> late;
+    CHECK(route.poll_events(1, late, 64) == 0);
+    CHECK(late.empty());
+    std::this_thread::sleep_for(5ms);
+  }
+  CHECK(route.stats().stale_events_filtered >= 6);
+  CHECK(route.stats().transport_stale_events_filtered >= 1);
 
-  // 新 start 必须重新建立终态水位并交付自己的唯一终态。
+  // 新 start 必须重新建立终态水位并交付自己的唯一终态，旧 request_id / 文本 / PCM
+  // 都不能重新出现在新轮次里。
   const auto restarted = route.call(
       MakeRequest("r-stale-restart", "start", "w-2", "s-2", 3000ms));
   CHECK(restarted.ok());
@@ -802,9 +958,9 @@ void TestStaleEventsDoNotLeakIntoNextStart() {
     if (event.end) {
       ++second_terminals;
     }
-    CHECK(event.text != "late-new-key");
   }
   CHECK(second_terminals == 1);
+  CHECK(!HasLateScriptedEvent(second_events));
 
   const auto exited = route.call(MakeRequest("r-stale-exit", "exit"));
   CHECK(exited.ok());
@@ -824,6 +980,7 @@ int main() {
   TestRouteModePreservesEventQueue();
   TestRemoteCancelBeforeFirstFrameAndRestart();
   TestRemoteCancelTimeoutIsStructured();
+  TestRemoteCancelStagesAndDuplicateCancel();
   TestStaleEventsDoNotLeakIntoNextStart();
   return 0;
 }

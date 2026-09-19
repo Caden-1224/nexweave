@@ -56,19 +56,35 @@ struct RemoteSessionRouteConfig {
 domain::OperationResult validate_remote_session_route_config(
     const RemoteSessionRouteConfig& config);
 
-// 远端路由只读账目快照。计数在对象生命周期内累加；cancellation_pending 与 terminal_delivered
-// 描述快照瞬间的当前 start。stale_events_filtered 只统计调用方已经取到、因此能被丢弃的旧事件；
-// 仍在代理队列或 socket 中的旧事件由终态过滤与下一轮清理负责，不能从该计数推断其数量。
-// 时长为 0 只表示尚未完成对应阶段，不表示该阶段立即完成。
+// 远端路由只读账目快照。路由自身计数在对象生命周期内累加；transport_stale_events_filtered
+// 与 discarded_output_events 来自当前或最近一次代理 start，代理重新 start 时清零。duration
+// 字段记录最近一次已受理取消的各阶段耗时；值为 0 表示该阶段没有完成，而不是“立即完成”。
+// cancellation_pending 与 terminal_delivered 描述快照瞬间的当前 start。
 struct RemoteSessionRouteStats {
   std::uint64_t starts_accepted = 0;
   std::uint64_t cancel_requests = 0;
   std::uint64_t duplicate_cancel_requests = 0;
+  // 路由层已经取回、并按代际水位或终态水位丢弃的旧输出事件数。终态交付后继续非阻塞
+  // 排空代理队列和 socket，使“在途旧事件被拒绝”成为可观察事实；它不是对端待发送量。
   std::uint64_t stale_events_filtered = 0;
+  // 传输层在 socket 接收路径判定为旧代际或重复终态并丢弃的事件数；与路由层过滤分开记账。
+  std::uint64_t transport_stale_events_filtered = 0;
+  // 终态交付或取消超时后，从代理输出队列主动丢弃的事件数；只代表软件队列，不代表 socket。
+  std::uint64_t discarded_output_events = 0;
   std::uint64_t terminal_events_delivered = 0;
   std::uint64_t cancel_timeouts = 0;
-  std::chrono::microseconds last_cancel_accept_to_terminal{0};
-  std::chrono::microseconds last_cancel_accept_to_queue_clear{0};
+  // 取消受理到当前轮次唯一终态交付。取消场景下，远端服务端只在会话收尾后发送该终态，
+  // 因此它是跨进程观测的上界，不等同于 SDK 内部计算或设备实际静默已经停止。
+  std::chrono::nanoseconds last_cancel_accept_to_terminal{0};
+  // 取消受理到“后端停止”的协议上界观察时间；正常取消时与远端终态同一事件，超时路径保持 0，
+  // 表示预算内没有收到后端停止证据。真实 SDK 停止时间仍需板端测量。
+  std::chrono::nanoseconds last_cancel_accept_to_backend_stop{0};
+  // 取消受理到本地输出队列完成丢弃的时间。终态批次中剩余的旧事件和后续 socket 在途事件
+  // 都会被清掉；该时刻只表达软件队列，不表达设备播放缓冲。
+  std::chrono::nanoseconds last_cancel_accept_to_queue_clear{0};
+  // 取消受理到路由完成本轮收敛（唯一终态、旧输出封锁、本地队列清理）的时间。它不承诺
+  // 后端进程已在同刻退出；进程回收由下一次 start/exit 或析构的停止路径负责。
+  std::chrono::nanoseconds last_cancel_accept_to_total{0};
   bool cancellation_pending = false;
   bool terminal_delivered = false;
 };
@@ -88,8 +104,9 @@ class RemoteSessionRoute final : public gateway::IControlRoute {
       const protocol::ControlRequest& request) override;
 
   // 非阻塞取出当前会话已到达的数据事件；终态事件出现后状态进入 completed，下一次 start
-  // 会清理资源。每个 start 生命周期只交付一个 end=true 终态；同一批中终态之后的旧事件会被
-  // 丢弃并计入 stale_events_filtered。取消超时会在下一次 poll_events() 交付 kTimeout 终态。
+  // 会清理资源。每个 start 生命周期只交付一个 end=true 终态；终态之后的旧事件会继续从代理
+  // 队列和 socket 非阻塞取回并丢弃，计入 stale_events_filtered 或 transport_stale_events_filtered。
+  // 取消超时会在下一次 poll_events() 交付 kTimeout 终态。
   std::size_t poll_events(gateway::ControlRouteOwner owner,
                           std::vector<protocol::DataEvent>& out,
                           std::size_t max_events) override;

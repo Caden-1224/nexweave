@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -26,6 +27,29 @@ using nexweave::protocol::DataEvent;
 using nexweave::protocol::DataEventType;
 using nexweave::transport::RemoteSessionProxy;
 using nexweave::transport::RemoteSessionProxyConfig;
+
+// 测试进程退出时统一删除本进程登记过的端点文件。端点路径由调用方拥有，产品代码只读；
+// 因此清理责任留在测试进程，避免重复运行后把 /tmp 里的夹具文件误当成产品资源残留。
+std::vector<std::string>& RegisteredEndpointFiles() {
+  static auto* files = new std::vector<std::string>();
+  return *files;
+}
+
+void RegisterEndpointFile(const std::string& path) {
+  RegisteredEndpointFiles().push_back(path);
+}
+
+struct EndpointFileCleanup {
+  ~EndpointFileCleanup() {
+    for (const std::string& path : RegisteredEndpointFiles()) {
+      std::remove(path.c_str());
+    }
+  }
+};
+
+void EnsureEndpointFileCleanup() {
+  static EndpointFileCleanup cleanup;
+}
 
 std::string EndpointFile(const std::string& suffix) {
   return "/tmp/nexweave-remote-session-" + std::to_string(::getpid()) + "-" + suffix +
@@ -47,6 +71,8 @@ RemoteSessionProxyConfig ProxyConfig(const std::string& suffix,
   config.child.expect_ready_signal = true;
   config.child_config.start_wait_budget = std::chrono::milliseconds(5000);
   config.endpoint_file = EndpointFile(suffix);
+  RegisterEndpointFile(config.endpoint_file);
+  EnsureEndpointFileCleanup();
   config.ready_timeout = std::chrono::milliseconds(5000);
   config.pump_interval = std::chrono::milliseconds(5);
   config.max_pending_input_events = 64;
