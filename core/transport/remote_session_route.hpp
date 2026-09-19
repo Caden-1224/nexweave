@@ -85,6 +85,17 @@ struct RemoteSessionRouteStats {
   // 取消受理到路由完成本轮收敛（唯一终态、旧输出封锁、本地队列清理）的时间。它不承诺
   // 后端进程已在同刻退出；进程回收由下一次 start/exit 或析构的停止路径负责。
   std::chrono::nanoseconds last_cancel_accept_to_total{0};
+  // 路由检测到当前 start 的节点/传输故障次数。一次故障只产生一个旧任务错误终态。
+  std::uint64_t faults_detected = 0;
+  // 故障后续重建尝试的成功与失败次数；失败会让路由进入不可用状态，不再静默重试。
+  std::uint64_t rebuilds_succeeded = 0;
+  std::uint64_t rebuilds_failed = 0;
+  // 故障检测到旧资源清理完成、新代理就绪、恢复会话首终态的耗时。值为 0 表示对应阶段
+  // 尚未发生；都是本地路由观测值，不代表真实网络或不同故障率下的分位数。
+  std::chrono::nanoseconds last_fault_detect_to_cleanup{0};
+  std::chrono::nanoseconds last_fault_detect_to_ready{0};
+  std::chrono::nanoseconds last_fault_detect_to_recovered_terminal{0};
+  std::chrono::nanoseconds last_rebuild_failure_duration{0};
   bool cancellation_pending = false;
   bool terminal_delivered = false;
 };

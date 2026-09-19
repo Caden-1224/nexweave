@@ -1,10 +1,16 @@
 // 数据面脚本夹具：为跨进程取消与旧代际过滤提供可控的数据面对端。
 //
-// 它只用于测试，不进入产品安装目标。两种模式：
+// 它只用于测试，不进入产品安装目标。模式：
 //   - block：完成 ready 握手后先阻塞一段时间不读输入，用来把代理输入队列压满；
-//     恢复后消费 start/frame/end/cancel；收到 cancel 或 end 时回一条唯一终态。
+//     恢复后消费 start/frame/end/cancel，收到 cancel 或 end 时回一条唯一终态，
+//     随后保持存活等待父进程停止。
 //   - stale：主动发送一条正常轮次，然后发送同键旧终态和不同键旧终态，最后保持
 //     存活等待父进程停止。它让测试能够验证“旧事件不能穿透到新请求”。
+//   - exit-once / disconnect-once：首次运行发送一条旧输出后退出或关闭通道再退出；
+//     后续运行依据故障标记文件回到正常 block 服务，用于重复注入后的恢复验证。
+//   - exit-once-unavailable：首次运行退出发送故障，后续运行不写端点、不就绪，用于验证
+//     重建失败时路由进入明确不可用状态。
+//   - no-ready：直接保持进程存活但不写端点、不通知就绪，用于注入启动就绪超时。
 //
 // 资源所有权：ZmqDataChannel 与 socket 由本进程创建并关闭；端点文件由父进程给出；
 // 本对象不拥有音频、Session 或任何设备句柄。
@@ -89,6 +95,51 @@ bool Send(ZmqDataChannel& channel, const DataEvent& event) {
     return false;
   }
   return true;
+}
+
+bool FileExists(const std::string& path) {
+  if (path.empty()) {
+    return false;
+  }
+  std::ifstream file(path);
+  return file.is_open();
+}
+
+void MarkFaultInjected(const std::string& path) {
+  if (path.empty()) {
+    return;
+  }
+  std::ofstream file(path, std::ios::app);
+  file << "fault-injected\n";
+}
+
+void WaitForReleaseFile(const std::string& path) {
+  if (path.empty()) {
+    return;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (FileExists(path)) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
+
+bool SendPreFaultOutput(ZmqDataChannel& channel) {
+  // 故障前先交付一条文本和一条 PCM，验证故障终态之外已经提交的旧输出不会在恢复轮次重放。
+  DataEvent token = MakeEvent("pre-fault-turn", "scripted-session", 1, 1,
+                              DataEventType::kToken);
+  token.text = "before-fault";
+  if (!Send(channel, token)) {
+    return false;
+  }
+  DataEvent pcm = MakeEvent("pre-fault-turn", "scripted-session", 1, 2,
+                            DataEventType::kPcm);
+  pcm.frame_index = 0;
+  pcm.pcm.assign(nexweave::domain::kAudioFrameBytes, 0x5A);
+  pcm.expected_pcm_bytes = nexweave::domain::kAudioFrameBytes;
+  return Send(channel, pcm);
 }
 
 int RunStaleMode(ZmqDataChannel& channel) {
@@ -196,10 +247,11 @@ int RunBlockMode(ZmqDataChannel& channel) {
       terminal.error_code = ErrorCode::kCancelled;
       terminal.message = "脚本夹具已取消";
       (void)Send(channel, terminal);
-      // linger=0 的测试通道在进程退出时会丢弃尚未被对端取走的排队的消息；短暂等待
-      // 父进程 I/O 线程消费终态，避免把“测试夹具正常退出”误判成“取消事件丢失”。
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      return 0;
+      // 终态交付后保持通道存活，等待父进程通过停止路径回收本进程。真实远端 Session 的
+      // 退出时机由拥有者决定，不能用“已经发出终态”推导出“进程可以自行退出”。
+      while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
     }
     if (event.kind == nexweave::runtime::InputEventKind::kEnd) {
       (void)WriteTrace(trace_file, "end");
@@ -207,9 +259,70 @@ int RunBlockMode(ZmqDataChannel& channel) {
           MakeEvent("scripted-end-turn", stream_id, event.generation, 1, DataEventType::kDone);
       terminal.end = true;
       (void)Send(channel, terminal);
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      return 0;
+      while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
     }
+  }
+}
+
+bool WaitForInputStart(ZmqDataChannel& channel) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto received = channel.receive_input(std::chrono::milliseconds(100));
+    if (received.ok()) {
+      if (received.value->kind == nexweave::runtime::InputEventKind::kStart) {
+        return true;
+      }
+      continue;
+    }
+    if (received.error.code != ErrorCode::kTimeout) {
+      return false;
+    }
+  }
+  return false;
+}
+
+int RunExitMode(ZmqDataChannel& channel, const std::string& fault_file) {
+  if (FileExists(fault_file)) {
+    return RunBlockMode(channel);
+  }
+  MarkFaultInjected(fault_file);
+  // 先等待父进程发出 start，确保 proxy.start() 已经完成；否则子进程退出与父进程
+  // ready 握手之间会出现不可重复的启动竞态。
+  if (!WaitForInputStart(channel)) {
+    return 19;
+  }
+  if (!SendPreFaultOutput(channel)) {
+    return 20;
+  }
+  // 父进程确认收到旧输出后写释放文件；夹具再关闭通道并退出，保证旧输出一定先于故障到达。
+  WaitForReleaseFile(Env("NEXWEAVE_SCRIPTED_FAULT_RELEASE_FILE"));
+  channel.close();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  return 0;
+}
+
+int RunDisconnectMode(ZmqDataChannel& channel, const std::string& fault_file) {
+  if (FileExists(fault_file)) {
+    return RunBlockMode(channel);
+  }
+  MarkFaultInjected(fault_file);
+  if (!WaitForInputStart(channel)) {
+    return 22;
+  }
+  if (!SendPreFaultOutput(channel)) {
+    return 21;
+  }
+  WaitForReleaseFile(Env("NEXWEAVE_SCRIPTED_FAULT_RELEASE_FILE"));
+  channel.close();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  return 0;
+}
+
+void SleepWithoutReady() {
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 }
 
@@ -221,6 +334,16 @@ int main() {
   if (endpoint_file.empty()) {
     std::cerr << "缺少远端数据面端点文件环境变量" << std::endl;
     return 2;
+  }
+
+  const std::string mode = Env("NEXWEAVE_SCRIPTED_MODE");
+  const std::string fault_file = Env("NEXWEAVE_SCRIPTED_FAULT_FILE");
+  if (mode == "no-ready") {
+    SleepWithoutReady();
+  }
+  if (mode == "exit-once-unavailable" && FileExists(fault_file)) {
+    // 第二次启动故意不再写出端点、不再通知就绪，让父进程的启动预算到期并进入不可用状态。
+    SleepWithoutReady();
   }
 
   ZmqDataChannel channel;
@@ -244,9 +367,14 @@ int main() {
     return 6;
   }
 
-  const std::string mode = Env("NEXWEAVE_SCRIPTED_MODE");
   if (mode == "stale") {
     return RunStaleMode(channel);
+  }
+  if (mode == "exit-once" || mode == "exit-once-unavailable") {
+    return RunExitMode(channel, fault_file);
+  }
+  if (mode == "disconnect-once") {
+    return RunDisconnectMode(channel, fault_file);
   }
   return RunBlockMode(channel);
 }

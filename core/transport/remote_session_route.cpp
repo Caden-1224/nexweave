@@ -105,7 +105,7 @@ struct RemoteSessionRoute::Impl {
   std::atomic<bool> stop_requested{false};
   std::atomic<bool> input_finished{false};
   std::atomic<bool> terminal_seen{false};
-  std::atomic<capability::IAudioSource*> source{nullptr};
+  std::shared_ptr<capability::IAudioSource> source;
   std::uint64_t generation = 0;
   std::string request_id;
   std::string work_id;
@@ -117,6 +117,10 @@ struct RemoteSessionRoute::Impl {
   std::chrono::steady_clock::time_point cancel_accepted_at{};
   std::chrono::steady_clock::time_point cancel_deadline{};
   bool cancellation_pending = false;
+  // 最近一次节点故障的检测时刻。故障终态交付后保留，下一次 start 用它记录清理/就绪/
+  // 恢复终态耗时；恢复会话产生终态后清空，避免下一次无关启动继续沿用旧基线。
+  std::chrono::steady_clock::time_point fault_detected_at{};
+  bool recovery_in_flight = false;
   RemoteSessionRouteStats stats{};
 
   domain::Result<ControlResponse> HandleStart(const ControlRequest& request);
@@ -124,10 +128,14 @@ struct RemoteSessionRoute::Impl {
   domain::Result<ControlResponse> HandleCancel(const ControlRequest& request);
   domain::Result<ControlResponse> HandleExit(const ControlRequest& request);
   void RunInput(std::uint64_t generation_value,
-                std::unique_ptr<capability::IAudioSource> audio_source);
+                std::shared_ptr<capability::IAudioSource> audio_source);
   void CleanupLocked();
   void RecordError(const domain::Error& error_value);
   std::string StateFactLocked() const;
+  std::size_t DeliverFaultLocked(std::vector<DataEvent>& out,
+                                 const domain::Error& error);
+  void RecordStartFailureLocked(
+      std::chrono::steady_clock::time_point recovery_started);
 };
 
 void RemoteSessionRoute::Impl::RecordError(const domain::Error& error_value) {
@@ -156,9 +164,64 @@ std::string RemoteSessionRoute::Impl::StateFactLocked() const {
          error_text;
 }
 
+std::size_t RemoteSessionRoute::Impl::DeliverFaultLocked(
+    std::vector<DataEvent>& out, const domain::Error& error) {
+  const auto now = std::chrono::steady_clock::now();
+  DataEvent fault;
+  fault.request_id = request_id;
+  fault.session_id = session_id;
+  fault.generation = generation;
+  fault.type = protocol::DataEventType::kError;
+  fault.end = true;
+  fault.error_code =
+      error.code == ErrorCode::kNone ? ErrorCode::kBackendFailure : error.code;
+  fault.message = error.message.empty() ? std::string("远端 Session 不可用")
+                                        : error.message;
+  out.push_back(std::move(fault));
+
+  terminal_seen.store(true);
+  state = State::kCompleted;
+  cancellation_pending = false;
+  cancel_accepted_at = std::chrono::steady_clock::time_point{};
+  cancel_deadline = std::chrono::steady_clock::time_point{};
+  ++stats.faults_detected;
+  ++stats.terminal_events_delivered;
+  // 新一轮故障会开始新的“检测→清理→就绪→恢复终态”观测，先清掉上一轮耗时，避免
+  // 调用方把旧值误读成本轮故障已经完成恢复。
+  stats.last_fault_detect_to_cleanup = std::chrono::nanoseconds{0};
+  stats.last_fault_detect_to_ready = std::chrono::nanoseconds{0};
+  stats.last_fault_detect_to_recovered_terminal = std::chrono::nanoseconds{0};
+  stats.last_rebuild_failure_duration = std::chrono::nanoseconds{0};
+  if (fault_detected_at == std::chrono::steady_clock::time_point{}) {
+    fault_detected_at = now;
+  }
+  recovery_in_flight = false;
+  // 故障可能发生在输入线程阻塞时。先唤醒生产者并撤销它持有的源，下一次 start 才能
+  // 在清理阶段安全 join，而不是把一个已经失效的会话留在线程里。
+  stop_requested.store(true);
+  std::shared_ptr<capability::IAudioSource> audio = source;
+  source.reset();
+  if (audio != nullptr) {
+    (void)audio->cancel();
+  }
+  RecordError(error);
+  return 1;
+}
+
+void RemoteSessionRoute::Impl::RecordStartFailureLocked(
+    std::chrono::steady_clock::time_point recovery_started) {
+  state = State::kUnavailable;
+  if (recovery_started != std::chrono::steady_clock::time_point{}) {
+    ++stats.rebuilds_failed;
+    stats.last_rebuild_failure_duration = std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recovery_started);
+  }
+}
+
 void RemoteSessionRoute::Impl::CleanupLocked() {
   stop_requested.store(true);
-  capability::IAudioSource* audio = source.exchange(nullptr);
+  std::shared_ptr<capability::IAudioSource> audio = source;
+  source.reset();
   if (audio != nullptr) {
     (void)audio->cancel();
   }
@@ -172,6 +235,7 @@ void RemoteSessionRoute::Impl::CleanupLocked() {
   cancellation_pending = false;
   cancel_accepted_at = std::chrono::steady_clock::time_point{};
   cancel_deadline = std::chrono::steady_clock::time_point{};
+  recovery_in_flight = false;
   request_id.clear();
   work_id.clear();
   session_id.clear();
@@ -192,7 +256,12 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleStart(
                                                     "没有配置输入源工厂");
   }
 
+  const auto recovery_started = fault_detected_at;
   CleanupLocked();
+  if (recovery_started != std::chrono::steady_clock::time_point{}) {
+    stats.last_fault_detect_to_cleanup = std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recovery_started);
+  }
   {
     const std::lock_guard<std::mutex> error_lock(error_mutex);
     last_error = domain::Error{};
@@ -204,6 +273,7 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleStart(
   cancel_accepted_at = std::chrono::steady_clock::time_point{};
   cancel_deadline = std::chrono::steady_clock::time_point{};
   if (generation == std::numeric_limits<std::uint64_t>::max()) {
+    RecordStartFailureLocked(recovery_started);
     return domain::Result<ControlResponse>::failure(ErrorCode::kBackendFailure,
                                                     "远端会话代际已经耗尽");
   }
@@ -212,40 +282,51 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleStart(
   work_id = request.work_id;
   session_id = request.session_id;
 
-  std::unique_ptr<capability::IAudioSource> audio;
+  std::unique_ptr<capability::IAudioSource> owned;
   try {
-    audio = config.input_factory();
+    owned = config.input_factory();
   } catch (...) {
+    RecordStartFailureLocked(recovery_started);
     return domain::Result<ControlResponse>::failure(ErrorCode::kBackendFailure,
                                                     "创建输入源时发生异常");
   }
-  if (audio == nullptr) {
+  if (owned == nullptr) {
+    RecordStartFailureLocked(recovery_started);
     return domain::Result<ControlResponse>::failure(ErrorCode::kBackendFailure,
                                                     "输入源工厂返回空值");
   }
+  // shared_ptr 同时被路由和输入线程持有：取消/清理路径可以在不依赖输入线程是否已经
+  // 释放原对象的前提下安全调用 cancel()，不会再出现裸指针 use-after-free。
+  std::shared_ptr<capability::IAudioSource> audio = std::move(owned);
 
   const auto started = proxy.start();
   if (!started.ok()) {
-    state = State::kIdle;
+    RecordStartFailureLocked(recovery_started);
     return domain::Result<ControlResponse>::failure(started.error.code,
                                                     started.error.message);
   }
 
-  source.store(audio.get());
+  source = audio;
   state = State::kActive;
   try {
     input_thread = std::thread([this, current = generation,
-                                owned = std::move(audio)]() mutable {
-      RunInput(current, std::move(owned));
+                                input = std::move(audio)]() mutable {
+      RunInput(current, std::move(input));
     });
   } catch (...) {
-    source.store(nullptr);
+    source.reset();
     (void)proxy.stop();
-    state = State::kUnavailable;
+    RecordStartFailureLocked(recovery_started);
     return domain::Result<ControlResponse>::failure(ErrorCode::kBackendFailure,
                                                     "创建输入线程失败");
   }
   ++stats.starts_accepted;
+  if (recovery_started != std::chrono::steady_clock::time_point{}) {
+    stats.last_fault_detect_to_ready = std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recovery_started);
+    ++stats.rebuilds_succeeded;
+    recovery_in_flight = true;
+  }
 
   const auto response = MakeResponse(
       request, OperationResult::success());
@@ -297,7 +378,7 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleCancel(
   }
 
   stop_requested.store(true);
-  capability::IAudioSource* audio = source.load();
+  std::shared_ptr<capability::IAudioSource> audio = source;
   if (audio != nullptr) {
     (void)audio->cancel();
   }
@@ -321,14 +402,13 @@ domain::Result<ControlResponse> RemoteSessionRoute::Impl::HandleExit(
 
 void RemoteSessionRoute::Impl::RunInput(
     std::uint64_t generation_value,
-    std::unique_ptr<capability::IAudioSource> audio_source) {
+    std::shared_ptr<capability::IAudioSource> audio_source) {
   const auto opened = audio_source->open();
   if (!opened.ok()) {
     RecordError(opened.error);
     (void)proxy.queue_cancel_stream();
     (void)audio_source->close();
     input_finished.store(true);
-    source.store(nullptr);
     return;
   }
 
@@ -337,7 +417,6 @@ void RemoteSessionRoute::Impl::RunInput(
     RecordError(started.error);
     (void)audio_source->close();
     input_finished.store(true);
-    source.store(nullptr);
     return;
   }
   // 取消可能早于输入线程执行到 queue_start_stream()：此时第一次 queue_cancel_stream()
@@ -346,7 +425,6 @@ void RemoteSessionRoute::Impl::RunInput(
     (void)proxy.queue_cancel_stream();
     (void)audio_source->close();
     input_finished.store(true);
-    source.store(nullptr);
     return;
   }
 
@@ -378,7 +456,6 @@ void RemoteSessionRoute::Impl::RunInput(
   }
 
   (void)audio_source->close();
-  source.store(nullptr);
   input_finished.store(true);
 }
 
@@ -488,6 +565,15 @@ std::size_t RemoteSessionRoute::poll_events(gateway::ControlRouteOwner owner,
 
   std::vector<DataEvent> events;
   (void)self.proxy.receive_events(events, max_events, std::chrono::milliseconds{0});
+  if (events.empty() && !self.terminal_seen.load()) {
+    // 先让已经到达的 partial/final/token/PCM 通过，再在下一轮 poll 把代理记录到的
+    // 节点/传输故障收敛成唯一错误终态。这样旧任务已有输出可以保留，但不会被误当成
+    // 新会话的成功收尾。
+    const domain::Error proxy_error = self.proxy.last_error();
+    if (!proxy_error.ok()) {
+      return self.DeliverFaultLocked(out, proxy_error);
+    }
+  }
   std::size_t delivered = 0;
   for (DataEvent& event : events) {
     if (self.terminal_seen.load()) {
@@ -510,6 +596,14 @@ std::size_t RemoteSessionRoute::poll_events(gateway::ControlRouteOwner owner,
     if (terminal) {
       const auto cancel_started = self.cancel_accepted_at;
       const auto terminal_now = std::chrono::steady_clock::now();
+      if (self.recovery_in_flight &&
+          self.fault_detected_at != std::chrono::steady_clock::time_point{}) {
+        self.stats.last_fault_detect_to_recovered_terminal =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                terminal_now - self.fault_detected_at);
+        self.recovery_in_flight = false;
+        self.fault_detected_at = std::chrono::steady_clock::time_point{};
+      }
       if (cancel_started != std::chrono::steady_clock::time_point{}) {
         self.stats.last_cancel_accept_to_terminal = std::chrono::duration_cast<
             std::chrono::nanoseconds>(terminal_now - cancel_started);

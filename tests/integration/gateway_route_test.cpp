@@ -203,6 +203,63 @@ bool HasLateScriptedEvent(const std::vector<protocol::DataEvent>& events) {
   return false;
 }
 
+bool HasRequestId(const std::vector<protocol::DataEvent>& events,
+                  const std::string& request_id) {
+  for (const protocol::DataEvent& event : events) {
+    if (event.request_id == request_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HasText(const std::vector<protocol::DataEvent>& events,
+             const std::string& text) {
+  for (const protocol::DataEvent& event : events) {
+    if (event.text == text) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::size_t CountTerminals(const std::vector<protocol::DataEvent>& events) {
+  std::size_t count = 0;
+  for (const protocol::DataEvent& event : events) {
+    if (event.end) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::vector<protocol::DataEvent> WaitForFaultOutputAndRelease(
+    transport::RemoteSessionRoute& route, const std::string& request_id,
+    const std::string& release_file, std::chrono::milliseconds budget) {
+  std::vector<protocol::DataEvent> events;
+  bool saw_fault_output = false;
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (!saw_fault_output && std::chrono::steady_clock::now() < deadline) {
+    std::vector<protocol::DataEvent> batch;
+    const std::size_t count = route.poll_events(1, batch, 64);
+    for (protocol::DataEvent& event : batch) {
+      if (event.request_id == request_id) {
+        saw_fault_output = true;
+      }
+      events.push_back(std::move(event));
+    }
+    if (!saw_fault_output && count == 0) {
+      std::this_thread::sleep_for(2ms);
+    }
+  }
+  CHECK_MESSAGE(saw_fault_output, "故障前旧输出未在预算内到达");
+
+  // 只有父进程确认收到旧输出后才释放故障注入，避免发送与退出之间的时序竞态。
+  std::ofstream release(release_file);
+  release << "release\n";
+  return events;
+}
+
 std::string MakeTempPath() {
   char path[] = "/tmp/nexweave-route-XXXXXX";
   const int fd = ::mkstemp(path);
@@ -970,6 +1027,297 @@ void TestStaleEventsDoNotLeakIntoNextStart() {
   std::filesystem::remove(endpoint_file, remove_error);
 }
 
+// 保护不变量：节点在旧任务未完成时退出，必须先交付唯一故障终态；旧任务已经产生的
+// token/PCM 可以到达调用方，但下一次 start 重建成功的轮次不得重放这些旧输出。
+void TestExitFaultRecoversWithoutReplay() {
+  const std::string endpoint_file = MakeTempPath();
+  const std::string fault_file = MakeTempPath();
+  const std::string release_file = MakeTempPath();
+  const auto first_state = std::make_shared<ScriptedSourceState>();
+  const auto second_state = std::make_shared<ScriptedSourceState>();
+  auto pending_states =
+      std::make_shared<std::deque<std::shared_ptr<ScriptedSourceState>>>();
+  pending_states->push_back(first_state);
+  pending_states->push_back(second_state);
+
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = NEXWEAVE_REMOTE_SCRIPTED_FIXTURE;
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = endpoint_file;
+  config.proxy.ready_timeout = 5000ms;
+  config.proxy.pump_interval = 5ms;
+  config.proxy.child_config.start_wait_budget = 1500ms;
+  config.proxy.child_config.stop_wait_budget = 500ms;
+  config.proxy.child_config.kill_wait_budget = 300ms;
+  config.cancel_timeout = 2000ms;
+  config.input_factory = [pending_states]() -> std::unique_ptr<capability::IAudioSource> {
+    if (pending_states->empty()) {
+      return {};
+    }
+    const std::shared_ptr<ScriptedSourceState> state = pending_states->front();
+    pending_states->pop_front();
+    return std::make_unique<ScriptedAudioSource>(state);
+  };
+  config.stream_id = "remote-session";
+  config.proxy.child.environment = {
+      "NEXWEAVE_SCRIPTED_MODE=exit-once",
+      "NEXWEAVE_SCRIPTED_FAULT_FILE=" + fault_file,
+      "NEXWEAVE_SCRIPTED_FAULT_RELEASE_FILE=" + release_file,
+  };
+
+  transport::RemoteSessionRoute route(config);
+  const auto started = route.call(
+      MakeRequest("r-fault-exit-start", "start", "w-1", "s-1", 3000ms));
+  CHECK(started.ok());
+  CHECK(started.value->result.ok());
+
+  std::vector<protocol::DataEvent> first_events =
+      WaitForFaultOutputAndRelease(route, "pre-fault-turn", release_file, 5s);
+  const auto tail_events = CollectRouteEvents(route, 5s);
+  for (const protocol::DataEvent& event : tail_events) {
+    first_events.push_back(event);
+  }
+  CHECK(HasTerminal(first_events, protocol::DataEventType::kError,
+                    domain::ErrorCode::kBackendFailure));
+  CHECK(CountTerminals(first_events) == 1);
+  CHECK(HasRequestId(first_events, "pre-fault-turn"));
+  CHECK(HasText(first_events, "before-fault"));
+
+  const transport::RemoteSessionRouteStats first_stats = route.stats();
+  CHECK(first_stats.faults_detected == 1);
+  CHECK(first_stats.terminal_events_delivered == 1);
+  CHECK(first_stats.last_fault_detect_to_cleanup.count() == 0);
+  CHECK(first_stats.last_fault_detect_to_ready.count() == 0);
+  CHECK(first_stats.last_fault_detect_to_recovered_terminal.count() == 0);
+
+  // 故障后的下一次 start 必须清理旧代理、建立新代理并完成一轮新任务。
+  const auto restarted = route.call(
+      MakeRequest("r-fault-exit-restart", "start", "w-2", "s-2", 3000ms));
+  CHECK(restarted.ok());
+  CHECK(restarted.value->result.ok());
+  const transport::RemoteSessionRouteStats after_restart = route.stats();
+  CHECK(after_restart.rebuilds_succeeded == 1);
+  CHECK(after_restart.last_fault_detect_to_cleanup.count() > 0);
+  CHECK(after_restart.last_fault_detect_to_ready.count() > 0);
+  CHECK(after_restart.last_fault_detect_to_recovered_terminal.count() == 0);
+
+  PushSourceFrame(second_state, 1000);
+  PushSourceFrame(second_state, 1000);
+  PushSourceFrame(second_state, 0);
+  PushSourceFrame(second_state, 0);
+  FinishSource(second_state);
+  const auto second_events = CollectRouteEvents(route, 5s);
+  CHECK(HasTerminal(second_events, protocol::DataEventType::kDone,
+                    domain::ErrorCode::kNone));
+  CHECK(CountTerminals(second_events) == 1);
+  CHECK(!HasRequestId(second_events, "pre-fault-turn"));
+  CHECK(!HasText(second_events, "before-fault"));
+
+  const transport::RemoteSessionRouteStats recovered_stats = route.stats();
+  CHECK(recovered_stats.starts_accepted == 2);
+  CHECK(recovered_stats.terminal_events_delivered == 2);
+  CHECK(recovered_stats.last_fault_detect_to_recovered_terminal.count() > 0);
+
+  if (std::getenv("NEXWEAVE_FAULT_EVIDENCE") != nullptr) {
+    std::cout << "fault_detect_to_cleanup_ns="
+              << recovered_stats.last_fault_detect_to_cleanup.count() << '\n';
+    std::cout << "fault_detect_to_ready_ns="
+              << recovered_stats.last_fault_detect_to_ready.count() << '\n';
+    std::cout << "fault_detect_to_recovered_terminal_ns="
+              << recovered_stats.last_fault_detect_to_recovered_terminal.count() << '\n';
+  }
+
+  const auto exited = route.call(MakeRequest("r-fault-exit-exit", "exit"));
+  CHECK(exited.ok());
+  CHECK(exited.value->result.ok());
+
+  std::error_code remove_error;
+  std::filesystem::remove(endpoint_file, remove_error);
+  std::filesystem::remove(fault_file, remove_error);
+  std::filesystem::remove(release_file, remove_error);
+}
+
+// 保护不变量：断连注入与节点退出一样不能把旧任务当成成功；重建后旧输出不得重放。
+void TestDisconnectFaultRecoversWithoutReplay() {
+  const std::string endpoint_file = MakeTempPath();
+  const std::string fault_file = MakeTempPath();
+  const std::string release_file = MakeTempPath();
+  const auto first_state = std::make_shared<ScriptedSourceState>();
+  const auto second_state = std::make_shared<ScriptedSourceState>();
+  auto pending_states =
+      std::make_shared<std::deque<std::shared_ptr<ScriptedSourceState>>>();
+  pending_states->push_back(first_state);
+  pending_states->push_back(second_state);
+
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = NEXWEAVE_REMOTE_SCRIPTED_FIXTURE;
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = endpoint_file;
+  config.proxy.ready_timeout = 5000ms;
+  config.proxy.pump_interval = 5ms;
+  config.proxy.child_config.start_wait_budget = 1500ms;
+  config.proxy.child_config.stop_wait_budget = 500ms;
+  config.proxy.child_config.kill_wait_budget = 300ms;
+  config.cancel_timeout = 2000ms;
+  config.input_factory = [pending_states]() -> std::unique_ptr<capability::IAudioSource> {
+    if (pending_states->empty()) {
+      return {};
+    }
+    const std::shared_ptr<ScriptedSourceState> state = pending_states->front();
+    pending_states->pop_front();
+    return std::make_unique<ScriptedAudioSource>(state);
+  };
+  config.stream_id = "remote-session";
+  config.proxy.child.environment = {
+      "NEXWEAVE_SCRIPTED_MODE=disconnect-once",
+      "NEXWEAVE_SCRIPTED_FAULT_FILE=" + fault_file,
+      "NEXWEAVE_SCRIPTED_FAULT_RELEASE_FILE=" + release_file,
+  };
+
+  transport::RemoteSessionRoute route(config);
+  const auto started = route.call(
+      MakeRequest("r-fault-disconnect-start", "start", "w-1", "s-1", 3000ms));
+  CHECK_MESSAGE(started.ok(), started.error.message);
+  CHECK(started.value->result.ok());
+
+  std::vector<protocol::DataEvent> first_events =
+      WaitForFaultOutputAndRelease(route, "pre-fault-turn", release_file, 5s);
+  const auto tail_events = CollectRouteEvents(route, 5s);
+  for (const protocol::DataEvent& event : tail_events) {
+    first_events.push_back(event);
+  }
+  CHECK(HasTerminal(first_events, protocol::DataEventType::kError,
+                    domain::ErrorCode::kBackendFailure));
+  CHECK(CountTerminals(first_events) == 1);
+  CHECK(HasRequestId(first_events, "pre-fault-turn"));
+
+  const auto restarted = route.call(
+      MakeRequest("r-fault-disconnect-restart", "start", "w-2", "s-2", 3000ms));
+  CHECK(restarted.ok());
+  CHECK(restarted.value->result.ok());
+
+  PushSourceFrame(second_state, 1000);
+  PushSourceFrame(second_state, 1000);
+  PushSourceFrame(second_state, 0);
+  PushSourceFrame(second_state, 0);
+  FinishSource(second_state);
+  const auto second_events = CollectRouteEvents(route, 5s);
+  CHECK(HasTerminal(second_events, protocol::DataEventType::kDone,
+                    domain::ErrorCode::kNone));
+  CHECK(CountTerminals(second_events) == 1);
+  CHECK(!HasRequestId(second_events, "pre-fault-turn"));
+
+  const auto exited = route.call(MakeRequest("r-fault-disconnect-exit", "exit"));
+  CHECK(exited.ok());
+  CHECK(exited.value->result.ok());
+
+  std::error_code remove_error;
+  std::filesystem::remove(endpoint_file, remove_error);
+  std::filesystem::remove(fault_file, remove_error);
+  std::filesystem::remove(release_file, remove_error);
+}
+
+// 保护不变量：重建失败必须进入明确不可用状态，而不是让后续 start 静默重试或挂起。
+void TestRebuildFailureMarksUnavailable() {
+  const std::string endpoint_file = MakeTempPath();
+  const std::string fault_file = MakeTempPath();
+  const auto first_state = std::make_shared<ScriptedSourceState>();
+  const auto second_state = std::make_shared<ScriptedSourceState>();
+  auto pending_states =
+      std::make_shared<std::deque<std::shared_ptr<ScriptedSourceState>>>();
+  pending_states->push_back(first_state);
+  pending_states->push_back(second_state);
+
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = NEXWEAVE_REMOTE_SCRIPTED_FIXTURE;
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = endpoint_file;
+  config.proxy.ready_timeout = 300ms;
+  config.proxy.pump_interval = 5ms;
+  config.proxy.child_config.start_wait_budget = 300ms;
+  config.proxy.child_config.poll_interval = 10ms;
+  config.proxy.child_config.stop_wait_budget = 300ms;
+  config.proxy.child_config.kill_wait_budget = 200ms;
+  config.cancel_timeout = 1000ms;
+  config.input_factory = [pending_states]() -> std::unique_ptr<capability::IAudioSource> {
+    if (pending_states->empty()) {
+      return {};
+    }
+    const std::shared_ptr<ScriptedSourceState> state = pending_states->front();
+    pending_states->pop_front();
+    return std::make_unique<ScriptedAudioSource>(state);
+  };
+  config.stream_id = "remote-session";
+  config.proxy.child.environment = {
+      "NEXWEAVE_SCRIPTED_MODE=exit-once-unavailable",
+      "NEXWEAVE_SCRIPTED_FAULT_FILE=" + fault_file,
+  };
+
+  transport::RemoteSessionRoute route(config);
+  const auto started = route.call(
+      MakeRequest("r-rebuild-fail-start", "start", "w-1", "s-1", 3000ms));
+  CHECK(started.ok());
+  CHECK(started.value->result.ok());
+  const auto first_events = CollectRouteEvents(route, 5s);
+  CHECK(HasTerminal(first_events, protocol::DataEventType::kError,
+                    domain::ErrorCode::kBackendFailure));
+  CHECK(route.stats().faults_detected == 1);
+
+  // 第二次 start 需要重建，但夹具故意不写端点、不通知就绪，启动预算到期应返回结构化错误。
+  const auto rebuild_failed = route.call(
+      MakeRequest("r-rebuild-fail-attempt", "start", "w-2", "s-2", 3000ms));
+  CHECK(!rebuild_failed.ok());
+  CHECK(rebuild_failed.error.code == domain::ErrorCode::kTimeout ||
+        rebuild_failed.error.code == domain::ErrorCode::kBackendFailure);
+  const transport::RemoteSessionRouteStats failed_stats = route.stats();
+  CHECK(failed_stats.rebuilds_failed == 1);
+  CHECK(failed_stats.last_rebuild_failure_duration.count() > 0);
+
+  // 不可用状态必须对后续 start 明确拒绝，不能再次尝试启动子进程。
+  const auto unavailable = route.call(
+      MakeRequest("r-rebuild-fail-again", "start", "w-3", "s-3", 3000ms));
+  CHECK(!unavailable.ok());
+  CHECK(unavailable.error.code == domain::ErrorCode::kBackendFailure);
+
+  const auto exited = route.call(MakeRequest("r-rebuild-fail-exit", "exit"));
+  CHECK(exited.ok());
+  CHECK(exited.value->result.ok());
+
+  std::error_code remove_error;
+  std::filesystem::remove(endpoint_file, remove_error);
+  std::filesystem::remove(fault_file, remove_error);
+}
+
+// 保护不变量：连接/启动失败也进入明确不可用状态，且后续 start 不会无限重试。
+void TestConnectionFailureMarksUnavailable() {
+  const std::string endpoint_file = MakeTempPath();
+  transport::RemoteSessionRouteConfig config;
+  config.proxy.child.executable = "/nonexistent/nexweave-remote-node";
+  config.proxy.child.expect_ready_signal = true;
+  config.proxy.endpoint_file = endpoint_file;
+  config.proxy.ready_timeout = 500ms;
+  config.proxy.pump_interval = 5ms;
+  config.proxy.child_config.start_wait_budget = 500ms;
+  config.input_factory = []() -> std::unique_ptr<capability::IAudioSource> {
+    return std::make_unique<ScriptedAudioSource>(std::make_shared<ScriptedSourceState>());
+  };
+  config.stream_id = "remote-session";
+
+  transport::RemoteSessionRoute route(config);
+  const auto started = route.call(
+      MakeRequest("r-connect-fail-start", "start", "w-1", "s-1", 1000ms));
+  CHECK(!started.ok());
+  CHECK(started.error.code == domain::ErrorCode::kBackendFailure);
+
+  const auto retry = route.call(
+      MakeRequest("r-connect-fail-retry", "start", "w-2", "s-2", 1000ms));
+  CHECK(!retry.ok());
+  CHECK(retry.error.code == domain::ErrorCode::kBackendFailure);
+
+  std::error_code remove_error;
+  std::filesystem::remove(endpoint_file, remove_error);
+}
+
 }  // namespace
 
 int main() {
@@ -982,5 +1330,9 @@ int main() {
   TestRemoteCancelTimeoutIsStructured();
   TestRemoteCancelStagesAndDuplicateCancel();
   TestStaleEventsDoNotLeakIntoNextStart();
+  TestExitFaultRecoversWithoutReplay();
+  TestDisconnectFaultRecoversWithoutReplay();
+  TestRebuildFailureMarksUnavailable();
+  TestConnectionFailureMarksUnavailable();
   return 0;
 }

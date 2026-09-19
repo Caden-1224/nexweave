@@ -471,8 +471,35 @@ void RemoteSessionProxy::Impl::StoreTerminal(const DataEvent& event) {
 void RemoteSessionProxy::Impl::IoLoop() {
   while (true) {
     runtime::InputStreamEvent event;
-    const QueuePopStatus popped = inbound_queue->try_pop(event);
-    if (popped == QueuePopStatus::kItem) {
+    runtime::InputStreamEvent cancel_event;
+    bool has_event = false;
+    bool has_cancel = false;
+    bool input_closed = false;
+    {
+      // “取一个已排队输入”和“构造待发取消”必须在同一个代理锁临界区内完成。
+      // 如果先解锁观察到队列为空、再检查 cancel_pending，那么 start 可能在两步之间
+      // 入队，导致 cancel 抢在 start 前上线；脚本夹具收到 cancel-without-start 正好
+      // 暴露过这条竞态。临界区内先 pop，pop 不到才允许把取消提升为待发送事件。
+      const std::lock_guard<std::mutex> lock(mutex);
+      const QueuePopStatus popped = inbound_queue->try_pop(event);
+      if (popped == QueuePopStatus::kItem) {
+        has_event = true;
+      } else if (popped == QueuePopStatus::kClosed) {
+        input_closed = true;
+      } else if (cancel_pending) {
+        cancel_event.stream_id = stream_id;
+        cancel_event.generation = generation;
+        cancel_event.sequence = pending_cancel_sequence;
+        cancel_event.kind = runtime::InputEventKind::kCancel;
+        cancel_pending = false;
+        has_cancel = true;
+      }
+    }
+
+    if (input_closed) {
+      break;
+    }
+    if (has_event) {
       const auto sent = channel.send_input(event);
       if (!sent.ok()) {
         RecordError(sent.error);
@@ -489,27 +516,7 @@ void RemoteSessionProxy::Impl::IoLoop() {
       }
       continue;
     }
-    if (popped == QueuePopStatus::kClosed) {
-      break;
-    }
-
-    // 取消事件绕过有界输入队列：只有在此前排队的输入事件都已经弹出并发送后，
-    // 才补发这条取消。这样队列满时也不会丢失停止指令，而且线上的 sequence
-    // 仍保持连续、取消排在已提交音频之后。
-    runtime::InputStreamEvent cancel_event;
-    bool has_pending_cancel = false;
-    {
-      const std::lock_guard<std::mutex> lock(mutex);
-      if (cancel_pending) {
-        cancel_event.stream_id = stream_id;
-        cancel_event.generation = generation;
-        cancel_event.sequence = pending_cancel_sequence;
-        cancel_event.kind = runtime::InputEventKind::kCancel;
-        cancel_pending = false;
-        has_pending_cancel = true;
-      }
-    }
-    if (has_pending_cancel) {
+    if (has_cancel) {
       const auto sent = channel.send_input(cancel_event);
       if (!sent.ok()) {
         RecordError(sent.error);
@@ -556,8 +563,22 @@ void RemoteSessionProxy::Impl::IoLoop() {
     }
 
     if (received.error.code == ErrorCode::kTimeout) {
-      const std::lock_guard<std::mutex> lock(mutex);
-      ++stats.receive_timeouts;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        ++stats.receive_timeouts;
+      }
+      // socket 超时不一定代表对端还活着。非阻塞 poll 子进程状态，让“节点自然退出”
+      // 也能尽快收敛成结构化故障，而不是无限等待一个已经不存在的数据面对端。
+      // stop_requested 为真时说明父进程已在走停止路径，不再把正常停止误报成故障。
+      if (!stop_requested.load()) {
+        const runtime::ChildProcessStatus child_status = child.status();
+        if (!child_status.process_alive ||
+            child_status.state == runtime::ChildProcessState::kIdle) {
+          RecordError(domain::Error{ErrorCode::kBackendFailure,
+                                    "远端 Session 子进程已经退出"});
+          break;
+        }
+      }
       continue;
     }
 
