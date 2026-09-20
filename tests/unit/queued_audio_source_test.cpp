@@ -91,5 +91,19 @@ int main() {
     CHECK(source.open().ok());
   }
 
+  {
+    // 保护不变量：end_input() 先于 open() 到达时，已经入队的完整帧仍要按顺序读出，
+    // 读完后以 kAlreadyCompleted 结束；不能把“队列已关闭”误报成设备无数据。
+    QueuedAudioSource source;
+    CHECK(source.push(Frame(9)).ok());
+    CHECK(source.end_input().ok());
+    CHECK(source.open().ok());
+    const auto first = source.read();
+    CHECK(first.ok());
+    CHECK(first.value->samples.front() == 9);
+    const auto ended = source.read();
+    CHECK(ended.error.code == ErrorCode::kAlreadyCompleted);
+  }
+
   return 0;
 }

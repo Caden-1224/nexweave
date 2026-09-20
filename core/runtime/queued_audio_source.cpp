@@ -47,6 +47,10 @@ domain::OperationResult QueuedAudioSource::open() {
   if (!opened_ && cancelled_) {
     return OperationResult::failure(ErrorCode::kCancelled, "音频源已经取消");
   }
+  // 记录 open 之前是否已经收到自然结束。end_input() 可以早于 open() 到达：字节流
+  // 已结束，但已经入队的完整帧仍按顺序有效。此时不能把 ended_ 清掉，否则 read() 会在
+  // 队列关闭后看到三个终态标志都为假，从而把一次正常结束误报成设备无数据。
+  const bool ended_before_open = !opened_ && ended_ && !closed_;
   // close() 之后的 open 是同一对象的新输入轮次：旧队列不保留，取消标志复位。
   // 初始 open 前的 push 是允许的启动窗口，不能被清掉，否则先到帧会被静默丢弃。
   if (closed_) {
@@ -54,7 +58,9 @@ domain::OperationResult QueuedAudioSource::open() {
   }
   opened_ = true;
   closed_ = false;
-  ended_ = false;
+  if (!ended_before_open) {
+    ended_ = false;
+  }
   cancelled_ = false;
   return OperationResult::success();
 }

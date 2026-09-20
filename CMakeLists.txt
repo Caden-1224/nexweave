@@ -146,6 +146,19 @@ target_link_libraries(nexweave_transport
   PRIVATE nexweave_warnings ${NEXWEAVE_ZMQ_LIBRARY}
 )
 
+# 部署 profile 层：把进程拓扑、生命周期与数据面组装成可复用的上层契约。它依赖传输层，
+# 但不反向进入传输或 Session；后续 Linux/RK3576 部署入口链接本目标即可复用启停语义。
+add_library(nexweave_profile STATIC
+  core/profile/linux_profile.cpp
+)
+target_include_directories(nexweave_profile PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/profile
+)
+target_link_libraries(nexweave_profile
+  PUBLIC nexweave_transport
+  PRIVATE nexweave_warnings
+)
+
 # 子进程生命周期测试夹具：它只调用 notify_parent_ready() 并等待信号，供集成测试观察
 # 启动就绪、SIGTERM/SIGKILL 升级和退出归档。它不进入产品安装目标。
 add_executable(nexweave_child_process_helper tests/support/child_process_helper.cpp)
@@ -309,6 +322,15 @@ target_compile_definitions(nexweave_remote_session_test PRIVATE
   NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>"
   NEXWEAVE_REMOTE_SCRIPTED_FIXTURE="$<TARGET_FILE:nexweave_remote_scripted_fixture>")
 set_tests_properties(remote_session_integration PROPERTIES TIMEOUT 60)
+
+# Linux profile 生命周期：真实子进程与 PAIR 数据面，覆盖重复启停、重启、取消过滤、
+# 启动失败回滚和满输出队列收敛；超时让夹具挂起变成明确失败。
+nexweave_test(linux_profile tests/integration/linux_profile_lifecycle_test.cpp integration)
+target_link_libraries(nexweave_linux_profile_test PRIVATE nexweave_profile)
+target_compile_definitions(nexweave_linux_profile_test PRIVATE
+  NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>"
+  NEXWEAVE_REMOTE_SCRIPTED_FIXTURE="$<TARGET_FILE:nexweave_remote_scripted_fixture>")
+set_tests_properties(linux_profile_integration PROPERTIES TIMEOUT 60)
 
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。
 add_executable(nexweave_session_app apps/session_app/main.cpp)
