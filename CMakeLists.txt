@@ -332,6 +332,16 @@ target_compile_definitions(nexweave_linux_profile_test PRIVATE
   NEXWEAVE_REMOTE_SCRIPTED_FIXTURE="$<TARGET_FILE:nexweave_remote_scripted_fixture>")
 set_tests_properties(linux_profile_integration PROPERTIES TIMEOUT 60)
 
+# 单进程/多进程对照：同一 Fake Session 夹具分别在同进程与 LinuxProfile 子进程中运行，
+# 输出原始延迟/RSS/队列样本与汇总 JSON；测试只断言成功收敛和输出一致，不把 Fake 耗时当性能。
+nexweave_test(linux_profile_comparison tests/integration/linux_profile_comparison_test.cpp integration)
+target_link_libraries(nexweave_linux_profile_comparison_test PRIVATE nexweave_profile)
+target_include_directories(nexweave_linux_profile_comparison_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+target_compile_definitions(nexweave_linux_profile_comparison_test PRIVATE
+  NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>")
+set_tests_properties(linux_profile_comparison_integration PROPERTIES TIMEOUT 120)
+
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。
 add_executable(nexweave_session_app apps/session_app/main.cpp)
 target_link_libraries(nexweave_session_app PRIVATE
