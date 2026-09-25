@@ -72,6 +72,7 @@ add_library(nexweave_core_domain STATIC
   core/backend/bm25_rag.cpp
   core/backend/fake_llm.cpp
   core/backend/fake_tts.cpp
+  core/backend/zipformer_stream.cpp
   core/runtime/interaction_contract.cpp
   core/runtime/session_runtime.cpp
   core/runtime/text_segmentation.cpp
@@ -215,6 +216,7 @@ nexweave_test(bounded_queue tests/unit/bounded_queue_test.cpp unit)
 # 终态缓存：容量淘汰、保留期限与显式过期查询。
 nexweave_test(terminal_cache tests/unit/terminal_cache_test.cpp unit)
 nexweave_test(fake_asr tests/unit/fake_asr_test.cpp unit)
+nexweave_test(zipformer_stream tests/unit/zipformer_stream_test.cpp unit)
 nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
 nexweave_test(bm25_rag tests/unit/bm25_rag_test.cpp unit)
 nexweave_test(fake_llm tests/unit/fake_llm_test.cpp unit)
@@ -382,3 +384,68 @@ add_test(NAME gate_scripts_failure COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test
 add_test(NAME gate_rebuild COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/gate/rebuild_test.sh
   ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(gate_scripts_failure gate_rebuild PROPERTIES LABELS "gate" TIMEOUT 60)
+
+# 可选 RKNN Zipformer 适配器构建：默认关闭，WSL Fake 回归不依赖 NPU SDK。
+# 打开后要求显式提供 NEXWEAVE_RKNN_ROOT，其中 include/ 放 rknn_api.h 与
+# kaldi-native-fbank 头，lib/ 放 librknnrt 与 libkaldi-native-fbank-core。
+# 第三方库不提交到本仓库；板端证据记录实际使用的头、库版本与路径。
+option(NEXWEAVE_ENABLE_RKNN "构建 RKNN Zipformer ASR 适配器" OFF)
+set(NEXWEAVE_RKNN_ROOT "" CACHE PATH "RKNN 与 kaldi-native-fbank 依赖根目录")
+if(NEXWEAVE_ENABLE_RKNN)
+  find_path(NEXWEAVE_RKNN_INCLUDE_DIR
+    NAMES rknn_api.h
+    HINTS "${NEXWEAVE_RKNN_ROOT}/include")
+  find_library(NEXWEAVE_RKNN_LIBRARY
+    NAMES rknnrt
+    HINTS "${NEXWEAVE_RKNN_ROOT}/lib")
+  find_path(NEXWEAVE_KNF_INCLUDE_DIR
+    NAMES kaldi-native-fbank/csrc/online-feature.h
+    HINTS "${NEXWEAVE_RKNN_ROOT}/include")
+  find_library(NEXWEAVE_KNF_LIBRARY
+    NAMES kaldi-native-fbank-core
+    HINTS "${NEXWEAVE_RKNN_ROOT}/lib")
+  if(NOT NEXWEAVE_RKNN_INCLUDE_DIR OR NOT NEXWEAVE_RKNN_LIBRARY OR
+     NOT NEXWEAVE_KNF_INCLUDE_DIR OR NOT NEXWEAVE_KNF_LIBRARY)
+    message(FATAL_ERROR
+      "NEXWEAVE_ENABLE_RKNN=ON 需要 NEXWEAVE_RKNN_ROOT/include 与 "
+      "NEXWEAVE_RKNN_ROOT/lib 下同时提供 rknn_api.h、librknnrt 与 "
+      "kaldi-native-fbank 头/静态库。")
+  endif()
+
+  add_library(nexweave_rknn_zipformer STATIC
+    core/backend/rknn/kaldi_online_fbank.cpp
+    core/backend/rknn/rknn_zipformer_engine.cpp
+    core/backend/rknn/rknn_zipformer_asr.cpp
+  )
+  target_include_directories(nexweave_rknn_zipformer
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/rknn
+    PRIVATE
+      ${NEXWEAVE_RKNN_INCLUDE_DIR}
+      ${NEXWEAVE_KNF_INCLUDE_DIR}
+  )
+  target_link_libraries(nexweave_rknn_zipformer
+    PUBLIC nexweave_core_domain
+    PRIVATE
+      nexweave_warnings
+      ${NEXWEAVE_RKNN_LIBRARY}
+      ${NEXWEAVE_KNF_LIBRARY}
+  )
+
+  # 板端硬件测试可执行文件：模型、词表和 WAV 由命令行注入，不在 CMake 配置期硬编码。
+  add_executable(nexweave_rknn_zipformer_hardware_test
+    tests/hardware/rknn_zipformer_hardware_test.cpp)
+  target_link_libraries(nexweave_rknn_zipformer_hardware_test PRIVATE
+    nexweave_rknn_zipformer
+    nexweave_warnings
+  )
+  target_include_directories(nexweave_rknn_zipformer_hardware_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  )
+  # 板端预编译的 kaldi-native-fbank 静态库未带 PIC；硬件测试单独使用非 PIE 链接，
+  # 避免把该第三方库的构建方式强加给核心库或其它测试目标。
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(nexweave_rknn_zipformer_hardware_test PRIVATE -no-pie)
+  endif()
+endif()

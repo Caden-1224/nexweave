@@ -138,7 +138,7 @@ Gateway 负责客户端接入，Supervisor 管理任务和子进程，Session �
 | 音频输入与输出 | 确定性 Fake | ALSA |
 | ASR（自动语音识别） | 脚本驱动的 Fake 流式事件 | RKNN Zipformer |
 | RAG（检索增强生成） | 固定检索夹具与路由 | 本地 JSONL 知识库、词项检索与路由校准 |
-| LLM（大语言模型） | 确定性 token 流 | Qwen3-VL-2B 的 RKLLM 文本推理 |
+| LLM（大语言模型） | 确定性 token 流 | Qwen3.5-0.8B 的 RKLLM 文本推理 |
 | TTS（文本转语音） | 确定性 PCM 流 | MeloTTS 离线合成 |
 | 音频前处理 | 可控音频与活动事件夹具 | WebRTC AEC/降噪、Silero VAD |
 
@@ -244,7 +244,7 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | Mock 运行证据 | 已实现 | 一次运行产生五份产物（run-manifest.json、events.jsonl、metrics.jsonl、protocol.jsonl、summary.md）；单调时间族与调度步数族分开标注，未测量项如实标注；`--evidence-dir` 留档，`--out-dir` 仍验证“返回即无残留” |
 | Gateway 传输与 ZeroMQ | 控制面与数据面适配已实现基础版 | ZeroMQ REQ/REP 控制传输、deadline 与幂等；PAIR multipart 输入音频/输出事件、二元长度与顺序校验；统一队列与终态缓存已接入，Linux 多进程端到端基础链路已交付；真实 HWM 压力与板端部署对照待后续 |
 | 本地知识库与真实检索 | 已实现基础版 | 固定 JSONL 知识库、BM25 词项检索、L0-L3 阈值与上下文字节预算校准；板端真实知识库部署待后续任务 |
-| RK3576 模型与音频前端 | 规划中 | RKNN、RKLLM、MeloTTS、ALSA、AEC 和 VAD |
+| RK3576 模型与音频前端 | ASR 适配器已实现，其余规划中 | Zipformer RKNN ASR 已完成板端增量输入、结束刷新、取消、重置与错误路径验证；Qwen3.5-0.8B、MeloTTS 编码器/解码器与 Silero VAD 已完成最小推理预检；正式 RKLLM/TTS/ALSA/AEC 与完整链路仍待交付 |
 | 板端故障与稳定性验证 | 待前置能力完成 | 真实闭环、打断、恢复和资源实验 |
 
 Fake ASR 不识别真实波形，而是按预设脚本产生事件。它用于验证协议和生命周期，不提供语音识别准确率。
@@ -275,7 +275,7 @@ cd nexweave
 ./scripts/test.sh
 ```
 
-测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件、单进程应用 `nexweave_session_app`、Mock profile 入口 `nexweave_mock_profile`，以及 ZeroMQ 控制/数据面集成测试。两个命令行门禁分别覆盖：参数错误与三种输入模式、确定性一致与信号退出（`session_app_cli`）；四个场景的退出码与关键字段、重复运行逐字节一致、产物清空与不链接硬件库（`mock_profile_cli`）。真实模型、ALSA 与板端入口尚未交付。
+测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件、单进程应用 `nexweave_session_app`、Mock profile 入口 `nexweave_mock_profile`，以及 ZeroMQ 控制/数据面集成测试。两个命令行门禁分别覆盖：参数错误与三种输入模式、确定性一致与信号退出（`session_app_cli`）；四个场景的退出码与关键字段、重复运行逐字节一致、产物清空与不链接硬件库（`mock_profile_cli`）。真实 ASR 适配器已实现但默认不参与 WSL 构建；ALSA、其余模型与完整板端入口仍待交付。
 
 跑一次 Mock profile：
 
@@ -307,6 +307,31 @@ ctest --test-dir build/strict -L contract --output-on-failure
 ```
 
 `BUILD_DIR` 和 `BUILD_TYPE` 同时适用于构建与测试脚本。自定义依赖安装可通过 `nlohmann_json_DIR`、`CMAKE_PREFIX_PATH` 或 ZeroMQ 的 `NEXWEAVE_ZMQ_INCLUDE_DIR`、`NEXWEAVE_CPPZMQ_INCLUDE_DIR`、`NEXWEAVE_ZMQ_LIBRARY` 指定；缺失依赖时 CMake 会报告安装提示。
+
+</details>
+
+<details>
+<summary>可选：构建 RKNN Zipformer 适配器</summary>
+
+该适配器默认不参与 WSL Fake 构建。启用时需要显式提供 RKNN Runtime 与
+kaldi-native-fbank 的头和库，仓库不提交厂商 SDK、动态库或模型文件：
+
+- `NEXWEAVE_RKNN_ROOT/include/rknn_api.h`
+- `NEXWEAVE_RKNN_ROOT/include/kaldi-native-fbank/csrc/online-feature.h`
+- `NEXWEAVE_RKNN_ROOT/lib/librknnrt.so`
+- `NEXWEAVE_RKNN_ROOT/lib/libkaldi-native-fbank-core.a`
+
+```bash
+cmake -S . -B build/rknn \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DNEXWEAVE_ENABLE_RKNN=ON \
+  -DNEXWEAVE_RKNN_ROOT=/path/to/rknn-deps
+cmake --build build/rknn --target nexweave_rknn_zipformer_hardware_test -j2
+```
+
+板端硬件测试通过 `IAsr` 公共接口驱动真实模型，模型、词表和 WAV 由命令行传入；
+支持 `success`、`short`、`long`、`cancel`、`callback-failure` 与 `invalid` 模式。
+测试只记录当前输入、配置和运行时版本下的可复现事实，不把单次耗时写成吞吐或可靠性结论。
 
 </details>
 
@@ -413,7 +438,7 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 - [ ] RK3576 模型、全双工音频前端与语音打断
 - [ ] 故障恢复、板端实验与发布验证
 
-第一版以 RK3576 为唯一硬件适配目标，聚焦单设备上的离线语音链路；昇腾、鲲鹏和其他 RK 型号的适配不进入本版门禁。Qwen3-VL-2B 仅使用文本推理能力；视觉输入、机器人动作、跨主机集群、多设备并发、在线 LLM/TTS 和模型训练不在当前范围。
+第一版以 RK3576 为唯一硬件适配目标，聚焦单设备上的离线语音链路；昇腾、鲲鹏和其他 RK 型号的适配不进入本版门禁。Qwen3.5-0.8B 仅使用文本推理能力；视觉输入、机器人动作、跨主机集群、多设备并发、在线 LLM/TTS 和模型训练不在当前范围。
 
 唤醒/休眠、暂停续说、推测性回答、保留原生高采样率播放、PREEMPT_RT 和自适应降级可以在基础链路稳定后扩展。接口仍在演进，当前不承诺跨版本二进制兼容。
 
