@@ -244,7 +244,7 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | Mock 运行证据 | 已实现 | 一次运行产生五份产物（run-manifest.json、events.jsonl、metrics.jsonl、protocol.jsonl、summary.md）；单调时间族与调度步数族分开标注，未测量项如实标注；`--evidence-dir` 留档，`--out-dir` 仍验证“返回即无残留” |
 | Gateway 传输与 ZeroMQ | 控制面与数据面适配已实现基础版 | ZeroMQ REQ/REP 控制传输、deadline 与幂等；PAIR multipart 输入音频/输出事件、二元长度与顺序校验；统一队列与终态缓存已接入，Linux 多进程端到端基础链路已交付；真实 HWM 压力与板端部署对照待后续 |
 | 本地知识库与真实检索 | 已实现基础版 | 固定 JSONL 知识库、BM25 词项检索、L0-L3 阈值与上下文字节预算校准；板端真实知识库部署待后续任务 |
-| RK3576 模型与音频前端 | ASR 适配器已实现，其余规划中 | Zipformer RKNN ASR 已完成板端增量输入、结束刷新、取消、重置与错误路径验证；Qwen3.5-0.8B、MeloTTS 编码器/解码器与 Silero VAD 已完成最小推理预检；正式 RKLLM/TTS/ALSA/AEC 与完整链路仍待交付 |
+| RK3576 模型与音频前端 | ASR 与文本推理适配器已实现，其余规划中 | Zipformer RKNN ASR 已完成板端增量输入、结束刷新、取消、重置与错误路径验证；Qwen3.5-0.8B 文本推理已完成真实 RKLLM 流式 token、取消、队列溢出与恢复验证；MeloTTS 编码器/解码器与 Silero VAD 已完成最小推理预检；正式 TTS/ALSA/AEC 与完整链路仍待交付 |
 | 板端故障与稳定性验证 | 待前置能力完成 | 真实闭环、打断、恢复和资源实验 |
 
 Fake ASR 不识别真实波形，而是按预设脚本产生事件。它用于验证协议和生命周期，不提供语音识别准确率。
@@ -275,7 +275,7 @@ cd nexweave
 ./scripts/test.sh
 ```
 
-测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件、单进程应用 `nexweave_session_app`、Mock profile 入口 `nexweave_mock_profile`，以及 ZeroMQ 控制/数据面集成测试。两个命令行门禁分别覆盖：参数错误与三种输入模式、确定性一致与信号退出（`session_app_cli`）；四个场景的退出码与关键字段、重复运行逐字节一致、产物清空与不链接硬件库（`mock_profile_cli`）。真实 ASR 适配器已实现但默认不参与 WSL 构建；ALSA、其余模型与完整板端入口仍待交付。
+测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件、单进程应用 `nexweave_session_app`、Mock profile 入口 `nexweave_mock_profile`，以及 ZeroMQ 控制/数据面集成测试。两个命令行门禁分别覆盖：参数错误与三种输入模式、确定性一致与信号退出（`session_app_cli`）；四个场景的退出码与关键字段、重复运行逐字节一致、产物清空与不链接硬件库（`mock_profile_cli`）。真实 ASR 与 RKLLM 文本适配器已实现但默认不参与 WSL 构建；ALSA、MeloTTS 适配器与完整板端入口仍待交付。
 
 跑一次 Mock profile：
 
@@ -311,26 +311,37 @@ ctest --test-dir build/strict -L contract --output-on-failure
 </details>
 
 <details>
-<summary>可选：构建 RKNN Zipformer 适配器</summary>
+<summary>可选：构建 RKNN/RKLLM 硬件适配器</summary>
 
-该适配器默认不参与 WSL Fake 构建。启用时需要显式提供 RKNN Runtime 与
-kaldi-native-fbank 的头和库，仓库不提交厂商 SDK、动态库或模型文件：
+硬件适配器默认不参与 WSL Fake 构建。启用时需要显式提供厂商 Runtime 与特征库，
+仓库不提交 SDK、动态库或模型文件：
+
+RKNN Zipformer：
 
 - `NEXWEAVE_RKNN_ROOT/include/rknn_api.h`
 - `NEXWEAVE_RKNN_ROOT/include/kaldi-native-fbank/csrc/online-feature.h`
 - `NEXWEAVE_RKNN_ROOT/lib/librknnrt.so`
 - `NEXWEAVE_RKNN_ROOT/lib/libkaldi-native-fbank-core.a`
 
+RKLLM 文本推理：
+
+- `NEXWEAVE_RKLLM_ROOT/include/rkllm.h`
+- `NEXWEAVE_RKLLM_ROOT/lib/librkllmrt.so`
+
 ```bash
-cmake -S . -B build/rknn \
+cmake -S . -B build/hardware \
   -DCMAKE_BUILD_TYPE=Release \
   -DNEXWEAVE_ENABLE_RKNN=ON \
-  -DNEXWEAVE_RKNN_ROOT=/path/to/rknn-deps
-cmake --build build/rknn --target nexweave_rknn_zipformer_hardware_test -j2
+  -DNEXWEAVE_RKNN_ROOT=/path/to/rknn-deps \
+  -DNEXWEAVE_ENABLE_RKLLM=ON \
+  -DNEXWEAVE_RKLLM_ROOT=/path/to/rkllm-deps
+cmake --build build/hardware \
+  --target nexweave_rknn_zipformer_hardware_test nexweave_rkllm_hardware_test -j2
 ```
 
-板端硬件测试通过 `IAsr` 公共接口驱动真实模型，模型、词表和 WAV 由命令行传入；
-支持 `success`、`short`、`long`、`cancel`、`callback-failure` 与 `invalid` 模式。
+板端测试通过统一能力接口驱动真实模型，模型、词表和输入由命令行传入：
+RKNN ASR 支持 `success`、`short`、`long`、`cancel`、`callback-failure`、`invalid`；
+RKLLM 文本支持 `success`、`long`、`cancel`、`callback-failure`、`queue-overflow`、`invalid`。
 测试只记录当前输入、配置和运行时版本下的可复现事实，不把单次耗时写成吞吐或可靠性结论。
 
 </details>

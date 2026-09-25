@@ -73,6 +73,7 @@ add_library(nexweave_core_domain STATIC
   core/backend/fake_llm.cpp
   core/backend/fake_tts.cpp
   core/backend/zipformer_stream.cpp
+  core/backend/rkllm/rkllm_text_core.cpp
   core/runtime/interaction_contract.cpp
   core/runtime/session_runtime.cpp
   core/runtime/text_segmentation.cpp
@@ -217,6 +218,7 @@ nexweave_test(bounded_queue tests/unit/bounded_queue_test.cpp unit)
 nexweave_test(terminal_cache tests/unit/terminal_cache_test.cpp unit)
 nexweave_test(fake_asr tests/unit/fake_asr_test.cpp unit)
 nexweave_test(zipformer_stream tests/unit/zipformer_stream_test.cpp unit)
+nexweave_test(rkllm_text_core tests/unit/rkllm_text_core_test.cpp unit)
 nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
 nexweave_test(bm25_rag tests/unit/bm25_rag_test.cpp unit)
 nexweave_test(fake_llm tests/unit/fake_llm_test.cpp unit)
@@ -448,4 +450,50 @@ if(NEXWEAVE_ENABLE_RKNN)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_link_options(nexweave_rknn_zipformer_hardware_test PRIVATE -no-pie)
   endif()
+endif()
+
+# 可选 RKLLM 文本适配器构建：默认关闭，WSL Fake 回归不依赖 NPU/SDK。
+# 打开后要求显式提供 NEXWEAVE_RKLLM_ROOT，其中 include/ 放 rkllm.h，
+# lib/ 放 librkllmrt.so。模型文件由运行时配置注入，不提交到仓库。
+option(NEXWEAVE_ENABLE_RKLLM "构建 RKLLM 文本推理适配器" OFF)
+set(NEXWEAVE_RKLLM_ROOT "" CACHE PATH "RKLLM Runtime 依赖根目录")
+if(NEXWEAVE_ENABLE_RKLLM)
+  find_path(NEXWEAVE_RKLLM_INCLUDE_DIR
+    NAMES rkllm.h
+    HINTS "${NEXWEAVE_RKLLM_ROOT}/include")
+  find_library(NEXWEAVE_RKLLM_LIBRARY
+    NAMES rkllmrt
+    HINTS "${NEXWEAVE_RKLLM_ROOT}/lib")
+  if(NOT NEXWEAVE_RKLLM_INCLUDE_DIR OR NOT NEXWEAVE_RKLLM_LIBRARY)
+    message(FATAL_ERROR
+      "NEXWEAVE_ENABLE_RKLLM=ON 需要 NEXWEAVE_RKLLM_ROOT/include/rkllm.h "
+      "与 NEXWEAVE_RKLLM_ROOT/lib/librkllmrt.so。")
+  endif()
+
+  add_library(nexweave_rkllm_text STATIC
+    core/backend/rkllm/rkllm_text_adapter.cpp
+  )
+  target_include_directories(nexweave_rkllm_text
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/rkllm
+    PRIVATE ${NEXWEAVE_RKLLM_INCLUDE_DIR}
+  )
+  target_link_libraries(nexweave_rkllm_text
+    PUBLIC nexweave_core_domain
+    PRIVATE
+      nexweave_warnings
+      ${NEXWEAVE_RKLLM_LIBRARY}
+  )
+
+  add_executable(nexweave_rkllm_hardware_test
+    tests/hardware/rkllm_hardware_test.cpp)
+  target_link_libraries(nexweave_rkllm_hardware_test PRIVATE
+    nexweave_rkllm_text
+    nexweave_warnings
+  )
+  target_include_directories(nexweave_rkllm_hardware_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/rkllm
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  )
 endif()
