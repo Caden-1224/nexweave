@@ -31,9 +31,9 @@ NexWeave 面向华为昇腾 AI 计算平台、鲲鹏处理器平台、瑞芯微 
 | 平台方向 | 在项目中的定位 | 当前状态 |
 |---|---|---|
 | WSL / 通用 Linux 开发环境 | 构建核心模块和执行确定性测试 | 已验证当前开发配置 |
-| 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | 硬件适配尚未完成 |
+| 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | ASR/LLM/MeloTTS 适配器已交付；ALSA/AEC/VAD 与完整闭环待后续 |
 
-> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期、进程内 Gateway 的控制请求入口与有界发送、ZeroMQ 控制传输和 multipart 数据面适配、子进程的显式启动就绪、停止升级与身份隔离，多进程 Gateway 控制路由，独立子进程 Session 的增量音频上行与输出事件回流，Linux 多进程端到端链路、Linux profile 的重复启停与失败清理、Linux profile 单进程/多进程对照样本，以及音频、控制响应、数据事件和终态缓存的有界策略。真实模型、ALSA/AEC/VAD 和板端语音交互尚未交付。
+> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期、进程内 Gateway 的控制请求入口与有界发送、ZeroMQ 控制传输和 multipart 数据面适配、子进程的显式启动就绪、停止升级与身份隔离，多进程 Gateway 控制路由，独立子进程 Session 的增量音频上行与输出事件回流，Linux 多进程端到端链路、Linux profile 的重复启停与失败清理、Linux profile 单进程/多进程对照样本，以及音频、控制响应、数据事件和终态缓存的有界策略。真实 ASR、文本推理与 MeloTTS 离线适配器已交付；ALSA/AEC/VAD 和完整板端语音交互尚未交付。
 
 <a id="background"></a>
 
@@ -139,10 +139,10 @@ Gateway 负责客户端接入，Supervisor 管理任务和子进程，Session �
 | ASR（自动语音识别） | 脚本驱动的 Fake 流式事件 | RKNN Zipformer |
 | RAG（检索增强生成） | 固定检索夹具与路由 | 本地 JSONL 知识库、词项检索与路由校准 |
 | LLM（大语言模型） | 确定性 token 流 | Qwen3.5-0.8B 的 RKLLM 文本推理 |
-| TTS（文本转语音） | 确定性 PCM 流 | MeloTTS 离线合成 |
+| TTS（文本转语音） | 确定性 PCM 流 | MeloTTS 离线合成（ONNX Runtime CPU 编码器 + RKNN NPU 解码器） |
 | 音频前处理 | 可控音频与活动事件夹具 | WebRTC AEC/降噪、Silero VAD |
 
-目前 Fake 音频、Fake ASR、Fake RAG 路由、Fake LLM 与 Fake TTS 均已实现相应的确定性模拟后端；真实检索和板端后端仍待实现。
+目前 Fake 音频、Fake ASR、Fake RAG 路由、Fake LLM 与 Fake TTS 均已实现相应的确定性模拟后端；真实检索、RKNN ASR、RKLLM 文本推理与 MeloTTS 离线适配器也已接入统一能力契约。
 
 同一类接口并不意味着所有实现都能即时取消。适配器需要声明是否支持并发调用、回调何时结束、取消在哪些位置生效，以及失败后谁释放资源。现有默认串行调用约定不能被调用方擅自改变。
 
@@ -244,7 +244,7 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | Mock 运行证据 | 已实现 | 一次运行产生五份产物（run-manifest.json、events.jsonl、metrics.jsonl、protocol.jsonl、summary.md）；单调时间族与调度步数族分开标注，未测量项如实标注；`--evidence-dir` 留档，`--out-dir` 仍验证“返回即无残留” |
 | Gateway 传输与 ZeroMQ | 控制面与数据面适配已实现基础版 | ZeroMQ REQ/REP 控制传输、deadline 与幂等；PAIR multipart 输入音频/输出事件、二元长度与顺序校验；统一队列与终态缓存已接入，Linux 多进程端到端基础链路已交付；真实 HWM 压力与板端部署对照待后续 |
 | 本地知识库与真实检索 | 已实现基础版 | 固定 JSONL 知识库、BM25 词项检索、L0-L3 阈值与上下文字节预算校准；板端真实知识库部署待后续任务 |
-| RK3576 模型与音频前端 | ASR 与文本推理适配器已实现，其余规划中 | Zipformer RKNN ASR 已完成板端增量输入、结束刷新、取消、重置与错误路径验证；Qwen3.5-0.8B 文本推理已完成真实 RKLLM 流式 token、取消、队列溢出与恢复验证；MeloTTS 编码器/解码器与 Silero VAD 已完成最小推理预检；正式 TTS/ALSA/AEC 与完整链路仍待交付 |
+| RK3576 模型与音频前端 | ASR、文本推理与 MeloTTS 适配器已实现，其余规划中 | Zipformer RKNN ASR 已完成板端增量输入、结束刷新、取消、重置与错误路径验证；Qwen3.5-0.8B 文本推理已完成真实 RKLLM 流式 token、取消、队列溢出与恢复验证；MeloTTS 已完成 ONNX CPU 编码器 + RKNN NPU 解码器、16 kHz 分块重采样、尾部补零、取消与恢复验证；Silero VAD 仅完成最小推理预检；正式 ALSA/AEC 与完整链路仍待交付 |
 | 板端故障与稳定性验证 | 待前置能力完成 | 真实闭环、打断、恢复和资源实验 |
 
 Fake ASR 不识别真实波形，而是按预设脚本产生事件。它用于验证协议和生命周期，不提供语音识别准确率。
@@ -275,7 +275,7 @@ cd nexweave
 ./scripts/test.sh
 ```
 
-测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件、单进程应用 `nexweave_session_app`、Mock profile 入口 `nexweave_mock_profile`，以及 ZeroMQ 控制/数据面集成测试。两个命令行门禁分别覆盖：参数错误与三种输入模式、确定性一致与信号退出（`session_app_cli`）；四个场景的退出码与关键字段、重复运行逐字节一致、产物清空与不链接硬件库（`mock_profile_cli`）。真实 ASR 与 RKLLM 文本适配器已实现但默认不参与 WSL 构建；ALSA、MeloTTS 适配器与完整板端入口仍待交付。
+测试脚本会先配置并构建，再运行 CTest。编译失败时不会执行旧测试程序；默认使用 Release，当前入口是库、测试套件、单进程应用 `nexweave_session_app`、Mock profile 入口 `nexweave_mock_profile`，以及 ZeroMQ 控制/数据面集成测试。两个命令行门禁分别覆盖：参数错误与三种输入模式、确定性一致与信号退出（`session_app_cli`）；四个场景的退出码与关键字段、重复运行逐字节一致、产物清空与不链接硬件库（`mock_profile_cli`）。真实 RKNN ASR、RKLLM 文本与 MeloTTS 适配器已实现，但默认不参与 WSL 构建；ALSA 与完整板端入口仍待交付。
 
 跑一次 Mock profile：
 
@@ -311,7 +311,7 @@ ctest --test-dir build/strict -L contract --output-on-failure
 </details>
 
 <details>
-<summary>可选：构建 RKNN/RKLLM 硬件适配器</summary>
+<summary>可选：构建 RKNN/RKLLM/MeloTTS 硬件适配器</summary>
 
 硬件适配器默认不参与 WSL Fake 构建。启用时需要显式提供厂商 Runtime 与特征库，
 仓库不提交 SDK、动态库或模型文件：
@@ -328,20 +328,34 @@ RKLLM 文本推理：
 - `NEXWEAVE_RKLLM_ROOT/include/rkllm.h`
 - `NEXWEAVE_RKLLM_ROOT/lib/librkllmrt.so`
 
+MeloTTS 离线适配器：
+
+- `NEXWEAVE_MELOTTS_ROOT/include/onnxruntime_c_api.h`
+- `NEXWEAVE_MELOTTS_ROOT/include/rknn_api.h`
+- `NEXWEAVE_MELOTTS_ROOT/lib/libonnxruntime.so`
+- `NEXWEAVE_MELOTTS_ROOT/lib/librknnrt.so`
+
 ```bash
 cmake -S . -B build/hardware \
   -DCMAKE_BUILD_TYPE=Release \
   -DNEXWEAVE_ENABLE_RKNN=ON \
   -DNEXWEAVE_RKNN_ROOT=/path/to/rknn-deps \
   -DNEXWEAVE_ENABLE_RKLLM=ON \
-  -DNEXWEAVE_RKLLM_ROOT=/path/to/rkllm-deps
+  -DNEXWEAVE_RKLLM_ROOT=/path/to/rkllm-deps \
+  -DNEXWEAVE_ENABLE_MELOTTS=ON \
+  -DNEXWEAVE_MELOTTS_ROOT=/path/to/ort-rknn-deps
 cmake --build build/hardware \
-  --target nexweave_rknn_zipformer_hardware_test nexweave_rkllm_hardware_test -j2
+  --target nexweave_rknn_zipformer_hardware_test \
+           nexweave_rkllm_hardware_test \
+           nexweave_melotts_hardware_test -j2
 ```
 
-板端测试通过统一能力接口驱动真实模型，模型、词表和输入由命令行传入：
+板端测试通过统一能力接口驱动真实模型，模型、词表、tokens 与 g 向量由命令行传入：
 RKNN ASR 支持 `success`、`short`、`long`、`cancel`、`callback-failure`、`invalid`；
-RKLLM 文本支持 `success`、`long`、`cancel`、`callback-failure`、`queue-overflow`、`invalid`。
+RKLLM 文本支持 `success`、`long`、`cancel`、`callback-failure`、`queue-overflow`、`invalid`；
+MeloTTS 离线适配器支持 `success`、`long`、`cancel`、`callback-failure`、`invalid`。
+MeloTTS 输出统一为 16 kHz、单声道、S16_LE、20 ms、320 样本帧；原生 44.1 kHz
+信息经线性重采样转换为 16 kHz，尾部补零样本不计入有效时长，也不宣称保留原生高频。
 测试只记录当前输入、配置和运行时版本下的可复现事实，不把单次耗时写成吞吐或可靠性结论。
 
 </details>
@@ -403,7 +417,7 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 | 语言与构建 | C++17、CMake、CTest、Bash | 同一构建基础扩展硬件目标 |
 | 消息与记录 | nlohmann-json、领域值与校验 | 网络事件传输和完整采集链路 |
 | 通信 | ZeroMQ REQ/REP 控制适配、PAIR multipart 数据适配 | TCP/NDJSON、统一队列与背压 |
-| 推理 | Fake ASR 与能力接口 | RKNN Zipformer、RKLLM、MeloTTS |
+| 推理 | Fake 能力、RKNN ASR、RKLLM 文本、MeloTTS 离线 TTS | 在线模型和更多 NPU 型号 |
 | 音频 | 固定格式帧、Fake 输入输出 | ALSA、WebRTC AEC/降噪、Silero VAD |
 
 源码当前按以下职责组织：
@@ -417,7 +431,7 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 | [core/gateway](https://github.com/Caden-1224/nexweave/tree/main/core/gateway) | NDJSON 增量分帧、控制请求路由、幂等记录与有界发送 |
 | [core/transport](https://github.com/Caden-1224/nexweave/tree/main/core/transport) | ZeroMQ REQ/REP 控制传输、PAIR multipart 数据面、socket/线程生命周期、deadline 与顺序校验 |
 | [core/profile](https://github.com/Caden-1224/nexweave/tree/main/core/profile) | Mock profile 组装、四个确定性场景、运行账目与产物留档；Linux profile 子进程启停、重启与失败清理 |
-| [core/backend](https://github.com/Caden-1224/nexweave/tree/main/core/backend) | Fake 音频、Fake 流式 ASR、Fake RAG、Fake LLM、Fake TTS 与 BM25 本地知识库检索 |
+| [core/backend](https://github.com/Caden-1224/nexweave/tree/main/core/backend) | Fake 音频/ASR/RAG/LLM/TTS、BM25 本地知识库检索，以及 RKNN Zipformer、RKLLM 文本和 MeloTTS 离线适配器 |
 | [core/observability](https://github.com/Caden-1224/nexweave/tree/main/core/observability) | 运行清单、事件与指标的值对象与编解码，以及把它们从一次运行里采集出来的证据记录器 |
 | [tests](https://github.com/Caden-1224/nexweave/tree/main/tests) | 单元、契约及构建门禁测试 |
 | [scripts](https://github.com/Caden-1224/nexweave/tree/main/scripts) | 构建与测试入口 |

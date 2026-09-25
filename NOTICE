@@ -24,8 +24,30 @@ zmq.hpp（cppzmq）为 4.8.1。
 当前验证包的完整版权/许可证清单位于 third_party/libzmq/debian-copyright。
 发布含该依赖的二进制或复制其代码时，应随发行材料保留相应声明；升级依赖时同步核对。
 
+ONNX Runtime
+用途：MeloTTS 编码器的 CPU 推理。
+来源：https://github.com/microsoft/onnxruntime
+构建与运行要求：启用 NEXWEAVE_ENABLE_MELOTTS 时由
+NEXWEAVE_MELOTTS_ROOT/include/onnxruntime_c_api.h 与
+NEXWEAVE_MELOTTS_ROOT/lib/libonnxruntime.so 提供；板端本次使用 1.22.1。
+许可证：MIT。
+本仓库不捆绑其头文件或动态库，由部署方提供；发布含该依赖的二进制时，
+应随发行材料保留其许可证与 NOTICE。
+
+RKNN Runtime
+用途：Zipformer ASR 与 MeloTTS 解码器的 NPU 推理。
+来源与许可证：由瑞芯微 RKNN SDK 提供；具体版本和许可证文本以厂商 SDK 为准。
+本仓库不捆绑其头文件、动态库或模型；发布含该依赖的二进制时，
+应按厂商 SDK 要求随发行材料保留许可证与声明。
+
+MeloTTS 模型与文本资源
+用途：离线中英混合语音合成适配器的编码器/解码器与文本前端资源。
+来源与许可证：MeloTTS 基座模型采用 MIT；导出与模型发布资源按其上游 BSD-3-Clause
+许可证使用。模型、词典、tokens 与说话人 g 向量由部署方提供，本仓库不提交模型
+权重或运行时缓存；发布时按上游 MIT/BSD-3-Clause 要求保留相应声明。
+
 发布边界
 --------
 后续引入的通信、模型、音频设备适配器及传递依赖，应登记具体版本、来源、用途和许可证，
-保留其原始声明。尚未接入的 ALSA、RKNN、RKLLM、sherpa-onnx、MeloTTS
-不属于当前已验证依赖。不提交模型、厂商 SDK、动态库、凭据或现场原始录音。
+保留其原始声明。尚未接入的 ALSA、WebRTC AEC、sherpa-onnx 及传递依赖应在接入时登记。
+不提交模型、厂商 SDK、动态库、凭据或现场原始录音。

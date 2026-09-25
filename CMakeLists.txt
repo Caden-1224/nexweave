@@ -72,6 +72,9 @@ add_library(nexweave_core_domain STATIC
   core/backend/bm25_rag.cpp
   core/backend/fake_llm.cpp
   core/backend/fake_tts.cpp
+  core/backend/melotts/melotts_pcm_converter.cpp
+  core/backend/melotts/melotts_text_frontend.cpp
+  core/backend/melotts/melotts_tts.cpp
   core/backend/zipformer_stream.cpp
   core/backend/rkllm/rkllm_text_core.cpp
   core/runtime/interaction_contract.cpp
@@ -223,6 +226,11 @@ nexweave_test(fake_rag tests/unit/fake_rag_test.cpp unit)
 nexweave_test(bm25_rag tests/unit/bm25_rag_test.cpp unit)
 nexweave_test(fake_llm tests/unit/fake_llm_test.cpp unit)
 nexweave_test(fake_tts tests/unit/fake_tts_test.cpp unit)
+nexweave_test(melotts_pcm_converter tests/unit/melotts_pcm_converter_test.cpp unit)
+nexweave_test(melotts_text_frontend tests/unit/melotts_text_frontend_test.cpp unit)
+nexweave_test(melotts_tts tests/unit/melotts_tts_test.cpp unit)
+# 取消、尾帧和回调失败夹具包含同步回调状态机；超时让潜在挂起变成明确失败。
+set_tests_properties(melotts_tts_unit PROPERTIES TIMEOUT 60)
 nexweave_test(playback_clock tests/unit/playback_clock_test.cpp unit)
 nexweave_test(interaction_contract tests/unit/interaction_contract_test.cpp unit)
 nexweave_test(session_l0_l1 tests/integration/session_l0_l1_test.cpp integration)
@@ -494,6 +502,66 @@ if(NEXWEAVE_ENABLE_RKLLM)
     ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/rkllm
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  )
+endif()
+
+# 可选 MeloTTS 离线适配器构建：默认关闭，WSL Fake 回归不依赖 ONNX Runtime/RKNN。
+# 打开后要求 NEXWEAVE_MELOTTS_ROOT/include 同时提供 onnxruntime_c_api.h 与
+# rknn_api.h，NEXWEAVE_MELOTTS_ROOT/lib 同时提供 libonnxruntime 与 librknnrt。
+# 模型、词表和 g 向量由运行时命令行注入，不提交到仓库。
+option(NEXWEAVE_ENABLE_MELOTTS "构建 MeloTTS ONNX/RKNN 离线适配器" OFF)
+set(NEXWEAVE_MELOTTS_ROOT "" CACHE PATH "MeloTTS ONNX Runtime 与 RKNN 依赖根目录")
+if(NEXWEAVE_ENABLE_MELOTTS)
+  find_path(NEXWEAVE_MELOTTS_ORT_INCLUDE_DIR
+    NAMES onnxruntime_c_api.h
+    HINTS "${NEXWEAVE_MELOTTS_ROOT}/include")
+  find_library(NEXWEAVE_MELOTTS_ORT_LIBRARY
+    NAMES onnxruntime
+    HINTS "${NEXWEAVE_MELOTTS_ROOT}/lib")
+  find_path(NEXWEAVE_MELOTTS_RKNN_INCLUDE_DIR
+    NAMES rknn_api.h
+    HINTS "${NEXWEAVE_MELOTTS_ROOT}/include")
+  find_library(NEXWEAVE_MELOTTS_RKNN_LIBRARY
+    NAMES rknnrt
+    HINTS "${NEXWEAVE_MELOTTS_ROOT}/lib")
+  if(NOT NEXWEAVE_MELOTTS_ORT_INCLUDE_DIR OR NOT NEXWEAVE_MELOTTS_ORT_LIBRARY OR
+     NOT NEXWEAVE_MELOTTS_RKNN_INCLUDE_DIR OR NOT NEXWEAVE_MELOTTS_RKNN_LIBRARY)
+    message(FATAL_ERROR
+      "NEXWEAVE_ENABLE_MELOTTS=ON 需要 NEXWEAVE_MELOTTS_ROOT/include 与 "
+      "NEXWEAVE_MELOTTS_ROOT/lib 下同时提供 onnxruntime_c_api.h、rknn_api.h、"
+      "libonnxruntime 与 librknnrt。")
+  endif()
+
+  add_library(nexweave_melotts STATIC
+    core/backend/melotts/melotts_real_engines.cpp
+    core/backend/melotts/melotts_adapter_factory.cpp
+  )
+  target_include_directories(nexweave_melotts
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/melotts
+    PRIVATE
+      ${NEXWEAVE_MELOTTS_ORT_INCLUDE_DIR}
+      ${NEXWEAVE_MELOTTS_RKNN_INCLUDE_DIR}
+  )
+  target_link_libraries(nexweave_melotts
+    PUBLIC nexweave_core_domain
+    PRIVATE
+      nexweave_warnings
+      ${NEXWEAVE_MELOTTS_ORT_LIBRARY}
+      ${NEXWEAVE_MELOTTS_RKNN_LIBRARY}
+  )
+
+  # 板端硬件测试可执行文件：模型、词表、tokens 与 g 文件由命令行注入。
+  add_executable(nexweave_melotts_hardware_test
+    tests/hardware/melotts_hardware_test.cpp)
+  target_link_libraries(nexweave_melotts_hardware_test PRIVATE
+    nexweave_melotts
+    nexweave_warnings
+  )
+  target_include_directories(nexweave_melotts_hardware_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/melotts
     ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
   )
 endif()
