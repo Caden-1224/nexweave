@@ -85,6 +85,7 @@ add_library(nexweave_core_domain STATIC
   core/runtime/speech_segmentation.cpp
   core/runtime/resident_audio_input.cpp
   core/runtime/queued_audio_source.cpp
+  core/runtime/audio_frontend.cpp
   core/runtime/supervisor.cpp
   core/runtime/child_process.cpp
   core/runtime/child_process_owner.cpp
@@ -215,6 +216,10 @@ nexweave_test(identifiers tests/unit/identifiers_test.cpp unit)
 nexweave_test(audio_frame tests/unit/audio_frame_test.cpp unit)
 nexweave_test(error tests/unit/error_test.cpp unit)
 nexweave_test(backend tests/contract/backend_contract_test.cpp contract)
+# 全双工前端默认使用受控前处理器与受控 PCM 后端，不依赖 ALSA/WebRTC；
+# 固定 10 ms 窗口、参考不连续、取消、恢复和重复启停都在这里回归。
+nexweave_test(audio_frontend tests/unit/audio_frontend_test.cpp unit)
+set_tests_properties(audio_frontend_unit PROPERTIES TIMEOUT 60)
 nexweave_test(session_state_machine tests/unit/session_state_machine_test.cpp unit)
 nexweave_test(control_rpc tests/unit/control_rpc_test.cpp unit)
 nexweave_test(data_event tests/unit/data_event_test.cpp unit)
@@ -264,7 +269,7 @@ nexweave_test(resident_input tests/integration/resident_input_session_test.cpp i
 set_tests_properties(resident_input_integration PROPERTIES TIMEOUT 60)
 # 同一公共能力测试同时进入 contract 门禁，避免只测最小 Fixture 而漏掉实际 Fake。
 set_tests_properties(fake_asr_unit fake_tts_unit fake_audio_unit
-  alsa_audio_source_unit alsa_audio_sink_unit PROPERTIES LABELS "unit;contract")
+  alsa_audio_source_unit alsa_audio_sink_unit audio_frontend_unit PROPERTIES LABELS "unit;contract")
 nexweave_test(session_app tests/integration/session_app_test.cpp integration)
 # 应用测试同时需要应用层与核心层：它既验收组装结果，也比对会话层的公开证据。
 target_link_libraries(nexweave_session_app_test PRIVATE nexweave_app)
@@ -664,6 +669,53 @@ if(NEXWEAVE_ENABLE_ALSA)
     ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/alsa
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  )
+endif()
+
+# 可选 WebRTC 音频前处理器：默认关闭，WSL Fake 回归不依赖系统音频处理库。
+# 打开后要求显式提供 libwebrtc_audio_processing（运行库或开发库均可）；实现只
+# 声明板端实测过的旧版 C ABI，不复制第三方头文件。板端默认运行库没有
+# libwebrtc_audio_processing.so 开发符号链接，因此入口脚本可直接传绝对 .so 路径。
+option(NEXWEAVE_ENABLE_WEBRTC_APM "构建 WebRTC AEC/降噪前处理器" OFF)
+set(NEXWEAVE_WEBRTC_LIBRARY "" CACHE FILEPATH "libwebrtc_audio_processing 库文件")
+if(NEXWEAVE_ENABLE_WEBRTC_APM)
+  if(NEXWEAVE_WEBRTC_LIBRARY STREQUAL "")
+    find_library(NEXWEAVE_WEBRTC_LIBRARY NAMES webrtc_audio_processing)
+  endif()
+  if(NOT NEXWEAVE_WEBRTC_LIBRARY)
+    message(FATAL_ERROR
+      "NEXWEAVE_ENABLE_WEBRTC_APM=ON 需要可链接的 libwebrtc_audio_processing；"
+      "请设置 NEXWEAVE_WEBRTC_LIBRARY 为库文件绝对路径。")
+  endif()
+  add_library(nexweave_webrtc_apm STATIC
+    core/backend/webrtc/webrtc_audio_processor.cpp
+  )
+  target_include_directories(nexweave_webrtc_apm
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/webrtc
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/runtime
+  )
+  target_link_libraries(nexweave_webrtc_apm
+    PUBLIC nexweave_core_domain
+    PRIVATE nexweave_warnings ${NEXWEAVE_WEBRTC_LIBRARY}
+  )
+endif()
+
+if(NEXWEAVE_ENABLE_ALSA AND NEXWEAVE_ENABLE_WEBRTC_APM)
+  add_executable(nexweave_audio_frontend_hardware_test
+    tests/hardware/audio_frontend_hardware_test.cpp)
+  target_link_libraries(nexweave_audio_frontend_hardware_test PRIVATE
+    nexweave_webrtc_apm
+    nexweave_alsa_capture
+    nexweave_alsa_playback
+    nexweave_warnings
+  )
+  target_include_directories(nexweave_audio_frontend_hardware_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/alsa
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/webrtc
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
   )
 endif()

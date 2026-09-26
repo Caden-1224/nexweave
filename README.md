@@ -31,9 +31,9 @@ NexWeave 面向华为昇腾 AI 计算平台、鲲鹏处理器平台、瑞芯微 
 | 平台方向 | 在项目中的定位 | 当前状态 |
 |---|---|---|
 | WSL / 通用 Linux 开发环境 | 构建核心模块和执行确定性测试 | 已验证当前开发配置 |
-| 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | ASR/LLM/MeloTTS、ALSA 输入输出与多进程部署机制已交付；AEC/VAD 与完整闭环待后续 |
+| 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | ASR/LLM/MeloTTS、ALSA 输入输出、全双工音频前端与多进程部署机制已交付；VAD 与完整闭环待后续 |
 
-> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期、进程内 Gateway 的控制请求入口与有界发送、ZeroMQ 控制传输和 multipart 数据面适配、子进程的显式启动就绪、停止升级与身份隔离，多进程 Gateway 控制路由，独立子进程 Session 的增量音频上行与输出事件回流，Linux 多进程端到端链路、Linux profile 的重复启停与失败清理、Linux profile 单进程/多进程对照样本、RK3576 多进程部署 profile 的 Fake 拓扑验证，以及音频、控制响应、数据事件和终态缓存的有界策略。真实 ASR、文本推理、MeloTTS 与 ALSA 输入输出适配器已交付；AEC/VAD 和完整板端语音交互尚未交付。
+> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期、进程内 Gateway 的控制请求入口与有界发送、ZeroMQ 控制传输和 multipart 数据面适配、子进程的显式启动就绪、停止升级与身份隔离，多进程 Gateway 控制路由，独立子进程 Session 的增量音频上行与输出事件回流，Linux 多进程端到端链路、Linux profile 的重复启停与失败清理、Linux profile 单进程/多进程对照样本、RK3576 多进程部署 profile 的 Fake 拓扑验证，以及音频、控制响应、数据事件和终态缓存的有界策略。真实 ASR、文本推理、MeloTTS、ALSA 输入输出适配器与全双工音频前端已交付；前端已接入实际播放参考、16 kHz 领域帧和板端 WebRTC 前处理入口，VAD 与完整板端语音交互仍待后续。
 
 <a id="background"></a>
 
@@ -312,6 +312,35 @@ ctest --test-dir build/strict -L contract --output-on-failure
 </details>
 
 <details>
+<summary>可选：构建全双工音频前端与 WebRTC 前处理</summary>
+
+全双工前端默认使用受控 Fake 前处理器与受控 PCM 后端回归，不链接 ALSA/WebRTC。
+板端真实路径必须同时打开 ALSA 与 WebRTC 音频处理库，并显式提供库文件绝对路径；
+默认运行库包可能没有开发符号链接，因此不要求 `find_library` 找到短名：
+
+- `NEXWEAVE_ENABLE_ALSA=ON`
+- `NEXWEAVE_ENABLE_WEBRTC_APM=ON`
+- `NEXWEAVE_WEBRTC_LIBRARY=/usr/lib/aarch64-linux-gnu/libwebrtc_audio_processing.so.1`
+
+```bash
+cmake -S . -B build/hardware-frontend \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DNEXWEAVE_WARNINGS_AS_ERRORS=ON \
+  -DNEXWEAVE_ENABLE_ALSA=ON \
+  -DNEXWEAVE_ENABLE_WEBRTC_APM=ON \
+  -DNEXWEAVE_WEBRTC_LIBRARY=/path/to/libwebrtc_audio_processing.so
+cmake --build build/hardware-frontend \
+  --target nexweave_audio_frontend_hardware_test -j2
+```
+
+板端入口按固定设备、原生采样率和声道数运行，支持近端、只有播放、双讲、取消和
+重复启停场景。AEC 状态只表示配置的软件收敛门限是否满足；回声残留、语音影响和
+资源开销必须在固定音量、距离、输入录音与噪声条件下另行测量，未测量项不得写成
+硬件结论。
+
+</details>
+
+<details>
 <summary>可选：构建 RKNN/RKLLM/MeloTTS 硬件适配器</summary>
 
 硬件适配器默认不参与 WSL Fake 构建。启用时需要显式提供厂商 Runtime 与特征库，
@@ -464,7 +493,8 @@ RK3576 源码部署包由 `bash scripts/package_rk3576_deployment.sh [输出.tar
 - [x] Linux profile 故障恢复、启停清理与对照证据
 - [ ] 本地知识库、真实检索与路由校准
 - [x] RK3576 多进程部署 profile：音频唯一拥有者、启动就绪顺序、停止与部分启动失败回滚（先用 Fake 验证）
-- [ ] RK3576 模型、全双工音频前端与语音打断
+- [x] RK3576 全双工音频前端：双向资源唯一拥有者、实际播放参考、AEC/降噪、10 ms 窗口与恢复状态
+- [ ] RK3576 模型、真实 VAD 与完整语音打断
 - [ ] 故障恢复、板端实验与发布验证
 
 第一版以 RK3576 为唯一硬件适配目标，聚焦单设备上的离线语音链路；昇腾、鲲鹏和其他 RK 型号的适配不进入本版门禁。Qwen3.5-0.8B 仅使用文本推理能力；视觉输入、机器人动作、跨主机集群、多设备并发、在线 LLM/TTS 和模型训练不在当前范围。

@@ -25,10 +25,19 @@ class FakePcmCaptureBackend final : public PcmCaptureBackend {
   explicit FakePcmCaptureBackend(PcmCaptureBackendConfig config = {})
       : config_(std::move(config)), format_(MakeFormat(config_)) {}
 
-  // 设置 open() 的返回值；默认成功。成功时把 opened_ 置为 true。
+  // 设置 open() 的默认返回值；默认成功。成功时把 opened_ 置为 true。
+  // 单独设置会清空 push_open_result() 排定的序列，便于测试明确重置场景。
   void set_open_result(domain::OperationResult result) {
     std::lock_guard<std::mutex> lock(mutex_);
     open_result_ = std::move(result);
+    open_results_.clear();
+  }
+
+  // 排定一次 open() 的返回值；队列非空时优先消费队首，队空后回到默认值。
+  // 用于模拟设备断开后前几次重开失败、随后恢复的有限重试路径。
+  void push_open_result(domain::OperationResult result) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    open_results_.push_back(std::move(result));
   }
 
   // 设置 recover() 的返回值；默认成功。失败时由适配器映射为设备失败。
@@ -48,6 +57,7 @@ class FakePcmCaptureBackend final : public PcmCaptureBackend {
   void push_read_result(PcmCaptureReadResult result) {
     std::lock_guard<std::mutex> lock(mutex_);
     read_results_.push_back(std::move(result));
+    cv_.notify_all();
   }
 
   // 排定一块数据；调用方保证 samples 是 file 对应的交错样本。
@@ -74,7 +84,12 @@ class FakePcmCaptureBackend final : public PcmCaptureBackend {
   domain::OperationResult open() override {
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.open_attempts;
-    if (open_result_.ok()) {
+    domain::OperationResult result = open_result_;
+    if (!open_results_.empty()) {
+      result = std::move(open_results_.front());
+      open_results_.pop_front();
+    }
+    if (result.ok()) {
       opened_ = true;
       cancelled_ = false;
       ++stats_.open_successes;
@@ -84,7 +99,7 @@ class FakePcmCaptureBackend final : public PcmCaptureBackend {
       stats_.actual_period_frames = config_.period_frames;
       stats_.actual_buffer_frames = config_.buffer_frames;
     }
-    return open_result_;
+    return result;
   }
 
   PcmCaptureReadResult read(std::chrono::milliseconds timeout) override {
@@ -220,6 +235,7 @@ class FakePcmCaptureBackend final : public PcmCaptureBackend {
   std::condition_variable cv_;
   PcmCaptureFormat format_;
   domain::OperationResult open_result_{};
+  std::deque<domain::OperationResult> open_results_;
   domain::OperationResult recover_result_{};
   bool opened_ = false;
   bool cancelled_ = false;
