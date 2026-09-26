@@ -73,6 +73,7 @@ add_library(nexweave_core_domain STATIC
   core/backend/fake_llm.cpp
   core/backend/fake_tts.cpp
   core/backend/alsa/alsa_audio_source.cpp
+  core/backend/alsa/alsa_audio_sink.cpp
   core/backend/melotts/melotts_pcm_converter.cpp
   core/backend/melotts/melotts_text_frontend.cpp
   core/backend/melotts/melotts_tts.cpp
@@ -219,6 +220,9 @@ nexweave_test(fake_audio tests/unit/fake_audio_test.cpp unit)
 nexweave_test(alsa_audio_source tests/unit/alsa_audio_source_test.cpp unit)
 # 该用例含阻塞读、取消唤醒与超时预算；超时属性让潜在挂起变成明确失败。
 set_tests_properties(alsa_audio_source_unit PROPERTIES TIMEOUT 30)
+# ALSA 输出适配器使用受控后端验证短写、underrun、重连、回放参考和取消/排空。
+nexweave_test(alsa_audio_sink tests/unit/alsa_audio_sink_test.cpp unit)
+set_tests_properties(alsa_audio_sink_unit PROPERTIES TIMEOUT 30)
 # 队列音频源边界：满队列拒绝、自然结束保留帧、取消唤醒阻塞读取。
 nexweave_test(queued_audio_source tests/unit/queued_audio_source_test.cpp unit)
 # 统一队列语义：容量、拒绝、超时、关闭、清空与峰值。
@@ -253,7 +257,7 @@ nexweave_test(resident_input tests/integration/resident_input_session_test.cpp i
 set_tests_properties(resident_input_integration PROPERTIES TIMEOUT 60)
 # 同一公共能力测试同时进入 contract 门禁，避免只测最小 Fixture 而漏掉实际 Fake。
 set_tests_properties(fake_asr_unit fake_tts_unit fake_audio_unit
-  alsa_audio_source_unit PROPERTIES LABELS "unit;contract")
+  alsa_audio_source_unit alsa_audio_sink_unit PROPERTIES LABELS "unit;contract")
 nexweave_test(session_app tests/integration/session_app_test.cpp integration)
 # 应用测试同时需要应用层与核心层：它既验收组装结果，也比对会话层的公开证据。
 target_link_libraries(nexweave_session_app_test PRIVATE nexweave_app)
@@ -574,7 +578,7 @@ endif()
 
 # 可选 ALSA 采集后端：默认关闭，WSL Fake 回归不依赖 libasound；打开后由系统包提供
 # alsa/asoundlib.h 与 libasound。真实设备名由硬件测试命令行或入口脚本注入，不写死在源码。
-option(NEXWEAVE_ENABLE_ALSA "构建 ALSA 音频输入真实设备后端" OFF)
+option(NEXWEAVE_ENABLE_ALSA "构建 ALSA 音频输入/输出真实设备后端" OFF)
 if(NEXWEAVE_ENABLE_ALSA)
   find_package(ALSA REQUIRED)
   add_library(nexweave_alsa_capture STATIC
@@ -601,6 +605,36 @@ if(NEXWEAVE_ENABLE_ALSA)
     nexweave_warnings
   )
   target_include_directories(nexweave_alsa_input_hardware_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/alsa
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  )
+
+  add_library(nexweave_alsa_playback STATIC
+    core/backend/alsa/alsa_pcm_playback_backend.cpp
+  )
+  target_include_directories(nexweave_alsa_playback
+    PUBLIC
+      ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/alsa
+      ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  )
+  target_link_libraries(nexweave_alsa_playback
+    PUBLIC nexweave_core_domain
+    PRIVATE
+      nexweave_warnings
+      ALSA::ALSA
+  )
+
+  add_executable(nexweave_alsa_output_hardware_test
+    tests/hardware/alsa_output_hardware_test.cpp)
+  target_link_libraries(nexweave_alsa_output_hardware_test PRIVATE
+    nexweave_alsa_playback
+    nexweave_warnings
+  )
+  target_include_directories(nexweave_alsa_output_hardware_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/alsa
