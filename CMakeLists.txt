@@ -72,6 +72,7 @@ add_library(nexweave_core_domain STATIC
   core/backend/bm25_rag.cpp
   core/backend/fake_llm.cpp
   core/backend/fake_tts.cpp
+  core/backend/alsa/alsa_audio_source.cpp
   core/backend/melotts/melotts_pcm_converter.cpp
   core/backend/melotts/melotts_text_frontend.cpp
   core/backend/melotts/melotts_tts.cpp
@@ -213,6 +214,11 @@ nexweave_test(observability tests/unit/observability_test.cpp unit)
 # 运行证据记录器：用注入的手动时钟验收步数分配、首次出现语义与未测量标注。
 nexweave_test(run_evidence tests/unit/run_evidence_test.cpp unit)
 nexweave_test(fake_audio tests/unit/fake_audio_test.cpp unit)
+# ALSA 输入适配器使用受控后端验证阻塞、取消、重连、格式转换和空转预算；
+# 默认构建不链接 libasound。
+nexweave_test(alsa_audio_source tests/unit/alsa_audio_source_test.cpp unit)
+# 该用例含阻塞读、取消唤醒与超时预算；超时属性让潜在挂起变成明确失败。
+set_tests_properties(alsa_audio_source_unit PROPERTIES TIMEOUT 30)
 # 队列音频源边界：满队列拒绝、自然结束保留帧、取消唤醒阻塞读取。
 nexweave_test(queued_audio_source tests/unit/queued_audio_source_test.cpp unit)
 # 统一队列语义：容量、拒绝、超时、关闭、清空与峰值。
@@ -247,7 +253,7 @@ nexweave_test(resident_input tests/integration/resident_input_session_test.cpp i
 set_tests_properties(resident_input_integration PROPERTIES TIMEOUT 60)
 # 同一公共能力测试同时进入 contract 门禁，避免只测最小 Fixture 而漏掉实际 Fake。
 set_tests_properties(fake_asr_unit fake_tts_unit fake_audio_unit
-  PROPERTIES LABELS "unit;contract")
+  alsa_audio_source_unit PROPERTIES LABELS "unit;contract")
 nexweave_test(session_app tests/integration/session_app_test.cpp integration)
 # 应用测试同时需要应用层与核心层：它既验收组装结果，也比对会话层的公开证据。
 target_link_libraries(nexweave_session_app_test PRIVATE nexweave_app)
@@ -562,6 +568,42 @@ if(NEXWEAVE_ENABLE_MELOTTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
     ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/melotts
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  )
+endif()
+
+# 可选 ALSA 采集后端：默认关闭，WSL Fake 回归不依赖 libasound；打开后由系统包提供
+# alsa/asoundlib.h 与 libasound。真实设备名由硬件测试命令行或入口脚本注入，不写死在源码。
+option(NEXWEAVE_ENABLE_ALSA "构建 ALSA 音频输入真实设备后端" OFF)
+if(NEXWEAVE_ENABLE_ALSA)
+  find_package(ALSA REQUIRED)
+  add_library(nexweave_alsa_capture STATIC
+    core/backend/alsa/alsa_pcm_capture_backend.cpp
+  )
+  target_include_directories(nexweave_alsa_capture
+    PUBLIC
+      ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/alsa
+      ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
+  )
+  target_link_libraries(nexweave_alsa_capture
+    PUBLIC nexweave_core_domain
+    PRIVATE
+      nexweave_warnings
+      ALSA::ALSA
+  )
+
+  add_executable(nexweave_alsa_input_hardware_test
+    tests/hardware/alsa_input_hardware_test.cpp)
+  target_link_libraries(nexweave_alsa_input_hardware_test PRIVATE
+    nexweave_alsa_capture
+    nexweave_warnings
+  )
+  target_include_directories(nexweave_alsa_input_hardware_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/capability
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/backend/alsa
     ${CMAKE_CURRENT_SOURCE_DIR}/core/domain
   )
 endif()
