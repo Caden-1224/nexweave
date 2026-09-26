@@ -157,6 +157,7 @@ target_link_libraries(nexweave_transport
 # 但不反向进入传输或 Session；后续 Linux/RK3576 部署入口链接本目标即可复用启停语义。
 add_library(nexweave_profile STATIC
   core/profile/linux_profile.cpp
+  core/profile/rk3576_profile.cpp
 )
 target_include_directories(nexweave_profile PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/core/profile
@@ -187,6 +188,12 @@ target_link_libraries(nexweave_remote_session_fixture PRIVATE
 add_executable(nexweave_remote_scripted_fixture tests/support/remote_scripted_fixture.cpp)
 target_link_libraries(nexweave_remote_scripted_fixture PRIVATE
   nexweave_transport nexweave_warnings)
+
+# 部署节点夹具：模拟节点就绪、音频设备 O_EXCL 所有权和 Unix socket 适配器；只进入测试，
+# 不进入产品安装或部署包。它不链接传输层，也不访问真实 ALSA/模型。
+add_executable(nexweave_deployment_node_fixture tests/support/deployment_node_fixture.cpp)
+target_link_libraries(nexweave_deployment_node_fixture PRIVATE
+  nexweave_core_domain nexweave_warnings)
 
 enable_testing()
 # 所有测试通过同一配置入口注册，新增目标不会漏掉警告门禁。
@@ -363,6 +370,25 @@ target_include_directories(nexweave_linux_profile_comparison_test PRIVATE
 target_compile_definitions(nexweave_linux_profile_comparison_test PRIVATE
   NEXWEAVE_REMOTE_SESSION_FIXTURE="$<TARGET_FILE:nexweave_remote_session_fixture>")
 set_tests_properties(linux_profile_comparison_integration PROPERTIES TIMEOUT 120)
+
+# RK3576 多进程部署 profile：真实子进程、音频拥有者独占资源和拓扑回滚；超时让夹具挂起
+# 变成明确失败。该用例只使用 Fake 节点，不对应真实模型或 ALSA 链路。
+nexweave_test(rk3576_profile tests/integration/rk3576_profile_test.cpp integration)
+target_link_libraries(nexweave_rk3576_profile_test PRIVATE nexweave_profile)
+target_compile_definitions(nexweave_rk3576_profile_test PRIVATE
+  NEXWEAVE_DEPLOYMENT_NODE_FIXTURE="$<TARGET_FILE:nexweave_deployment_node_fixture>")
+add_dependencies(nexweave_rk3576_profile_test nexweave_deployment_node_fixture)
+set_tests_properties(rk3576_profile_integration PROPERTIES TIMEOUT 120)
+
+# 板端部署门禁可执行文件：用同一套 Fake 节点重复验证启动/就绪/停止、部分启动失败回滚和
+# SIGKILL 升级。默认构建也会编译，便于 WSL 先排除编译问题；真实板端运行证据由入口脚本采集。
+add_executable(nexweave_rk3576_deployment_hardware_test
+  tests/hardware/rk3576_deployment_hardware_test.cpp)
+target_link_libraries(nexweave_rk3576_deployment_hardware_test PRIVATE
+  nexweave_profile nexweave_warnings)
+target_compile_definitions(nexweave_rk3576_deployment_hardware_test PRIVATE
+  NEXWEAVE_DEPLOYMENT_NODE_FIXTURE="$<TARGET_FILE:nexweave_deployment_node_fixture>")
+add_dependencies(nexweave_rk3576_deployment_hardware_test nexweave_deployment_node_fixture)
 
 # 单进程 Mock 应用入口：与测试目标共用同一套警告门禁与依赖，避免“只在测试里能跑”。
 add_executable(nexweave_session_app apps/session_app/main.cpp)

@@ -31,9 +31,9 @@ NexWeave 面向华为昇腾 AI 计算平台、鲲鹏处理器平台、瑞芯微 
 | 平台方向 | 在项目中的定位 | 当前状态 |
 |---|---|---|
 | WSL / 通用 Linux 开发环境 | 构建核心模块和执行确定性测试 | 已验证当前开发配置 |
-| 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | ASR/LLM/MeloTTS 适配器已交付；ALSA/AEC/VAD 与完整闭环待后续 |
+| 瑞芯微 RK3576 泰山派 | 首个真实模型与音频交互验证目标 | ASR/LLM/MeloTTS、ALSA 输入输出与多进程部署机制已交付；AEC/VAD 与完整闭环待后续 |
 
-> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期、进程内 Gateway 的控制请求入口与有界发送、ZeroMQ 控制传输和 multipart 数据面适配、子进程的显式启动就绪、停止升级与身份隔离，多进程 Gateway 控制路由，独立子进程 Session 的增量音频上行与输出事件回流，Linux 多进程端到端链路、Linux profile 的重复启停与失败清理、Linux profile 单进程/多进程对照样本，以及音频、控制响应、数据事件和终态缓存的有界策略。真实 ASR、文本推理与 MeloTTS 离线适配器已交付；ALSA/AEC/VAD 和完整板端语音交互尚未交付。
+> **当前处于早期开发阶段。** 已实现基础契约、会话状态机、确定性 Fake 音频输入输出、Fake 流式 ASR/LLM/TTS、Fake RAG 路由、本地知识库检索与路由校准、常驻音频输入与语音分段、L2/L3 生成路径的流式分句与重叠播放、进程内 Supervisor 的单活跃会话生命周期、进程内 Gateway 的控制请求入口与有界发送、ZeroMQ 控制传输和 multipart 数据面适配、子进程的显式启动就绪、停止升级与身份隔离，多进程 Gateway 控制路由，独立子进程 Session 的增量音频上行与输出事件回流，Linux 多进程端到端链路、Linux profile 的重复启停与失败清理、Linux profile 单进程/多进程对照样本、RK3576 多进程部署 profile 的 Fake 拓扑验证，以及音频、控制响应、数据事件和终态缓存的有界策略。真实 ASR、文本推理、MeloTTS 与 ALSA 输入输出适配器已交付；AEC/VAD 和完整板端语音交互尚未交付。
 
 <a id="background"></a>
 
@@ -240,6 +240,7 @@ generation 过滤不能代替停止计算，停止提交 PCM 也不能撤回已�
 | Linux 多进程端到端链路 | 已实现基础版 | 本地 Gateway 控制路由经独立 Session 进程完成增量输入、Fake Session 推理、文本/PCM/终态回传和退出清理；单活跃忙碌拒绝与远端播放/生成顺序有夹具证据；故障恢复已实现基础版 |
 | Linux profile 生命周期 | 已实现基础版 | 独立子进程的重复启动、停止、重启，启动失败回滚，活跃输入/推理期间停止，终态后迟到输出拒绝，以及有界进程与端点清理；完整部署入口与对照证据待后续 |
 | Linux profile 对照证据 | 已实现基础版 | 同一 Fake Session 夹具在同进程与独立子进程中运行，保留原始延迟、RSS、队列峰值与成功率样本并输出汇总 JSON；只证明 Fake 调度与拓扑差异，不证明模型、NPU 或板端性能 |
+| RK3576 部署 profile | 已实现基础版 | 显式进程拓扑、唯一音频拥有者、按依赖等待每个子进程显式就绪、反序停止、部分启动失败回滚和 SIGKILL 升级；先以 Fake 节点验证部署机制，真实模型/ALSA 构件在后续任务汇合时重跑同一门禁 |
 | Mock profile 确定性入口 | 已实现 | 单进程组装工厂、监督器与请求入口，四个可显式选择的场景（正常、慢消费、取消、故障）、固定输入逐字节可复现、退出码语义、运行结束清理自证 |
 | Mock 运行证据 | 已实现 | 一次运行产生五份产物（run-manifest.json、events.jsonl、metrics.jsonl、protocol.jsonl、summary.md）；单调时间族与调度步数族分开标注，未测量项如实标注；`--evidence-dir` 留档，`--out-dir` 仍验证“返回即无残留” |
 | Gateway 传输与 ZeroMQ | 控制面与数据面适配已实现基础版 | ZeroMQ REQ/REP 控制传输、deadline 与幂等；PAIR multipart 输入音频/输出事件、二元长度与顺序校验；统一队列与终态缓存已接入，Linux 多进程端到端基础链路已交付；真实 HWM 压力与板端部署对照待后续 |
@@ -372,7 +373,9 @@ MeloTTS 输出统一为 16 kHz、单声道、S16_LE、20 ms、320 样本帧；�
 | Linux | 通信与系统行为验证 | 多进程、ZeroMQ、Fake 后端 | 控制可响应、增量上行、背压、重建与清理 |
 | RK3576 | 真实离线交互 | 硬件模型、ALSA、AEC 与 VAD | 模型兼容、音频交互、实际静默与资源竞争 |
 
-Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑通四个确定性场景。Linux profile 已实现生命周期管理和单/多进程 Fake 对照测试，完整部署入口与 RK3576 profile 尚未交付。板端接入前将先检查实际系统、驱动、SDK、模型、音频设备和最小真实推理；不能仅凭模型文件存在就判定可部署。
+Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑通四个确定性场景。Linux profile 已实现生命周期管理和单/多进程 Fake 对照测试。RK3576 profile 已交付部署机制基础版：拓扑中只允许一个音频拥有者，适配器消费者必须在依赖上晚于拥有者；启动、就绪、停止、部分启动失败回滚和 SIGKILL 升级先用 Fake 节点验证，真实模型、ALSA、AEC/VAD 构件在后续汇合时重跑同一门禁。部署前仍要检查实际系统、驱动、SDK、模型、音频设备和最小真实推理；不能仅凭模型文件存在就判定可部署。
+
+RK3576 源码部署包由 `bash scripts/package_rk3576_deployment.sh [输出.tar.gz]` 生成。脚本只收集 Git 中会进入部署的源码，并在打包前后拒绝模型、SDK、动态库、构建缓存、日志、凭据、令牌和私钥；模型与厂商运行库始终由板端外部目录提供。
 
 <a id="validation"></a>
 
@@ -460,6 +463,7 @@ Mock profile 已可运行：`nexweave_mock_profile` 用进程内 Fake 后端跑�
 - [x] Linux profile 启停、重启与失败清理
 - [x] Linux profile 故障恢复、启停清理与对照证据
 - [ ] 本地知识库、真实检索与路由校准
+- [x] RK3576 多进程部署 profile：音频唯一拥有者、启动就绪顺序、停止与部分启动失败回滚（先用 Fake 验证）
 - [ ] RK3576 模型、全双工音频前端与语音打断
 - [ ] 故障恢复、板端实验与发布验证
 
